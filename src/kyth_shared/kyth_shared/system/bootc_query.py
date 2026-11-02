@@ -31,8 +31,7 @@ _SUPPORTED_TAG_PATTERN = "(?:" + "|".join(map(re.escape, sorted(SUPPORTED_IMAGE_
 _IMAGE_REFERENCE_RE = re.compile(
     r"(?<![A-Za-z0-9._/-])"
     + f"({_REGISTRIES_PATTERN})"
-    + f"(?::({_SUPPORTED_TAG_PATTERN}))?"
-    + r"(?:@sha256:([a-fA-F0-9]{64}))?"
+    + f"(?::({_SUPPORTED_TAG_PATTERN})|@sha256:([a-fA-F0-9]{{64}}))?"
     + r"(?![A-Za-z0-9._:@/-])"
 )
 

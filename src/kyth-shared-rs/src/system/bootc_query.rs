@@ -378,6 +378,7 @@ pub fn image_version_from_status(data: &Value, section: &str) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system::bootc_policy::{DESTINATION_REGISTRY, LEGACY_REGISTRY};
     use serde_json::json;
     #[test]
     fn nested() {
@@ -395,18 +396,50 @@ mod tests {
     }
 
     #[test]
+    fn image_ref_preserves_generic_structured_references() {
+        let reference = "quay.io/example/other:nightly@sha256:abc";
+        let status = json!({"status":{"booted":{"image":{"reference":reference}}}});
+        assert_eq!(
+            image_reference_from_status(&status),
+            Some(reference.to_string())
+        );
+        assert_eq!(
+            crate::system::bootc_policy::registry_from_ref(Some(reference)),
+            None
+        );
+    }
+
+    #[test]
     fn image_ref_falls_back_to_human_readable_status_output() {
         let output = "Image: ghcr.io/kyth-os/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
         assert_eq!(
             image_reference_from_status_with_output(&Value::Null, output),
-            Some("ghcr.io/kyth-os/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+            None
         );
         let destination_output =
             "Image: ghcr.io/mrtrickdotorg/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
         assert_eq!(
             image_reference_from_status_with_output(&Value::Null, destination_output),
-            Some("ghcr.io/mrtrickdotorg/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+            None
         );
+        for registry in [LEGACY_REGISTRY, DESTINATION_REGISTRY] {
+            let digest = "a".repeat(64);
+            let digest_only_output = format!("Image: {registry}@sha256:{digest}");
+            assert_eq!(
+                image_reference_from_status_with_output(&Value::Null, &digest_only_output),
+                Some(format!("{registry}@sha256:{digest}"))
+            );
+        }
+        for invalid_output in [
+            "Image: ghcr.io/mrtrickdotorg/kyth:nightly",
+            "Image: ghcr.io/kyth-os/kyth@sha256:abc",
+            "Image: ghcr.io/mrtrickdotorg/kyth:testing@sha256:abc",
+        ] {
+            assert!(
+                image_reference_from_status_with_output(&Value::Null, invalid_output).is_none(),
+                "{invalid_output}"
+            );
+        }
         let invalid_then_valid =
             "Image: ghcr.io/mrtrickdotorg/kyth:nightly; fallback: ghcr.io/kyth-os/kyth:testing";
         assert_eq!(

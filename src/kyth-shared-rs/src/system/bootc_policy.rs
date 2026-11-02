@@ -36,7 +36,9 @@ pub fn registry_from_ref(reference: Option<&str>) -> Option<&'static str> {
         _ => return None,
     };
     match tag {
-        Some("latest" | "testing" | "latest-cachy" | "testing-cachy") => Some(registry),
+        Some("latest" | "testing" | "latest-cachy" | "testing-cachy") if digest.is_none() => {
+            Some(registry)
+        }
         Some(_) => None,
         None if digest.is_some() => Some(registry),
         None => None,
@@ -430,10 +432,16 @@ mod tests {
             );
         }
         let digest = "a".repeat(64);
-        assert_eq!(
-            registry_from_ref(Some(&format!("ghcr.io/mrtrickdotorg/kyth@sha256:{digest}"))),
-            Some(DESTINATION_REGISTRY)
-        );
+        for registry in [LEGACY_REGISTRY, DESTINATION_REGISTRY] {
+            assert_eq!(
+                registry_from_ref(Some(&format!("{registry}@sha256:{digest}"))),
+                Some(registry)
+            );
+            assert_eq!(
+                registry_from_ref(Some(&format!("{registry}:testing@sha256:{digest}"))),
+                None
+            );
+        }
         for unsupported in [
             "ghcr.io/kyth-os/kyth-other:testing",
             "ghcr.io/mrtrickdotorg/kyth-extra:latest",

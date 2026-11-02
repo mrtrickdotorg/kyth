@@ -110,6 +110,11 @@ class BootcHelpersTests(unittest.TestCase):
             f"{REGISTRY}:testing",
         )
 
+    def test_image_reference_from_status_preserves_generic_structured_refs(self):
+        reference = "quay.io/example/other:nightly@sha256:abc"
+        status = {"status": {"booted": {"image": {"reference": reference}}}}
+        self.assertEqual(bootc_query.image_reference_from_status(status), reference)
+
     def test_image_reference_from_status_spec_fallback(self):
         status = {"spec": {"image": {"image": f"{REGISTRY}:latest"}}}
         self.assertEqual(
@@ -131,6 +136,38 @@ class BootcHelpersTests(unittest.TestCase):
                         ),
                         expected,
                     )
+        digest = "a" * 64
+        for repository in (
+            "ghcr.io/kyth-os/kyth",
+            "ghcr.io/mrtrickdotorg/kyth",
+        ):
+            digest_only = f"{repository}@sha256:{digest}"
+            self.assertEqual(
+                bootc_query.image_reference_from_status(
+                    {}, status_output=f"Image: {digest_only}"
+                ),
+                digest_only,
+            )
+            self.assertIsNone(
+                bootc_query.image_reference_from_status(
+                    {},
+                    status_output=f"Image: {repository}:testing@sha256:{digest}",
+                )
+            )
+        for repository in (
+            "ghcr.io/kyth-os/kyth",
+            "ghcr.io/mrtrickdotorg/kyth",
+        ):
+            for invalid_reference in (
+                f"{repository}:nightly",
+                f"{repository}@sha256:abc",
+                f"{repository}@sha256:{digest}0",
+            ):
+                self.assertIsNone(
+                    bootc_query.image_reference_from_status(
+                        {}, status_output=f"Image: {invalid_reference}"
+                    )
+                )
         self.assertIsNone(
             bootc_query.image_reference_from_status(
                 {}, status_output="Image: ghcr.io/mrtrickdotorg/kyth-extra:testing"
