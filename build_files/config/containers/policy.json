@@ -1,1 +1,1 @@
-{"default":[{"type":"insecureAcceptAnything"}],"transports":{"docker":{"ghcr.io/kyth-os/kyth":[{"keyPath":"/etc/containers/kyth-cosign.pub","signedIdentity":{"type":"matchRepository"},"type":"sigstoreSigned"}]}}}
+{"default":[{"type":"insecureAcceptAnything"}],"transports":{"docker":{"ghcr.io/kyth-os/kyth":[{"keyPath":"/etc/containers/kyth-cosign.pub","signedIdentity":{"type":"matchRepository"},"type":"sigstoreSigned"}],"ghcr.io/mrtrickdotorg/kyth":[{"keyPath":"/etc/containers/kyth-cosign.pub","signedIdentity":{"type":"matchRepository"},"type":"sigstoreSigned"}]}}}

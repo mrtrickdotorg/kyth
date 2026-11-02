@@ -1,5 +1,6 @@
 
 ARG BASE_IMAGE=localhost/kyth-base:stable
+ARG IMAGE_OWNER=kyth-os
 # CI pins this to a digest-qualified ref (ghcr.io/...@sha256:...) via
 # --build-arg BASE_IMAGE="${STEPS_UPSTREAM_BASE_OUTPUTS_PINNED}" in
 # .github/workflows/build.yml; local `localhost` alias is intentional for
@@ -178,13 +179,19 @@ RUN --mount=type=cache,id=kyth-hub-shell-cargo-registry,target=/root/.cargo/regi
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG IMAGE_OWNER
 # Override upstream OCI labels so downstream tooling (lorax/bootc) sees KythOS product metadata
 LABEL org.opencontainers.image.title="KythOS"
 LABEL org.opencontainers.image.version="45"
 LABEL org.opencontainers.image.description="KythOS — atomic gaming and dev workstation built on Fedora Kinoite"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
-LABEL org.opencontainers.image.source="https://github.com/kyth-os/kyth"
-LABEL org.opencontainers.image.documentation="https://github.com/kyth-os/kyth"
+LABEL org.opencontainers.image.source="https://github.com/${IMAGE_OWNER}/kyth"
+LABEL org.opencontainers.image.documentation="https://github.com/${IMAGE_OWNER}/kyth"
+RUN case "${IMAGE_OWNER}" in \
+      kyth-os) ;; \
+      mrtrickdotorg) mkdir -p /usr/share/kyth && printf '%s\n' 'mrtrickdotorg' > /usr/share/kyth/image-owner ;; \
+      *) echo "Unsupported IMAGE_OWNER: ${IMAGE_OWNER}" >&2; exit 1 ;; \
+    esac
 LABEL org.osbuild.product="KythOS"
 LABEL org.osbuild.version="45"
 LABEL org.osbuild.branding.release="KythOS 45"

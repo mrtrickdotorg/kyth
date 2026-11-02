@@ -19,7 +19,31 @@ from kyth_shared.system.process import (
     run_command,
 )
 
-REGISTRY = "ghcr.io/kyth-os/kyth"
+LEGACY_REGISTRY = "ghcr.io/kyth-os/kyth"
+DESTINATION_REGISTRY = "ghcr.io/mrtrickdotorg/kyth"
+REGISTRY = LEGACY_REGISTRY  # Compatibility for callers using the old name.
+REGISTRIES = (LEGACY_REGISTRY, DESTINATION_REGISTRY)
+SUPPORTED_IMAGE_TAGS = frozenset(
+    {"latest", "testing", "latest-cachy", "testing-cachy"}
+)
+_REGISTRIES_PATTERN = "(?:" + "|".join(map(re.escape, REGISTRIES)) + ")"
+_SUPPORTED_TAG_PATTERN = "(?:" + "|".join(map(re.escape, sorted(SUPPORTED_IMAGE_TAGS))) + ")"
+_IMAGE_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9._/-])"
+    + f"({_REGISTRIES_PATTERN})"
+    + f"(?::({_SUPPORTED_TAG_PATTERN}))?"
+    + r"(?:@sha256:([a-fA-F0-9]{64}))?"
+    + r"(?![A-Za-z0-9._:@/-])"
+)
+
+
+def _supported_image_reference(value: str, *, search: bool = False) -> str | None:
+    value = value.strip()
+    matches = _IMAGE_REFERENCE_RE.finditer(value) if search else [_IMAGE_REFERENCE_RE.fullmatch(value)]
+    for match in matches:
+        if match and (match.group(2) or match.group(3)):
+            return match.group(0)
+    return None
 
 
 def nested_get(data: object, path: tuple[str, ...]) -> Any:
@@ -178,17 +202,12 @@ def image_reference_from_status(
         if isinstance(value, str) and value.strip():
             return value.strip()
     for value in walk_strings(data):
-        if REGISTRY in value.strip():
-            return value.strip()
+        reference = _supported_image_reference(value, search=True)
+        if reference:
+            return reference
     status_output = status_output or status_text
     if status_output:
-        pattern = re.compile(
-            rf"({re.escape(REGISTRY)}(?::[A-Za-z0-9._-]+)?"
-            rf"(?:@sha256:[a-fA-F0-9]+)?)"
-        )
-        match = pattern.search(status_output)
-        if match:
-            return match.group(1)
+        return _supported_image_reference(status_output, search=True)
     return None
 
 

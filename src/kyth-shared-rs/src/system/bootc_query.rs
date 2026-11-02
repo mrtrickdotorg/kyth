@@ -15,8 +15,10 @@ static SYSROOT_LOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Compiled once: the image-reference fallback regex for older bootc text
 /// output ran on every `image_reference()` call.
 static IMAGE_REFERENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(ghcr\.io/kyth-os/kyth(?::[A-Za-z0-9._-]+)?(?:@sha256:[a-fA-F0-9]+)?)")
-        .expect("image reference pattern is a compile-time constant")
+    Regex::new(
+        r"(?:^|[^A-Za-z0-9._/-])(ghcr\.io/(?:kyth-os|mrtrickdotorg)/kyth(?::[A-Za-z0-9._-]+)?(?:@sha256:[a-fA-F0-9]+)?)(?:$|[^A-Za-z0-9._:@/-])",
+    )
+    .expect("image reference pattern is a compile-time constant")
 });
 
 pub fn nested_get<'a>(data: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -284,16 +286,19 @@ pub fn image_reference_from_status_with_output(
     let mut strs = Vec::new();
     walk_strings(data, &mut strs);
     for s in strs {
-        if s.to_lowercase().contains("ghcr.io/kyth-os/kyth") {
+        if crate::system::bootc_policy::registry_from_ref(Some(&s)).is_some() {
             return Some(s.trim().to_string());
         }
     }
     if !status_output.is_empty() {
         if let Some(reference) = IMAGE_REFERENCE_RE
-            .captures(status_output)
-            .and_then(|captures| captures.get(1))
+            .captures_iter(status_output)
+            .filter_map(|captures| captures.get(1).map(|capture| capture.as_str()))
+            .find(|reference| {
+                crate::system::bootc_policy::registry_from_ref(Some(reference)).is_some()
+            })
         {
-            return Some(reference.as_str().to_string());
+            return Some(reference.to_string());
         }
     }
     None
@@ -391,11 +396,28 @@ mod tests {
 
     #[test]
     fn image_ref_falls_back_to_human_readable_status_output() {
-        let output = "Image: ghcr.io/kyth-os/kyth:testing@sha256:abcdef1234\n";
+        let output = "Image: ghcr.io/kyth-os/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
         assert_eq!(
             image_reference_from_status_with_output(&Value::Null, output),
-            Some("ghcr.io/kyth-os/kyth:testing@sha256:abcdef1234".into())
+            Some("ghcr.io/kyth-os/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
         );
+        let destination_output =
+            "Image: ghcr.io/mrtrickdotorg/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        assert_eq!(
+            image_reference_from_status_with_output(&Value::Null, destination_output),
+            Some("ghcr.io/mrtrickdotorg/kyth:testing@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+        );
+        let invalid_then_valid =
+            "Image: ghcr.io/mrtrickdotorg/kyth:nightly; fallback: ghcr.io/kyth-os/kyth:testing";
+        assert_eq!(
+            image_reference_from_status_with_output(&Value::Null, invalid_then_valid),
+            Some("ghcr.io/kyth-os/kyth:testing".into())
+        );
+        assert!(image_reference_from_status_with_output(
+            &Value::Null,
+            "Image: ghcr.io/mrtrickdotorg/kyth:testing@sha256:not-a-digest"
+        )
+        .is_none());
         assert!(image_reference_from_status_with_output(
             &Value::Null,
             "Image: quay.io/example/other:latest"

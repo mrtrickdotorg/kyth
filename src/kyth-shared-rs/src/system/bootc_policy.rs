@@ -5,7 +5,43 @@
 //! truth shared by both Hubs, so drifting copy here would desync the UI.
 //! Tests mirror `tests/test_kyth_bootc_policy.py` where it exists.
 
-pub const REGISTRY: &str = "ghcr.io/kyth-os/kyth";
+pub const LEGACY_REGISTRY: &str = "ghcr.io/kyth-os/kyth";
+pub const DESTINATION_REGISTRY: &str = "ghcr.io/mrtrickdotorg/kyth";
+/// Compatibility alias for callers that intentionally keep targeting the
+/// legacy registry during the trust-preparation phase.
+pub const REGISTRY: &str = LEGACY_REGISTRY;
+
+/// Return the exact Kyth repository identity for a supported image reference.
+/// Only the four published channel tags (or a digest-only reference) are
+/// accepted; near-match repositories and unknown tags fail closed.
+pub fn registry_from_ref(reference: Option<&str>) -> Option<&'static str> {
+    let raw = reference?.trim();
+    let (image, digest) = match raw.split_once('@') {
+        Some((image, digest)) => (image, Some(digest)),
+        None => (raw, None),
+    };
+    if let Some(digest) = digest {
+        let hex = digest.strip_prefix("sha256:")?;
+        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+    let (repository, tag) = match image.rsplit_once(':') {
+        Some((repository, tag)) => (repository, Some(tag)),
+        None => (image, None),
+    };
+    let registry = match repository {
+        LEGACY_REGISTRY => LEGACY_REGISTRY,
+        DESTINATION_REGISTRY => DESTINATION_REGISTRY,
+        _ => return None,
+    };
+    match tag {
+        Some("latest" | "testing" | "latest-cachy" | "testing-cachy") => Some(registry),
+        Some(_) => None,
+        None if digest.is_some() => Some(registry),
+        None => None,
+    }
+}
 
 pub fn default_phase(mode: &str) -> String {
     match mode {
@@ -368,6 +404,46 @@ pub fn update_availability_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_from_ref_accepts_all_channel_pairs_and_rejects_near_matches() {
+        for (reference, expected) in [
+            ("ghcr.io/kyth-os/kyth:latest", LEGACY_REGISTRY),
+            ("ghcr.io/kyth-os/kyth:testing", LEGACY_REGISTRY),
+            ("ghcr.io/kyth-os/kyth:latest-cachy", LEGACY_REGISTRY),
+            ("ghcr.io/kyth-os/kyth:testing-cachy", LEGACY_REGISTRY),
+            ("ghcr.io/mrtrickdotorg/kyth:latest", DESTINATION_REGISTRY),
+            ("ghcr.io/mrtrickdotorg/kyth:testing", DESTINATION_REGISTRY),
+            (
+                "ghcr.io/mrtrickdotorg/kyth:latest-cachy",
+                DESTINATION_REGISTRY,
+            ),
+            (
+                "ghcr.io/mrtrickdotorg/kyth:testing-cachy",
+                DESTINATION_REGISTRY,
+            ),
+        ] {
+            assert_eq!(
+                registry_from_ref(Some(reference)),
+                Some(expected),
+                "{reference}"
+            );
+        }
+        let digest = "a".repeat(64);
+        assert_eq!(
+            registry_from_ref(Some(&format!("ghcr.io/mrtrickdotorg/kyth@sha256:{digest}"))),
+            Some(DESTINATION_REGISTRY)
+        );
+        for unsupported in [
+            "ghcr.io/kyth-os/kyth-other:testing",
+            "ghcr.io/mrtrickdotorg/kyth-extra:latest",
+            "ghcr.io/other/kyth:latest",
+            "ghcr.io/mrtrickdotorg/kyth:nightly",
+            "ghcr.io/mrtrickdotorg/kyth:testing@sha256:not-a-digest",
+        ] {
+            assert_eq!(registry_from_ref(Some(unsupported)), None, "{unsupported}");
+        }
+    }
 
     #[test]
     fn branch_from_ref_basic() {

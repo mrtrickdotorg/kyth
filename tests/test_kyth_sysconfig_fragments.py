@@ -348,16 +348,27 @@ class ConfigHelperTests(unittest.TestCase):
         self.assertTrue(fragment.is_file(), "signature policy sysconfig fragment missing")
 
         policy = json.loads(policy_path.read_text(encoding="utf-8"))
-        reqs = policy["transports"]["docker"]["ghcr.io/kyth-os/kyth"]
-        self.assertEqual(reqs[0]["type"], "sigstoreSigned")
-        self.assertEqual(reqs[0].get("keyPath"), "/etc/containers/kyth-cosign.pub")
-        self.assertNotIn("fulcio", reqs[0], "native policy must not use unsupported Fulcio URI fields")
-        self.assertEqual(reqs[0]["signedIdentity"]["type"], "matchRepository")
+        registries = registries_path.read_text(encoding="utf-8")
+        protected_repositories = (
+            "ghcr.io/kyth-os/kyth",
+            "ghcr.io/mrtrickdotorg/kyth",
+        )
+        for repository in protected_repositories:
+            with self.subTest(repository=repository):
+                reqs = policy["transports"]["docker"][repository]
+                self.assertEqual(reqs[0]["type"], "sigstoreSigned")
+                self.assertEqual(reqs[0].get("keyPath"), "/etc/containers/kyth-cosign.pub")
+                self.assertNotIn("fulcio", reqs[0], "native policy must not use unsupported Fulcio URI fields")
+                self.assertEqual(reqs[0]["signedIdentity"]["type"], "matchRepository")
+                self.assertIn(repository + ":", registries)
+                self.assertIn("use-sigstore-attachments: true", registries)
 
         body = fragment.read_text(encoding="utf-8")
         self.assertIn("/etc/containers/policy.json", body)
         self.assertIn("/etc/containers/registries.d/kyth.yaml", body)
         self.assertIn("kyth-cosign.pub", body)
+        for repository in protected_repositories:
+            self.assertIn(repository, body)
 
     def test_supply_chain_signs_and_verifies_with_the_native_policy_key(self):
         workflow = (ROOT / ".github/workflows/supply-chain.yml").read_text(encoding="utf-8")

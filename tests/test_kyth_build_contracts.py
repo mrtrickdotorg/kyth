@@ -212,6 +212,18 @@ class ShippedCommandContracts(unittest.TestCase):
 
 
 class BuildAssemblyContracts(unittest.TestCase):
+    def test_migration_owner_build_contract(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
+        self.assertRegex(dockerfile, r"(?m)^ARG IMAGE_OWNER=kyth-os$")
+        self.assertIn('"https://github.com/${IMAGE_OWNER}/kyth"', dockerfile)
+        self.assertIn("case \"${IMAGE_OWNER}\" in", dockerfile)
+        self.assertIn('mrtrickdotorg)', dockerfile)
+        self.assertIn('kyth-os)', dockerfile)
+        self.assertIn("esac", dockerfile)
+        self.assertIn("/usr/share/kyth/", dockerfile)
+        self.assertIn('--build-arg IMAGE_OWNER="${GITHUB_REPOSITORY_OWNER}"', workflow)
+
     def test_rust_desktop_stack_has_scheduled_coordinated_freshness_check(self):
         workflow = (
             ROOT / ".github" / "workflows" / "rust-desktop-stack-freshness.yml"

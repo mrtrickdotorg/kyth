@@ -577,6 +577,7 @@ jobs:
             --secret id=github_token,env=GITHUB_TOKEN \
             "${MOK_SECRET_ARG[@]}" \
             --build-arg BASE_IMAGE="${STEPS_BUILD_BASE_OUTPUTS_PINNED}" \
+            --build-arg IMAGE_OWNER="${GITHUB_REPOSITORY_OWNER}" \
             --build-arg PROTON_CACHYOS_VER="${STEPS_PROTON_CACHYOS_OUTPUTS_VERSION}" \
             --build-arg UMU_VERSION="${STEPS_THIRDPARTY_VERSIONS_OUTPUTS_UMU}" \
             --build-arg THIRDPARTY_VERSIONS_HASH="${STEPS_THIRDPARTY_VERSIONS_OUTPUTS_HASH}" \

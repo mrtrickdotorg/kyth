@@ -117,6 +117,35 @@ class BootcHelpersTests(unittest.TestCase):
             f"{REGISTRY}:latest",
         )
 
+    def test_image_reference_from_status_accepts_both_exact_repositories(self):
+        for repository in (
+            "ghcr.io/kyth-os/kyth",
+            "ghcr.io/mrtrickdotorg/kyth",
+        ):
+            for tag in ("latest", "testing", "latest-cachy", "testing-cachy"):
+                with self.subTest(repository=repository, tag=tag):
+                    expected = f"{repository}:{tag}"
+                    self.assertEqual(
+                        bootc_query.image_reference_from_status(
+                            {}, status_output=f"Image: {expected}"
+                        ),
+                        expected,
+                    )
+        self.assertIsNone(
+            bootc_query.image_reference_from_status(
+                {}, status_output="Image: ghcr.io/mrtrickdotorg/kyth-extra:testing"
+            )
+        )
+        self.assertIsNone(
+            bootc_query.image_reference_from_status(
+                {},
+                status_output=(
+                    "Image: ghcr.io/mrtrickdotorg/kyth:testing"
+                    "@sha256:not-a-digest"
+                ),
+            )
+        )
+
     def test_image_digest_from_status(self):
         digest = "sha256:" + "a" * 64
         status = {"status": {"booted": {"image": {"imageDigest": digest}}}}
