@@ -1090,7 +1090,7 @@ fn rebase_image(args: &[String]) -> io::Result<ExitCode> {
         } else {
             &input[5..]
         };
-        format!("ghcr.io/kyth-os/kyth:{tag}")
+        format!("ghcr.io/mrtrickdotorg/kyth:{tag}")
     } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

@@ -100,7 +100,7 @@ if [[ "${expected_digest}" != "${source_digest}" ]]; then
 	exit 1
 fi
 release_digest="${source_digest}"
-target_image="ghcr.io/kyth-os/kyth:${SOURCE_TAG}"
+target_image="ghcr.io/mrtrickdotorg/kyth:${SOURCE_TAG}"
 
 # ── Registry signature gate: cosign-verify at ISO build time ─────────────────
 # The installer daemon re-verifies this digest and signature bundle before
@@ -123,7 +123,7 @@ if [ -n "${cosign_registry_ref}" ]; then
 	curl -sfL "https://github.com/sigstore/cosign/releases/download/v${cosign_version}/cosign-linux-amd64" -o "${cosign_bin}"
 	echo "${cosign_sha256}  ${cosign_bin}" | sha256sum -c -
 	chmod 0755 "${cosign_bin}"
-	cosign_identity="${KYTH_COSIGN_IDENTITY:-^https://github.com/kyth-os/kyth/\.github/workflows/supply-chain\.yml@refs/heads/(main|testing)$}"
+	cosign_identity="${KYTH_COSIGN_IDENTITY:-^https://github.com/mrtrickdotorg/kyth/\.github/workflows/supply-chain\.yml@refs/heads/(main|testing)$}"
 	cosign_issuer="https://token.actions.githubusercontent.com"
 	# cosign's TUF client bootstraps its cache with a plain mkdir of the
 	# cache root: with HOME=/root (which already exists in bootc payload

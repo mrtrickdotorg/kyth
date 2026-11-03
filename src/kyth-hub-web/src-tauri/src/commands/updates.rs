@@ -82,7 +82,8 @@ pub(crate) struct StageProgressSnapshot {
 
 static STAGE_PROGRESS: OnceLock<std::sync::Mutex<StageProgressSnapshot>> = OnceLock::new();
 const STAGE_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(5);
-const IMAGE_RELEASES_API: &str = "https://api.github.com/repos/kyth-os/kyth/releases?per_page=100";
+const IMAGE_RELEASES_API: &str =
+    "https://api.github.com/repos/mrtrickdotorg/kyth/releases?per_page=100";
 const IMAGE_RELEASES_MAX_BYTES: &str = "4000000";
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,7 +244,10 @@ fn update_release_summary_from_api(
     }
     let releases: serde_json::Value = serde_json::from_str(payload).ok()?;
     let releases = releases.as_array()?;
-    let expected_digest_line = format!("Image: `ghcr.io/kyth-os/kyth@{digest}`");
+    let expected_digest_lines = [
+        format!("Image: `ghcr.io/mrtrickdotorg/kyth@{digest}`"),
+        format!("Image: `ghcr.io/kyth-os/kyth@{digest}`"),
+    ];
     for release in releases {
         if release.get("draft").and_then(serde_json::Value::as_bool) != Some(false)
             || release
@@ -263,14 +267,18 @@ fn update_release_summary_from_api(
             .get("body")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if !body.lines().any(|line| line.trim() == expected_digest_line) {
+        if !body.lines().any(|line| {
+            expected_digest_lines
+                .iter()
+                .any(|expected| line.trim() == expected)
+        }) {
             continue;
         }
         let (highlights_title, highlights, package_total) = release_highlights(body);
         return Some(UpdateReleaseSummary {
             version,
             flavor: flavor.to_string(),
-            release_url: format!("https://github.com/kyth-os/kyth/releases/tag/{tag}"),
+            release_url: format!("https://github.com/mrtrickdotorg/kyth/releases/tag/{tag}"),
             highlights_title,
             highlights,
             package_total,
@@ -357,13 +365,16 @@ pub(crate) struct UpdateHistoryEntry {
 }
 
 /// The digest a release body binds itself to, from its
-/// `Image: ghcr.io/kyth-os/kyth@sha256:...` line; empty when absent.
+/// `Image: ghcr.io/<supported-owner>/kyth@sha256:...` line; empty when absent.
 fn release_body_digest(body: &str) -> String {
     for line in body.lines() {
-        if let Some(rest) = line.trim().strip_prefix("Image: `ghcr.io/kyth-os/kyth@") {
-            let digest = rest.trim_end_matches('`').trim();
-            if valid_image_digest(digest) {
-                return digest.to_string();
+        let line = line.trim();
+        for repository in ["ghcr.io/mrtrickdotorg/kyth@", "ghcr.io/kyth-os/kyth@"] {
+            if let Some(rest) = line.strip_prefix(&format!("Image: `{repository}")) {
+                let digest = rest.trim_end_matches('`').trim();
+                if valid_image_digest(digest) {
+                    return digest.to_string();
+                }
             }
         }
     }
@@ -416,7 +427,7 @@ fn update_release_history_from_api(
         entries.push(UpdateHistoryEntry {
             version,
             flavor: release_flavor.to_string(),
-            release_url: format!("https://github.com/kyth-os/kyth/releases/tag/{tag}"),
+            release_url: format!("https://github.com/mrtrickdotorg/kyth/releases/tag/{tag}"),
             published_at: release
                 .get("published_at")
                 .and_then(serde_json::Value::as_str)
@@ -1791,6 +1802,24 @@ mod tests {
         assert!(summary
             .highlights
             .contains(&"Security fix: CVE-2026-12345".to_string()));
+    }
+
+    #[test]
+    fn update_release_summary_matches_new_registry_and_legacy_release_bodies() {
+        let digest = format!("sha256:{}", "d".repeat(64));
+        for repository in ["ghcr.io/mrtrickdotorg/kyth", "ghcr.io/kyth-os/kyth"] {
+            let body = format!("Image: `{repository}@{digest}`");
+            let payload = serde_json::json!([{
+                "tag_name": "image-testing-20261102-2481-1-8b81dca7",
+                "draft": false, "prerelease": true, "body": body,
+            }]);
+            let summary =
+                super::update_release_summary_from_api(&payload.to_string(), "testing", &digest)
+                    .expect("new and legacy image refs are supported");
+            assert_eq!(summary.flavor, "fedora");
+            assert_eq!(summary.release_url,
+                "https://github.com/mrtrickdotorg/kyth/releases/tag/image-testing-20261102-2481-1-8b81dca7");
+        }
     }
 
     #[test]

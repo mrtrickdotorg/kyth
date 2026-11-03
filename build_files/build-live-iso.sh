@@ -8,7 +8,7 @@ SOURCE_TAG="${SOURCE_TAG:-latest}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUTPUT_DIR="${KYTH_ISO_OUTPUT:-${REPO_ROOT}/output/live-iso}"
-BASE_IMAGE="${INSTALLER_BASE_IMAGE:-ghcr.io/kyth-os/kyth:${SOURCE_TAG}}"
+BASE_IMAGE="${INSTALLER_BASE_IMAGE:-ghcr.io/mrtrickdotorg/kyth:${SOURCE_TAG}}"
 INSTALL_SOURCE_IMAGE="${INSTALL_SOURCE_IMAGE:-${BASE_IMAGE}}"
 IS_LOCAL_IMAGE=false
 if [[ "${BASE_IMAGE}" == localhost/* || "${BASE_IMAGE}" == localhost:*/* ]]; then

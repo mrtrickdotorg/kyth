@@ -233,13 +233,13 @@ jobs:
         run: |
           set -euo pipefail
           digest="$(skopeo inspect --no-creds \
-            docker://ghcr.io/kyth-os/kyth:testing | jq -r .Digest)"
+            docker://ghcr.io/mrtrickdotorg/kyth:testing | jq -r .Digest)"
           [[ "${digest}" == sha256:* ]] || {
             echo "::error::could not resolve promoted testing image digest" >&2
             exit 1
           }
-          echo "Promoted testing image: ghcr.io/kyth-os/kyth:testing@${digest}"
-          printf 'ref=%s\n' "ghcr.io/kyth-os/kyth:testing@${digest}" >>"${GITHUB_OUTPUT}"
+          echo "Promoted testing image: ghcr.io/mrtrickdotorg/kyth@${digest}"
+          printf 'ref=%s\n' "ghcr.io/mrtrickdotorg/kyth@${digest}" >>"${GITHUB_OUTPUT}"
 
       - name: Download promoted testing ISO
         env:

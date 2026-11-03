@@ -1,6 +1,5 @@
 # Registry configuration for KythOS image signature verification.
-# Enable sigstore attachment lookup for both the legacy and destination
-# repositories so policy.json can validate signatures at either identity.
+# Retain attachment lookup for old deployments while new installs use destination.
 docker:
   ghcr.io/kyth-os/kyth:
     use-sigstore-attachments: true

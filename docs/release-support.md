@@ -149,3 +149,31 @@ is untrusted.
 Most changes should be delivered through `bootc upgrade`. A reinstall should be
 required only for installer-specific defects, disk layout choices, or documented
 breaking changes that cannot be safely migrated in place.
+
+
+## Switching an installed system to the destination registry
+
+The supported image references are `ghcr.io/mrtrickdotorg/kyth:latest`,
+`ghcr.io/mrtrickdotorg/kyth:testing`,
+`ghcr.io/mrtrickdotorg/kyth:latest-cachy`, and
+`ghcr.io/mrtrickdotorg/kyth:testing-cachy`. Existing deployments keep tracking
+their configured image reference; updates do not silently change the host's
+bootc origin.
+
+Before switching, inspect the effective signature policy (including any
+`/etc/containers/policy.json` override) and confirm it permits the destination
+image's signatures. Record `sudo bootc status` before the change. Explicitly
+opt in by selecting the matching channel and kernel flavor, for example:
+
+```bash
+sudo bootc switch ghcr.io/mrtrickdotorg/kyth:testing
+sudo bootc status
+sudo systemctl reboot
+```
+
+After reboot, run `sudo bootc status` again and verify the active deployment and
+image match the intended channel. Do not remove the previous deployment until
+this check succeeds. If the new deployment fails to boot or is unhealthy, use
+the boot menu to select the previous deployment; once booted, `sudo bootc
+rollback` restores the prior deployment as the rollback target. Then reboot and
+verify status. Switching is opt-in; there is no automatic origin migration.

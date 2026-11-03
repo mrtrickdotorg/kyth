@@ -7,6 +7,11 @@ name: Supply Chain Metadata
 on:
   workflow_dispatch:
     inputs:
+      migrate_legacy_stable:
+        description: Copy the existing legacy stable digest unchanged (manual approval required)
+        required: false
+        default: false
+        type: boolean
       source_tag:
         description: Image tag to process
         required: true
@@ -52,6 +57,7 @@ env:
 
 jobs:
   prepare:
+    if: inputs.migrate_legacy_stable != true
     name: Prepare metadata (${{ inputs.source_tag }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -633,3 +639,151 @@ jobs:
             {
               "source_tag": ${{ toJSON(inputs.source_tag) }}
             }
+
+  # Maintenance copy, not a new stable build or testing-to-main promotion.
+  # Preserve original labels/provenance and all source images. No ISO/release
+  # dispatches: those existing stable images predate the consumer-default fix.
+  migrate_stable:
+    name: Migrate unchanged stable (${{ inputs.source_tag }})
+    if: inputs.migrate_legacy_stable == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: stable-release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    concurrency:
+      group: supply-chain-publish-${{ inputs.source_tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MIGRATE_LEGACY_STABLE: ${{ toJSON(inputs.migrate_legacy_stable) }}
+      ORIGINAL_EVENT: ${{ inputs.original_event }}
+      SOURCE_TAG: ${{ inputs.source_tag }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      SOURCE_DIGEST: ${{ inputs.source_digest }}
+      LEGACY_IMAGE: ghcr.io/kyth-os/kyth
+      DESTINATION_IMAGE: ghcr.io/mrtrickdotorg/kyth
+    steps:
+      - name: Checkout maintenance code at workflow SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Setup ORAS
+        uses: ./.github/actions/setup-oras
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Cosign
+        uses: ./.github/actions/setup-cosign
+      - name: Install native image verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+      - name: Authenticate destination registry
+        uses: ./.github/actions/registry-login
+        with:
+          password: ${{ secrets.GITHUB_TOKEN }}
+          docker: "true"
+      - name: Verify legacy build provenance
+        run: |
+          set -euo pipefail
+          # Validate caller fields before using them in registry or API paths.
+          [[ "${SOURCE_TAG}" == latest || "${SOURCE_TAG}" == latest-cachy ]]
+          [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${SOURCE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          MAIN_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          export MAIN_SHA
+          LEGACY_DIGEST="$(skopeo inspect --no-creds "docker://${LEGACY_IMAGE}:${SOURCE_TAG}" --format '{{.Digest}}')"
+          export LEGACY_DIGEST
+          python3 .github/scripts/validate-stable-migration.py > "${RUNNER_TEMP}/migration-context.json"
+          test "$(gh api repos/kyth-os/kyth --jq .id)" = "$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"
+          skopeo inspect --no-creds "docker://${LEGACY_IMAGE}@${SOURCE_DIGEST}" > "${RUNNER_TEMP}/legacy-image.json"
+          jq -e --arg sha "${SOURCE_SHA}" --arg base "${LEGACY_IMAGE}:base-${SOURCE_TAG}" \
+            '.Labels["org.opencontainers.image.revision"] == $sha and .Labels["org.opencontainers.image.base.name"] == $base' \
+            "${RUNNER_TEMP}/legacy-image.json"
+          gh attestation verify "oci://${LEGACY_IMAGE}@${SOURCE_DIGEST}" \
+            --bundle-from-oci --repo kyth-os/kyth \
+            --signer-workflow kyth-os/kyth/.github/workflows/build.yml \
+            --source-digest "${SOURCE_SHA}" --source-ref refs/heads/main \
+            --deny-self-hosted-runners --format json > "${RUNNER_TEMP}/legacy-provenance.json"
+          # Refuse to replace a separately published destination stable image.
+          oras repo tags "${DESTINATION_IMAGE}" --format json > "${RUNNER_TEMP}/destination-tags.json"
+          if jq -e --arg tag "${SOURCE_TAG}" '.tags | index($tag) != null' "${RUNNER_TEMP}/destination-tags.json"; then
+            test "$(skopeo inspect --no-creds "docker://${DESTINATION_IMAGE}:${SOURCE_TAG}" --format '{{.Digest}}')" = "${SOURCE_DIGEST}"
+          fi
+      - name: Copy verified immutable image and attached evidence
+        run: |
+          set -euo pipefail
+          CANDIDATE="migration-${SOURCE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Remote copy preserves bytes and recursively retains OCI provenance
+          # and SBOM referrers. It makes no claim that this was destination-built.
+          oras copy --recursive "${LEGACY_IMAGE}@${SOURCE_DIGEST}" "${DESTINATION_IMAGE}:${CANDIDATE}"
+          test "$(skopeo inspect --no-creds "docker://${DESTINATION_IMAGE}:${CANDIDATE}" --format '{{.Digest}}')" = "${SOURCE_DIGEST}"
+          gh attestation verify "oci://${DESTINATION_IMAGE}@${SOURCE_DIGEST}" \
+            --bundle-from-oci --repo kyth-os/kyth \
+            --signer-workflow kyth-os/kyth/.github/workflows/build.yml \
+            --source-digest "${SOURCE_SHA}" --source-ref refs/heads/main \
+            --deny-self-hosted-runners --format json > "${RUNNER_TEMP}/copied-provenance.json"
+      - name: Sign destination identity
+        env:
+          KYTH_COSIGN_PRIVATE_KEY: ${{ secrets.KYTH_COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.KYTH_COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${KYTH_COSIGN_PRIVATE_KEY}"
+          test -n "${COSIGN_PASSWORD}"
+          umask 077
+          KEY="${RUNNER_TEMP}/migration-cosign.key"
+          trap 'rm -f "${KEY}"' EXIT
+          printf '%s' "${KYTH_COSIGN_PRIVATE_KEY}" > "${KEY}"
+          cosign sign -y --key "${KEY}" "${DESTINATION_IMAGE}@${SOURCE_DIGEST}"
+          cosign sign -y "${DESTINATION_IMAGE}@${SOURCE_DIGEST}"
+      - name: Verify destination signatures and policy
+        run: |
+          set -euo pipefail
+          cosign verify --key build_files/config/containers/kyth-cosign.pub \
+            "${DESTINATION_IMAGE}@${SOURCE_DIGEST}" > "${RUNNER_TEMP}/destination-static-signature.json"
+          cosign verify \
+            --certificate-identity 'https://github.com/mrtrickdotorg/kyth/.github/workflows/supply-chain.yml@refs/heads/testing' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${DESTINATION_IMAGE}@${SOURCE_DIGEST}" > "${RUNNER_TEMP}/destination-keyless-signature.json"
+          # Exercise containers/image's real sigstoreSigned matchRepository
+          # policy, with the same public key and registry attachment lookup.
+          jq --arg key "${GITHUB_WORKSPACE}/build_files/config/containers/kyth-cosign.pub" \
+            '{default:[{type:"reject"}],transports:{docker:{"ghcr.io/mrtrickdotorg/kyth":[{type:"sigstoreSigned",keyPath:$key,signedIdentity:{type:"matchRepository"}}]}}}' \
+            -n > "${RUNNER_TEMP}/migration-policy.json"
+          skopeo --policy "${RUNNER_TEMP}/migration-policy.json" \
+            --registries.d build_files/config/containers/registries.d \
+            copy --all --preserve-digests --src-no-creds \
+            "docker://${DESTINATION_IMAGE}@${SOURCE_DIGEST}" "dir:${RUNNER_TEMP}/verified-stable-pull"
+      - name: Promote unchanged stable digest
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          export MAIN_SHA
+          LEGACY_DIGEST="$(skopeo inspect --no-creds "docker://${LEGACY_IMAGE}:${SOURCE_TAG}" --format '{{.Digest}}')"
+          export LEGACY_DIGEST
+          python3 .github/scripts/validate-stable-migration.py
+          oras repo tags "${DESTINATION_IMAGE}" --format json > "${RUNNER_TEMP}/destination-tags.json"
+          if jq -e --arg tag "${SOURCE_TAG}" '.tags | index($tag) != null' "${RUNNER_TEMP}/destination-tags.json"; then
+            test "$(skopeo inspect --no-creds "docker://${DESTINATION_IMAGE}:${SOURCE_TAG}" --format '{{.Digest}}')" = "${SOURCE_DIGEST}"
+          fi
+          oras tag "${DESTINATION_IMAGE}@${SOURCE_DIGEST}" "${SOURCE_TAG}"
+          test "$(skopeo inspect --no-creds "docker://${DESTINATION_IMAGE}:${SOURCE_TAG}" --format '{{.Digest}}')" = "${SOURCE_DIGEST}"
+          test "$(skopeo inspect --no-creds "docker://${LEGACY_IMAGE}:${SOURCE_TAG}" --format '{{.Digest}}')" = "${SOURCE_DIGEST}"
+      - name: Preserve migration verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stable-registry-migration-${{ inputs.source_tag }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/migration-context.json
+            ${{ runner.temp }}/legacy-image.json
+            ${{ runner.temp }}/legacy-provenance.json
+            ${{ runner.temp }}/copied-provenance.json
+            ${{ runner.temp }}/destination-static-signature.json
+            ${{ runner.temp }}/destination-keyless-signature.json
+          if-no-files-found: warn
+          retention-days: 30

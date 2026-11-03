@@ -229,7 +229,7 @@ fn installer_target_ref() -> String {
             })
         })
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "ghcr.io/kyth-os/kyth:testing".into())
+        .unwrap_or_else(|| "ghcr.io/mrtrickdotorg/kyth:testing".into())
 }
 
 #[cfg(unix)]
@@ -810,7 +810,9 @@ mod tests {
     #[test]
     fn validates_restricted_update_refs() {
         assert!(valid_update_ref(""));
-        assert!(valid_update_ref("ghcr.io/kyth-os/kyth:testing@sha256:abc"));
+        assert!(valid_update_ref(
+            "ghcr.io/mrtrickdotorg/kyth:testing@sha256:abc"
+        ));
         assert!(!valid_update_ref("ghcr.io/kyth;poweroff"));
         assert!(!valid_update_ref("image with spaces"));
         assert!(!valid_update_ref(&"a".repeat(UPDATE_REF_MAX + 1)));

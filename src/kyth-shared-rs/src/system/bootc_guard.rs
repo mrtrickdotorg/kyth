@@ -99,10 +99,10 @@ pub fn check() -> Result<String, String> {
 
 pub fn switch(channel: &str) -> Result<String, String> {
     let reference = match channel {
-        "latest" => "ghcr.io/kyth-os/kyth:latest",
-        "testing" => "ghcr.io/kyth-os/kyth:testing",
-        "latest-cachy" => "ghcr.io/kyth-os/kyth:latest-cachy",
-        "testing-cachy" => "ghcr.io/kyth-os/kyth:testing-cachy",
+        "latest" => "ghcr.io/mrtrickdotorg/kyth:latest",
+        "testing" => "ghcr.io/mrtrickdotorg/kyth:testing",
+        "latest-cachy" => "ghcr.io/mrtrickdotorg/kyth:latest-cachy",
+        "testing-cachy" => "ghcr.io/mrtrickdotorg/kyth:testing-cachy",
         _ => return Err("unsupported bootc channel".to_string()),
     };
     // Lock first: prepare_boot remounts /boot rw, so a busy lock must
@@ -131,6 +131,17 @@ pub fn switch(channel: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_uses_destination_registry_for_all_supported_channels() {
+        let source = include_str!("bootc_guard.rs");
+        for channel in ["latest", "testing", "latest-cachy", "testing-cachy"] {
+            assert!(
+                source.contains(&format!("ghcr.io/mrtrickdotorg/kyth:{channel}")),
+                "missing destination registry reference for {channel}"
+            );
+        }
+    }
 
     #[test]
     fn switch_takes_lock_before_remounting_boot() {

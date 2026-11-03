@@ -69,7 +69,8 @@ class RustMigrationAcceptanceContractTest(unittest.TestCase):
         self.assertIn("schedule:", self.artifact_workflow)
         self.assertIn("cron:", self.artifact_workflow)
         # Nightly runs the promoted testing image, not a dispatch artifact.
-        self.assertIn("ghcr.io/kyth-os/kyth:testing", self.artifact_workflow)
+        self.assertIn("ghcr.io/mrtrickdotorg/kyth:testing", self.artifact_workflow)
+        self.assertNotIn("ghcr.io/kyth-os/kyth", self.artifact_workflow)
         self.assertIn("iso-testing", self.artifact_workflow)
         # The nightly run must fail on a nonzero acceptance exit: it gates
         # nothing, so silence would hide regressions.

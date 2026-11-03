@@ -53,7 +53,7 @@ fi
 if [ -f /etc/kyth-installer.env ]; then
 	. /etc/kyth-installer.env
 fi
-KYTH_SOURCE_IMAGE="${KYTH_SOURCE_IMAGE:-ghcr.io/kyth-os/kyth:latest}"
+KYTH_SOURCE_IMAGE="${KYTH_SOURCE_IMAGE:-ghcr.io/mrtrickdotorg/kyth:latest}"
 KYTH_TARGET_IMAGE="${KYTH_TARGET_IMAGE:-${KYTH_SOURCE_IMAGE}}"
 KYTH_SOURCE_DIGEST="${KYTH_SOURCE_DIGEST:-}"
 

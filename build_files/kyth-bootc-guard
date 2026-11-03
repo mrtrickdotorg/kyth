@@ -66,16 +66,16 @@ case "$1" in
         exit $?
         ;;
     switch-latest)
-        ref="ghcr.io/kyth-os/kyth:latest"
+        ref="ghcr.io/mrtrickdotorg/kyth:latest"
         ;;
     switch-testing)
-        ref="ghcr.io/kyth-os/kyth:testing"
+        ref="ghcr.io/mrtrickdotorg/kyth:testing"
         ;;
     switch-latest-cachy)
-        ref="ghcr.io/kyth-os/kyth:latest-cachy"
+        ref="ghcr.io/mrtrickdotorg/kyth:latest-cachy"
         ;;
     switch-testing-cachy)
-        ref="ghcr.io/kyth-os/kyth:testing-cachy"
+        ref="ghcr.io/mrtrickdotorg/kyth:testing-cachy"
         ;;
     *)
         echo "kyth-bootc-guard: unsupported operation: $1" >&2

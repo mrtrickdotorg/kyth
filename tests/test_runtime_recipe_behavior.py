@@ -204,7 +204,7 @@ class RuntimeRecipeBehaviorTest(unittest.TestCase):
                 )
             ],
             "rebase": [
-                ("sudo", ["bootc", "switch", "ghcr.io/kyth-os/kyth:testing"]),
+                ("sudo", ["bootc", "switch", "ghcr.io/mrtrickdotorg/kyth:testing"]),
                 ("sudo", ["/usr/bin/kyth-finalize-staged"]),
             ],
             "switch-channel": [

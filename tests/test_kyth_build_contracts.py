@@ -726,7 +726,7 @@ class BuildAssemblyContracts(unittest.TestCase):
             chr(10).join(json.dumps(value) for value in expected_signatures),
             json.dumps(expected_signatures),
         ]
-        expected_identity = r"^https://github.com/kyth-os/kyth/\.github/workflows/supply-chain\.yml@refs/heads/(main|testing)$"
+        expected_identity = r"^https://github.com/mrtrickdotorg/kyth/\.github/workflows/supply-chain\.yml@refs/heads/(main|testing)$"
 
         with tempfile.TemporaryDirectory() as directory:
             bundle_path = Path(directory) / "image.sig.bundle.json"
@@ -763,7 +763,7 @@ class BuildAssemblyContracts(unittest.TestCase):
                 )
                 self.assertEqual(bundle["identity"], expected_identity)
                 self.assertRegex(
-                    "https://github.com/kyth-os/kyth/.github/workflows/supply-chain.yml@refs/heads/testing",
+                    "https://github.com/mrtrickdotorg/kyth/.github/workflows/supply-chain.yml@refs/heads/testing",
                     re.compile(bundle["identity"]),
                 )
 

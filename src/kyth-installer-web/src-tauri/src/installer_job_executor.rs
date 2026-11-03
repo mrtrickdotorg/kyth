@@ -232,9 +232,9 @@ impl NativeInstallRequest {
                         "to-disk".to_string()
                     },
                     source_imgref: std::env::var("KYTH_SOURCE_IMAGE")
-                        .unwrap_or_else(|_| "ghcr.io/kyth-os/kyth:latest".to_string()),
+                        .unwrap_or_else(|_| "ghcr.io/mrtrickdotorg/kyth:latest".to_string()),
                     target_imgref: std::env::var("KYTH_TARGET_IMAGE")
-                        .unwrap_or_else(|_| "ghcr.io/kyth-os/kyth:latest".to_string()),
+                        .unwrap_or_else(|_| "ghcr.io/mrtrickdotorg/kyth:latest".to_string()),
                     target: if filesystem_install {
                         FILESYSTEM_STAGING_MOUNTPOINT.to_string()
                     } else {
@@ -3444,7 +3444,7 @@ mod tests {
                 bootc: BootcInstallInput {
                     subcommand: "to-disk".into(),
                     source_imgref: "oci:/usr/share/kyth/image:latest".into(),
-                    target_imgref: "ghcr.io/kyth-os/kyth:latest".into(),
+                    target_imgref: "ghcr.io/mrtrickdotorg/kyth:latest".into(),
                     target: "/dev/sda".into(),
                     skip_fetch_check: false,
                     skip_finalize: false,
@@ -3794,7 +3794,7 @@ mod tests {
                 "schema_version": 1,
                 "digest": digest,
                 "release_digest": digest,
-                "target_image": "ghcr.io/kyth-os/kyth:latest",
+                "target_image": "ghcr.io/mrtrickdotorg/kyth:latest",
                 "source_image": format!("docker://ghcr.io/kyth-os/kyth@{digest}"),
                 "signature": "verified",
                 "signature_digest": format!("sha256:{bundle_sha}"),

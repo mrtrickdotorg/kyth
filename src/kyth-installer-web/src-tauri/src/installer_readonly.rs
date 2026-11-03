@@ -103,14 +103,14 @@ fn normalize_source_reference(image: &str) -> String {
 fn source_reference() -> String {
     normalize_source_reference(&configured(
         "KYTH_SOURCE_IMAGE",
-        "ghcr.io/kyth-os/kyth:latest",
+        "ghcr.io/mrtrickdotorg/kyth:latest",
     ))
 }
 
 fn target_reference() -> String {
     configured(
         "KYTH_TARGET_IMAGE",
-        &configured("KYTH_SOURCE_IMAGE", "ghcr.io/kyth-os/kyth:latest"),
+        &configured("KYTH_SOURCE_IMAGE", "ghcr.io/mrtrickdotorg/kyth:latest"),
     )
 }
 
@@ -480,7 +480,7 @@ fn source_status() -> Value {
 
 pub(crate) fn config() -> Value {
     serde_json::json!({
-        "source_image": configured("KYTH_SOURCE_IMAGE", "ghcr.io/kyth-os/kyth:latest"),
+        "source_image": configured("KYTH_SOURCE_IMAGE", "ghcr.io/mrtrickdotorg/kyth:latest"),
         "is_live": Path::new("/etc/kyth-installer.env").is_file(),
         "source": source_status()
     })
