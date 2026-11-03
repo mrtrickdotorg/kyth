@@ -330,7 +330,9 @@ test("release summary is tied to the checked image and explains unavailable note
   assert.match(updatesOverview, /RELEASE_SUMMARY_RETRY_DELAY_MS/);
   assert.match(updatesOverview, /setTimeout/);
   assert.match(updatesOverview, /clearTimeout/);
-  assert.match(updatesRust, /body\.lines\(\)\.any\(\|line\| line\.trim\(\) == expected_digest_line\)/);
+  assert.ok(updatesRust.includes('format!("Image: `ghcr.io/mrtrickdotorg/kyth@{digest}`")'));
+  assert.ok(updatesRust.includes('format!("Image: `ghcr.io/kyth-os/kyth@{digest}`")'));
+  assert.match(updatesRust, /expected_digest_lines\s*\.iter\(\)\s*\.any\(\|expected\| line\.trim\(\) == expected\)/);
   assert.match(updatesRust, /fn normalize_image_branch/);
   assert.match(updatesRust, /"testing-cachy" => Some\(\("testing", "cachy"\)\)/);
   assert.match(updatesRust, /"latest-cachy" => Some\(\("latest", "cachy"\)\)/);

@@ -44,14 +44,14 @@ class StreamingAdditionalCoverageTests(unittest.TestCase):
         runner = StreamingCommandRunner(rx_bytes=lambda: 0, publish=lambda _e: None)
         seen = []
         runner.run(
-            ["/usr/bin/echo", "layers needed: garbage-no-parens"],
+            ["echo", "layers needed: garbage-no-parens"],
             0, 100, lambda m: None, lambda p: seen.append(p),
         )
         self.assertTrue(seen)
         # Parenthesized garbage must also fall back instead of raising.
         seen.clear()
         runner.run(
-            ["/usr/bin/echo", "layers needed: abc (not-a-size)"],
+            ["echo", "layers needed: abc (not-a-size)"],
             0, 100, lambda m: None, lambda p: seen.append(p),
         )
         self.assertTrue(seen)
@@ -76,7 +76,7 @@ class StreamingAdditionalCoverageTests(unittest.TestCase):
         ), mock.patch("kyth_installer.streaming.os.read", return_value=b""):
             with self.assertRaisesRegex(RuntimeError, "did not exit"):
                 runner.run(
-                    ["/usr/bin/echo", "hi"], 0, 100,
+                    ["echo", "hi"], 0, 100,
                     lambda m: None, lambda p: None,
                 )
 
