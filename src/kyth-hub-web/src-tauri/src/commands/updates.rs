@@ -1788,7 +1788,7 @@ mod tests {
         assert_eq!(summary.version, "testing.20260925.2481.1.8b81dca7");
         assert_eq!(
             summary.release_url,
-            "https://github.com/kyth-os/kyth/releases/tag/image-testing-20260925-2481-1-8b81dca7"
+            "https://github.com/mrtrickdotorg/kyth/releases/tag/image-testing-20260925-2481-1-8b81dca7"
         );
         assert_eq!(summary.highlights_title, "Package changes");
         assert_eq!(summary.flavor, "fedora");
@@ -1963,7 +1963,7 @@ mod tests {
         assert_eq!(history[0].published_at, "2026-10-12T22:00:00Z");
         assert_eq!(
             history[0].release_url,
-            "https://github.com/kyth-os/kyth/releases/tag/image-testing-20261012-2736-1-aaaaaaaa"
+            "https://github.com/mrtrickdotorg/kyth/releases/tag/image-testing-20261012-2736-1-aaaaaaaa"
         );
         let cachy_history =
             super::update_release_history_from_api(&payload.to_string(), "testing", "cachy");

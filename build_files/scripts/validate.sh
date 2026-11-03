@@ -267,6 +267,7 @@ if grep -qE '^Before=.*systemd-sysusers\.service' "${host_accounts_unit}" 2>/dev
 	stale_host_cycle_filter='^(local-fs(-pre)?\.target|systemd-(tmpfiles-setup-dev|sysusers)\.service|kyth-system-accounts\.service): .*'
 fi
 unexpected="$(printf '%s\n' "${output}" |
+	python3 build_files/scripts/filter-systemd-verify.py build_files/*.service build_files/*.timer |
 	grep -Ev \
 		-e '^[^:]+: Command .+ is not executable: No such file or directory$' \
 		-e '^Failed to turn off SO_PASSRIGHTS on user lookup socket, ignoring: Operation not permitted$' \
