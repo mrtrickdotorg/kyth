@@ -13,6 +13,11 @@ on:
         options:
           - 'false'
           - 'true'
+      destination_testing:
+        description: 'Run the hard-disabled destination preflight only'
+        required: false
+        default: false
+        type: boolean
   # `workflow_run` always executes the DEFAULT branch's copy of this file, so a
   # testing push was built by main's (F44) workflow no matter what testing's
   # copy said. A push trigger runs the pushed branch's own copy, which is the
@@ -102,8 +107,14 @@ jobs:
             if (eventName === 'workflow_dispatch') {
               // Manual dispatch requires explicit skip_validation=true to
               // bypass; defaults to requiring Validation.
+              const destinationValue = context.payload.inputs?.destination_testing;
+              const destinationTesting =
+                destinationValue === true || destinationValue === 'true';
               const skip = context.payload.inputs && context.payload.inputs.skip_validation === 'true';
-              if (skip) {
+              if (destinationTesting) {
+                core.info('Destination preflight requested; legacy build path remains disabled');
+                core.setOutput('ok', 'false');
+              } else if (skip) {
                 core.warning('Validation gate explicitly skipped via skip_validation input');
                 core.setOutput('ok', 'true');
               } else {
@@ -175,6 +186,102 @@ jobs:
             }
             core.info(`Validation succeeded for ${headSha} (${headBranch}) — proceeding`);
             core.setOutput('ok', 'true');
+
+  destination_gate:
+    name: Destination testing preflight (hard-disabled)
+    if: github.event_name == 'workflow_dispatch' && inputs.destination_testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout trusted policy at dispatched SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate destination dispatch context
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const workflows = await github.paginate(
+              github.rest.actions.listRepoWorkflows,
+              { owner, repo, per_page: 100 }
+            );
+            const validationWorkflow = workflows.find((workflow) =>
+              workflow.name === 'Validation' &&
+              workflow.path === '.github/workflows/validation.yml' &&
+              workflow.state === 'active'
+            );
+            if (!validationWorkflow) {
+              throw new Error('Active Validation workflow at expected path not found');
+            }
+            const branch = await github.rest.repos.getBranch({ owner, repo, branch: 'testing' });
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id: validationWorkflow.id,
+                head_sha: context.sha,
+                event: 'push',
+                branch: 'testing',
+                per_page: 100,
+              }
+            );
+            const validation = runs.find((r) =>
+              r.name === 'Validation' &&
+              r.status === 'completed' &&
+              r.conclusion === 'success'
+            );
+            const input = {
+              event_name: context.eventName,
+              repository: `${owner}/${repo}`,
+              ref: context.ref,
+              skip_validation: context.payload.inputs?.skip_validation ?? 'false',
+              source_sha: context.sha,
+              testing_tip_sha: branch.data.commit.sha,
+              validation_sha: validation?.head_sha ?? '',
+              validation_branch: validation?.head_branch ?? '',
+              validation_workflow_name: validation?.name ?? '',
+              validation_workflow_path: validationWorkflow.path,
+              validation_event: validation?.event ?? '',
+              validation_status: validation?.status ?? '',
+              validation_conclusion: validation?.conclusion ?? '',
+            };
+            const fs = require('fs');
+            fs.writeFileSync(process.env.RUNNER_TEMP + '/destination-dispatch.json', JSON.stringify(input));
+            const { execFileSync } = require('child_process');
+            execFileSync('python3', ['build_files/scripts/destination_testing_policy.py', 'validate-dispatch', process.env.RUNNER_TEMP + '/destination-dispatch.json'], { stdio: 'inherit' });
+            const plans = [
+              { source_tag: 'testing', kernel_flavor: 'fedora' },
+              { source_tag: 'testing-cachy', kernel_flavor: 'cachy' },
+            ];
+            for (const channel of plans) {
+              const plan = {
+                repository: `${owner}/${repo}`,
+                ref: context.ref,
+                source_sha: context.sha,
+                build_workflow_sha: context.sha,
+                source_tag: channel.source_tag,
+                kernel_flavor: channel.kernel_flavor,
+                run_id: process.env.DESTINATION_RUN_ID,
+                run_attempt: process.env.DESTINATION_RUN_ATTEMPT,
+              };
+              const planPath = process.env.RUNNER_TEMP + `/destination-plan-${channel.source_tag}.json`;
+              fs.writeFileSync(planPath, JSON.stringify(plan));
+              const identity = execFileSync('python3', ['build_files/scripts/destination_testing_policy.py', 'plan-build', planPath], { encoding: 'utf8' });
+              core.info(identity.trim());
+            }
+        env:
+          DESTINATION_RUN_ID: ${{ github.run_id }}
+          DESTINATION_RUN_ATTEMPT: ${{ github.run_attempt }}
+      - name: Keep destination publication disabled
+        run: |
+          echo '::notice::Preflight gate only: destination build, signing, and publication remain hard-disabled.'
+          exit 1
 
   plan:
     name: Plan build matrix

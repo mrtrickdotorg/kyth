@@ -53,6 +53,14 @@ done
 echo "==> Python syntax"
 python3 build_files/scripts/validate-python-syntax.py
 
+# Fast, dependency-free gate for the destination-testing policy: it asserts the
+# opt-in preflight workflow feeds the same repository identity the policy
+# authorizes, so the gate cannot silently reject every dispatch. Runs here as
+# well as under `unittest discover` because --fast skips the full suite.
+echo "==> Destination-testing policy"
+PYTHONPATH=build_files/kyth_shared:build_files/kyth-installer python3 -m unittest \
+	tests.test_kyth_destination_build_gate tests.test_kyth_destination_testing_policy
+
 echo "==> Optimization budgets"
 python3 build_files/scripts/optimization-report.py --check
 

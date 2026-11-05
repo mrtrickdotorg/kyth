@@ -177,3 +177,31 @@ this check succeeds. If the new deployment fails to boot or is unhealthy, use
 the boot menu to select the previous deployment; once booted, `sudo bootc
 rollback` restores the prior deployment as the rollback target. Then reboot and
 verify status. Switching is opt-in; there is no automatic origin migration.
+
+## Destination-testing preflight (manual, non-publishing)
+
+Destination-built publication is **not enabled**. The only destination path
+released today is the unchanged-stable maintenance copy in
+`.github/workflows/supply-chain.yml` (`migrate_legacy_stable`), documented
+above.
+
+A manual `Build container image` dispatch with `destination_testing: true` runs
+a read-only preflight and then fails closed; it never builds, signs, or
+publishes an image and does not promote a tag:
+
+- Only `workflow_dispatch` on `testing` at the current tip qualifies, and the
+  exact SHA must already have a successful `Validation` run from the `push`
+  event on `.github/workflows/validation.yml`. `skip_validation: true` is
+  rejected in this mode.
+- The job holds `actions: read` and `contents: read` only, and derives the
+  repository, ref, SHA, run ID, and run attempt from trusted workflow context
+  and the GitHub API rather than from dispatch inputs.
+- Identity checks live in `build_files/scripts/destination_testing_policy.py`:
+  they fix the source repository, the `testing`/`fedora` and
+  `testing-cachy`/`cachy` channel plan, and the
+  `destination-{base,raw,candidate}-<channel>-<run>-<attempt>-<flavor>` tags.
+  The preflight computes those plans and exits non-zero on any mismatch.
+
+Anyone changing the source repository, the destination image, or the channel
+plan must update that policy module and its tests together; `validate.sh`
+runs them as a fast gate.
