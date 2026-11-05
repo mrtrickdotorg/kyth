@@ -10,12 +10,17 @@ set -euo pipefail
 # SECURITY: the bootstrap RPMs are fetched over TLS and then verified against
 # pinned SHA256 hashes before install. A compromised bootstrap could otherwise
 # point `gpgkey` at an attacker key, subverting all later "verified" installs.
-# These hashes are byte-stable per Fedora release; bump them on releasever
-# change (verify against https://rpmfusion.org/Configuration).
-#   rpmfusion-free-release-45.noarch.rpm
-RPMFUSION_FREE_SHA256="a120c2a2c70ec2c8ad461908aacf316998b03f6b2156c143b772052972e80a95"
-#   rpmfusion-nonfree-release-45.noarch.rpm
-RPMFUSION_NONFREE_SHA256="0cb381899827136c92be41a068e6177982bda36ce594729c0bf6f4fa485a15a9"
+# Each hash pins one exact build. RPM Fusion does republish these RPMs within
+# a Fedora release (45-2, upstream last-modified 2026-11-03), so a pin
+# goes stale mid-cycle; that fails the build loudly rather than silently
+# installing unverified bytes. Bump by re-downloading the artifact and
+# confirming its SHA256 matches across independent mirrors
+# (download1.rpmfusion.org + the mirrors.rpmfusion.org pool); see
+# https://rpmfusion.org/Configuration.
+#   rpmfusion-free-release-45.noarch.rpm (45-2)
+RPMFUSION_FREE_SHA256="761100efc44f57e16dadec1780582f725028e212593740e955dbc7d5b2de81bb"
+#   rpmfusion-nonfree-release-45.noarch.rpm (45-2)
+RPMFUSION_NONFREE_SHA256="04582bbbb8edf54cc5340d807fb57ae44fea2e8c513b1928a9637b518817328e"
 # Fail loudly: later codec installs must not silently drop freeworld packages
 # when RPM Fusion is missing.
 fedora_release="$(rpm -E %fedora)"
