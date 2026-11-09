@@ -32,6 +32,11 @@ openssl x509 -in "${CERT}" -outform DER -out "${der_tmp}"
 install -Dm 0644 "${der_tmp}" /usr/share/kyth/secureboot/kyth-secureboot.der
 install -Dm 0755 /ctx/kyth-enroll-mok /usr/bin/kyth-enroll-mok
 install -Dm 0644 /ctx/kyth-enroll-mok.service /usr/lib/systemd/system/kyth-enroll-mok.service
+# Enable in every flavor, not only on the signed-custom-kernel path below:
+# the unit is state-attesting — it stamps its marker once the Kyth key is
+# enrolled and otherwise waits quietly — so Fedora-flavor images need it
+# running too (e.g. before a later switch to a custom-kernel image).
+systemctl enable kyth-enroll-mok.service
 
 if [[ "${KERNEL_FLAVOR}" == "fedora" ]]; then
 	echo "secureboot: Fedora kernel flavor uses Fedora-signed boot artifacts — Kyth MOK signing skipped"
@@ -127,7 +132,5 @@ sbverify --cert "${CERT}" "${VMLINUZ}"
 rm -f /usr/share/kyth/secureboot/unsigned-kernel
 
 echo "secureboot: vmlinuz signed successfully"
-
-systemctl enable kyth-enroll-mok.service
 
 echo "secureboot: Secure Boot support configured"

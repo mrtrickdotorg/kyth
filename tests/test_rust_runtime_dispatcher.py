@@ -92,6 +92,49 @@ class RustRuntimeDispatcherTest(unittest.TestCase):
         # once the quarantine threshold is crossed.
         self.assertGreater(int(bounds["GREENBOOT_RECORD_FAILURE_TIMEOUT"]), 60)
 
+    def test_enroll_mok_arm_attests_state_instead_of_importing_unattended(self):
+        text = RUNTIME.read_text(encoding="utf-8")
+        # Only the shipped dispatcher, not its own Rust test module.
+        shipped = text.split("#[cfg(test)]")[0]
+
+        def segment(start_marker: str, end_marker: str) -> str:
+            start = text.index(start_marker)
+            return text[start:text.index(end_marker, start)]
+
+        enroll = segment('"enroll-mok" =>', '"rotate-mok" =>')
+
+        # The arm delegates to the state-attesting helper; the old
+        # unconditional `mokutil --import` — which can never succeed
+        # unattended, since it needs a one-time password typed at a
+        # terminal — is gone from the arm itself.
+        self.assertIn("enroll_mok()", enroll)
+        self.assertNotIn("--import", enroll)
+
+        # The helper (the last fn before delegate) probes mokutil state
+        # with mok_verify's sb-state parsing and attests from it.
+        helper = segment("fn enroll_mok()", "fn delegate(")
+        self.assertIn('"--sb-state"', helper)
+        self.assertIn("mok_verify::parse_sb", helper)
+        self.assertIn('"--test-key"', helper)
+        self.assertIn('"--list-enrolled"', helper)
+        self.assertIn('"--list-new"', helper)
+        # Enrolled means stamping the marker kyth-enroll-mok.service
+        # gates on, at the path the unit's condition checks.
+        self.assertIn('"/var/lib/kyth/mok-enrolled"', shipped)
+        self.assertIn("MOK_ENROLLED_MARKER", helper)
+        self.assertIn("write_atomic", helper)
+        # Unenrolled and unattended means guidance, not an import.
+        self.assertIn("ujust enroll-secureboot", helper)
+        self.assertIn("MokEnrollPlan::GuidanceOnly", helper)
+
+        # The import survives exactly once, inside the plan's
+        # interactive arm, and the TTY check feeding the plan is
+        # evaluated before it — source order mirrors the runtime gate.
+        self.assertEqual(helper.count('"--import"'), 1)
+        self.assertIn("MokEnrollPlan::InteractiveImport", helper)
+        self.assertLess(helper.index("is_terminal"), helper.index('"--import"'))
+        self.assertIn("fn mok_enroll_plan(", shipped)
+
     def test_runtime_binary_compiles(self):
         result = subprocess.run(
             ["cargo", "check", "--manifest-path", "src/kyth-shared-rs/Cargo.toml", "--bin", "kyth-runtime"],

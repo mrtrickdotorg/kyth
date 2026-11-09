@@ -33,11 +33,13 @@ SystemCallArchitectures=native
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # Same write surface as kyth-hw-setup.service: atomic state/marker writes
-# under /var/lib/kyth plus the akmods build dirs.
+# under /var/lib/kyth plus the akmods build dirs. /etc/pki/akmods holds the
+# per-machine module-signing keypair (generated at first boot); the image
+# always creates those directories, so the path needs no `-` prefix.
 StateDirectory=kyth
 StateDirectoryMode=0700
 ProtectSystem=strict
-ReadWritePaths=/var/lib/akmods -/var/cache/akmods
+ReadWritePaths=/var/lib/akmods -/var/cache/akmods /etc/pki/akmods
 CacheDirectory=kyth
 CacheDirectoryMode=0700
 # akmods can take 5-15 min to build the NVIDIA module on a fresh kernel.

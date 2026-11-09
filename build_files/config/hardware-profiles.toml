@@ -68,7 +68,7 @@ classes = ["0300", "0302", "0380"]
 [[profiles]]
 id = "nvidia-proprietary"
 title = "NVIDIA proprietary graphics"
-tier = "supported"
+tier = "experimental"
 priority = 120
 image_variant = "universal"
 capabilities = ["gpu.nvidia", "nvidia.proprietary", "wayland.explicit-sync"]
@@ -83,7 +83,7 @@ nvidia_setup = true
 [[profiles]]
 id = "intel-nvidia-hybrid"
 title = "Intel plus NVIDIA hybrid graphics"
-tier = "supported"
+tier = "experimental"
 priority = 180
 image_variant = "universal"
 capabilities = ["gpu.hybrid", "gpu.offload"]
@@ -99,7 +99,7 @@ classes = ["0300", "0302", "0380"]
 [[profiles]]
 id = "amd-nvidia-hybrid"
 title = "AMD plus NVIDIA hybrid graphics"
-tier = "supported"
+tier = "experimental"
 priority = 180
 image_variant = "universal"
 capabilities = ["gpu.hybrid", "gpu.offload"]

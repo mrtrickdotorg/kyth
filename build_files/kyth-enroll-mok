@@ -15,11 +15,24 @@ fi
 cert="${KYTH_MOK_CERT_DER:-/usr/share/kyth/secureboot/kyth-secureboot.der}"
 flag="${KYTH_MOK_FLAG:-/var/lib/kyth/mok-enrolled}"
 mokutil="${KYTH_MOKUTIL:-mokutil}"
-if [[ "${MOCK_SB_ENABLED:-0}" == "1" && ! -f "${flag}" ]]; then
-    if [[ "${MOCK_ENROLLED:-0}" != "1" ]]; then
-        "${mokutil}" --import "${cert}" < /dev/null || exit $?
+# Same state-attesting contract as the Rust enroll-mok arm: attest
+# enrollment that already happened, never stage an import unattended.
+# `mokutil --import` demands a one-time password typed at a terminal,
+# which a boot service cannot provide; interactive staging belongs to
+# `ujust enroll-secureboot`.
+sb_state="$("${mokutil}" --sb-state 2>/dev/null || true)"
+if [[ "${sb_state}" == *"SecureBoot enabled"* ]]; then
+    if "${mokutil}" --test-key "${cert}" >/dev/null 2>&1 \
+        || "${mokutil}" --list-enrolled 2>/dev/null | grep -q "KythOS Secure Boot"; then
+        # Already enrolled: stamp the marker so the unit stops running.
+        mkdir -p "$(dirname "${flag}")"
+        : > "${flag}"
+    elif "${mokutil}" --list-new 2>/dev/null | grep -q "KythOS Secure Boot"; then
+        # Staged but unconfirmed: enrollment completes after the user's
+        # MokManager reboot — wait quietly, no marker and no re-import.
+        :
+    else
+        echo "kyth-enroll-mok: KythOS Secure Boot key is not enrolled; run \`ujust enroll-secureboot\` from a terminal to stage enrollment."
     fi
-    mkdir -p "$(dirname "${flag}")"
-    : > "${flag}"
 fi
 echo "secureboot enrollment tests passed"

@@ -60,3 +60,13 @@ fi
 dnf5 install -y --skip-unavailable --setopt=excludepkgs= \
 	nvidia-vaapi-driver \
 	xorg-x11-drv-nvidia-cuda-libs.i686 || true
+
+# Pre-create the akmods PKI directories (Fedora/kmodtool signing
+# convention) so kyth-nvidia-akmods.service can name /etc/pki/akmods in
+# ReadWritePaths without the ignore-missing `-` prefix under
+# ProtectSystem=strict, and so the first-boot keypair generation has a
+# home with the right permissions from the start. Directories only: the
+# signing keypair is per-machine and must NEVER ship in the image —
+# kyth-hardware-policy generates it once at first boot (kmodgenca).
+install -d -m 0755 /etc/pki/akmods/certs
+install -d -m 0700 /etc/pki/akmods/private

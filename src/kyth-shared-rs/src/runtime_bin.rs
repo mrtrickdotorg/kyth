@@ -9,7 +9,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -2011,6 +2011,120 @@ fn recipe(args: &[String]) -> io::Result<ExitCode> {
     delegate(operation, &operation_args)
 }
 
+/// DER form of the Kyth Secure Boot certificate: secureboot.sh installs it
+/// next to the PEM (.cer), and it is the form mokutil --test-key/--import
+/// consume — the same file `ujust enroll-secureboot` stages.
+const MOK_CERT_DER: &str = "/usr/share/kyth/secureboot/kyth-secureboot.der";
+/// Marker kyth-enroll-mok.service gates on (ConditionPathExists=!): stamped
+/// only once the Kyth key is attested enrolled, never for staging alone.
+const MOK_ENROLLED_MARKER: &str = "/var/lib/kyth/mok-enrolled";
+/// Certificate subject substring mok_verify and the ujust recipes match on.
+const MOK_KEY_SUBJECT: &str = "KythOS Secure Boot";
+
+/// What one enroll-mok run should do, decided from probed mokutil state.
+///
+/// The boot service runs this arm unattended with captured stdio, and
+/// `mokutil --import` demands a one-time password typed interactively —
+/// the old unconditional import could never succeed there, so the unit
+/// re-ran a doomed import on every boot and the marker was never stamped.
+/// Interactive staging belongs to `ujust enroll-secureboot`; this arm
+/// attests state instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MokEnrollPlan {
+    /// Secure Boot is off (or its state cannot be confirmed): nothing to
+    /// attest and no marker, so a later boot re-checks if the user
+    /// enables Secure Boot.
+    NothingToAttest,
+    /// The Kyth key is already enrolled: stamp the marker so the unit's
+    /// condition stops it from running again.
+    StampMarker,
+    /// The key is staged in MokManager's queue but unconfirmed: it
+    /// completes only after the user's reboot confirmation, so wait
+    /// quietly — no marker, no re-import.
+    AwaitConfirmation,
+    /// Not enrolled and not staged, and stdin is not a terminal: print
+    /// guidance toward `ujust enroll-secureboot` and exit successfully.
+    GuidanceOnly,
+    /// Not enrolled and not staged, but a person is at a terminal: the
+    /// interactive `mokutil --import` may run.
+    InteractiveImport,
+}
+
+fn mok_enroll_plan(
+    sb_enabled: bool,
+    enrolled: bool,
+    staged: bool,
+    stdin_is_tty: bool,
+) -> MokEnrollPlan {
+    if !sb_enabled {
+        return MokEnrollPlan::NothingToAttest;
+    }
+    if enrolled {
+        return MokEnrollPlan::StampMarker;
+    }
+    if staged {
+        return MokEnrollPlan::AwaitConfirmation;
+    }
+    if stdin_is_tty {
+        MokEnrollPlan::InteractiveImport
+    } else {
+        MokEnrollPlan::GuidanceOnly
+    }
+}
+
+/// One bounded mokutil probe; None when mokutil cannot run at all
+/// (missing binary, timeout). Callers treat that as "not confirmed"
+/// rather than an error — the same posture as mok_verify's unknown.
+fn mok_probe(args: &[&str]) -> Option<std::process::Output> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    run_output("mokutil", &args).ok()
+}
+
+fn enroll_mok() -> io::Result<ExitCode> {
+    // Parse with mok_verify's semantics so this arm and the Hub status
+    // view can never disagree about whether Secure Boot is on.
+    let sb_enabled = mok_probe(&["--sb-state"])
+        .map(|output| {
+            kyth_shared::system::mok_verify::parse_sb(
+                &String::from_utf8_lossy(&output.stdout),
+                output.status.code().unwrap_or(-1),
+            ) == "enabled"
+        })
+        .unwrap_or(false);
+    // --test-key is the exact check; the --list-enrolled subject match
+    // is the fallback mok_verify and the ujust recipes also use.
+    let enrolled = mok_probe(&["--test-key", MOK_CERT_DER])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+        || mok_probe(&["--list-enrolled"])
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(MOK_KEY_SUBJECT)
+            })
+            .unwrap_or(false);
+    let staged = mok_probe(&["--list-new"])
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(MOK_KEY_SUBJECT)
+        })
+        .unwrap_or(false);
+    match mok_enroll_plan(sb_enabled, enrolled, staged, io::stdin().is_terminal()) {
+        MokEnrollPlan::NothingToAttest => Ok(ExitCode::SUCCESS),
+        MokEnrollPlan::StampMarker => {
+            write_atomic(Path::new(MOK_ENROLLED_MARKER), b"enrolled\n")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        MokEnrollPlan::AwaitConfirmation => Ok(ExitCode::SUCCESS),
+        MokEnrollPlan::GuidanceOnly => {
+            println!("KythOS Secure Boot key is not enrolled. Run `ujust enroll-secureboot` from a terminal to stage enrollment.");
+            Ok(ExitCode::SUCCESS)
+        }
+        MokEnrollPlan::InteractiveImport => {
+            run("mokutil", &["--import".into(), MOK_CERT_DER.into()])
+        }
+    }
+}
+
 fn delegate(name: &str, args: &[String]) -> io::Result<ExitCode> {
     match name {
         "recipe" => recipe(args),
@@ -2332,16 +2446,7 @@ fn delegate(name: &str, args: &[String]) -> io::Result<ExitCode> {
         }
         "flathub-setup" => flathub_setup(),
         "mok-status" => run("mokutil", &["--list-enrolled".into()]),
-        "enroll-mok" => {
-            let cert = Path::new("/usr/share/kyth/secureboot/kyth-secureboot.cer");
-            if !cert.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "KythOS Secure Boot certificate is not installed",
-                ));
-            }
-            run("mokutil", &["--import".into(), cert.display().to_string()])
-        }
+        "enroll-mok" => enroll_mok(),
         "rotate-mok" => run("mokutil", &["--list-enrolled".into()]),
         // The greenboot hooks delegate to kyth-boot-health, which owns
         // the digest-aware state machine (docs/update-safety.md steps
@@ -2539,6 +2644,52 @@ mod tests {
         // rather than truncate a rollback in flight.
         assert!(GREENBOOT_RECORD_FAILURE_TIMEOUT > Duration::from_secs(60));
         assert!(GREENBOOT_RECORD_FAILURE_TIMEOUT > COMMAND_TIMEOUT);
+    }
+
+    #[test]
+    fn mok_enroll_plan_attests_state_and_never_imports_unattended() {
+        // Secure Boot off: nothing to attest and, crucially, no marker —
+        // the unit must re-check if the user enables Secure Boot later,
+        // even when the key happens to be enrolled already.
+        assert_eq!(
+            mok_enroll_plan(false, false, false, false),
+            MokEnrollPlan::NothingToAttest
+        );
+        assert_eq!(
+            mok_enroll_plan(false, true, true, true),
+            MokEnrollPlan::NothingToAttest
+        );
+        // Enrolled: stamp the marker so the unit stops running.
+        // Enrollment wins over a leftover staged entry.
+        assert_eq!(
+            mok_enroll_plan(true, true, false, false),
+            MokEnrollPlan::StampMarker
+        );
+        assert_eq!(
+            mok_enroll_plan(true, true, true, false),
+            MokEnrollPlan::StampMarker
+        );
+        // Staged but unconfirmed: wait for the MokManager reboot — no
+        // marker, and no re-import even at a terminal.
+        assert_eq!(
+            mok_enroll_plan(true, false, true, false),
+            MokEnrollPlan::AwaitConfirmation
+        );
+        assert_eq!(
+            mok_enroll_plan(true, false, true, true),
+            MokEnrollPlan::AwaitConfirmation
+        );
+        // Unenrolled: the boot service (no TTY) gets guidance only; the
+        // interactive import is reserved for a real terminal, where
+        // mokutil can actually prompt for its one-time password.
+        assert_eq!(
+            mok_enroll_plan(true, false, false, false),
+            MokEnrollPlan::GuidanceOnly
+        );
+        assert_eq!(
+            mok_enroll_plan(true, false, false, true),
+            MokEnrollPlan::InteractiveImport
+        );
     }
 
     #[test]

@@ -23,6 +23,14 @@ case "$1" in
             echo "SecureBoot disabled"
         fi
         ;;
+    --test-key)
+        if [[ "${MOCK_ENROLLED:-0}" == "1" ]]; then
+            echo "$2 is already enrolled"
+        else
+            echo "$2 is not enrolled" >&2
+            exit 1
+        fi
+        ;;
     --list-enrolled)
         if [[ "${MOCK_ENROLLED:-0}" == "1" ]]; then
             echo "CN=KythOS Secure Boot"
@@ -34,11 +42,9 @@ case "$1" in
         fi
         ;;
     --import)
+        # Tripwire only: the enroller must never import unattended, so
+        # any call lands in the log and fails the case asserting on it.
         cat >/dev/null
-        if [[ "${MOCK_IMPORT_FAIL:-0}" == "1" ]]; then
-            echo "import failed" >&2
-            exit 1
-        fi
         echo "import $2" >> "${MOCK_LOG}"
         ;;
     *)
@@ -54,7 +60,7 @@ run_enroller() {
 		KYTH_ENROLL_MOK_FORCE_SHELL="1" \
 		MOCK_SB_ENABLED="${1}" \
 		MOCK_ENROLLED="${2}" \
-		MOCK_IMPORT_FAIL="${MOCK_IMPORT_FAIL:-0}" \
+		MOCK_PENDING="${3:-0}" \
 		KYTH_MOK_CERT_DER="${CERT}" \
 		KYTH_MOK_FLAG="${FLAG}" \
 		KYTH_MOKUTIL="${MOKUTIL}" \
@@ -72,12 +78,22 @@ if [[ -s "${LOG}" ]]; then
 fi
 
 run_enroller 1 0
-if [[ ! -f "${FLAG}" ]]; then
-	echo "enabled Secure Boot path should create enrollment marker after staging" >&2
+if [[ -f "${FLAG}" ]]; then
+	echo "unenrolled Secure Boot path should not create enrollment marker" >&2
 	exit 1
 fi
-if ! grep -q "import ${CERT}" "${LOG}"; then
-	echo "enabled Secure Boot path should stage mokutil import" >&2
+if [[ -s "${LOG}" ]]; then
+	echo "unenrolled Secure Boot path should not import automatically" >&2
+	exit 1
+fi
+
+run_enroller 1 0 1
+if [[ -f "${FLAG}" ]]; then
+	echo "staged Secure Boot path should not create enrollment marker before confirmation" >&2
+	exit 1
+fi
+if [[ -s "${LOG}" ]]; then
+	echo "staged Secure Boot path should not import again" >&2
 	exit 1
 fi
 
@@ -89,18 +105,6 @@ if [[ ! -f "${FLAG}" ]]; then
 fi
 if [[ -s "${LOG}" ]]; then
 	echo "already-enrolled path should not import again" >&2
-	exit 1
-fi
-
-rm -f "${FLAG}" "${LOG}"
-enroll_status=0
-MOCK_IMPORT_FAIL=1 run_enroller 1 0 || enroll_status=$?
-if [[ "${enroll_status}" -eq 0 ]]; then
-	echo "failed mokutil import should exit non-zero" >&2
-	exit 1
-fi
-if [[ -f "${FLAG}" ]]; then
-	echo "failed mokutil import should not create enrollment marker" >&2
 	exit 1
 fi
 

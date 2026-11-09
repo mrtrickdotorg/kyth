@@ -11,8 +11,19 @@ use std::time::Duration;
 use kyth_shared::atomic_io::{atomic_write_bytes, atomic_write_json, atomic_write_text};
 use kyth_shared::system::akmods_lock::{acquire, DEFAULT_LOCK_PATH, DEFAULT_TIMEOUT};
 use kyth_shared::system::hardware_policy::{self, Evaluation, DEFAULT_POLICY_PATH};
+use kyth_shared::system::mok_verify::mok_status;
 use kyth_shared::system::process::run_bounded;
 
+/// akmods module-signing keypair locations. CAVEAT: these paths are the
+/// standard Fedora/kmodtool convention — akmods signs modules it builds
+/// when a keypair exists here, and `kmodgenca -a` generates it — but they
+/// cannot be verified from anything in this repository. They are named in
+/// exactly one place so a future akmods layout change is a one-line fix;
+/// if the convention ever moves, the post-build signature check in
+/// `build_nvidia_akmods` turns the mismatch into a visible
+/// `proprietary-unsigned` state instead of a silently unloadable module.
+const AKMODS_CERT_PATH: &str = "/etc/pki/akmods/certs/public_key.der";
+const AKMODS_KEY_PATH: &str = "/etc/pki/akmods/private/private_key.priv";
 const STATE_PATH: &str = "/var/lib/kyth/hardware-policy.json";
 const NVIDIA_AKMODS_PENDING_PATH: &str = "/var/lib/kyth/nvidia-akmods-pending";
 const REPORT_PATH: &str = "/var/lib/kyth/hardware-support.json";
@@ -340,6 +351,177 @@ fn configure_nvidia() -> Result<String, String> {
     Ok("proprietary-pending".into())
 }
 
+/// Signing decision for the deferred NVIDIA build, from the three facts
+/// the gate probes. Pure so the whole decision table is unit-testable
+/// without Secure Boot hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NvidiaSigningGate {
+    /// Secure Boot is off: build unsigned, exactly as before.
+    NotRequired,
+    /// Secure Boot is on and the akmods certificate is enrolled: akmods
+    /// signs during the build; verify the signature afterwards.
+    BuildSigned,
+    /// Secure Boot is on, no keypair yet: generate it once, then defer —
+    /// the fresh certificate cannot be enrolled yet, so a build now would
+    /// produce a module the kernel refuses to load.
+    GenerateKeypairAndDefer,
+    /// Secure Boot is on, keypair present, certificate not enrolled:
+    /// defer the build until the user enrolls the akmods certificate.
+    AwaitEnrollment,
+}
+
+fn nvidia_signing_gate(
+    sb_enabled: bool,
+    keypair_present: bool,
+    cert_enrolled: bool,
+) -> NvidiaSigningGate {
+    if !sb_enabled {
+        return NvidiaSigningGate::NotRequired;
+    }
+    if !keypair_present {
+        return NvidiaSigningGate::GenerateKeypairAndDefer;
+    }
+    if cert_enrolled {
+        NvidiaSigningGate::BuildSigned
+    } else {
+        NvidiaSigningGate::AwaitEnrollment
+    }
+}
+
+/// Secure Boot state via the same probe as `kyth_shared::system::mok_verify`:
+/// only an explicit "SecureBoot enabled" report counts as enabled. An
+/// unreadable state (no mokutil, non-UEFI boot) folds into disabled, so the
+/// gate never blocks the build on a machine that cannot enroll keys anyway.
+fn secure_boot_enabled() -> bool {
+    mok_status().sb_state == "enabled"
+}
+
+fn akmods_keypair_present() -> bool {
+    Path::new(AKMODS_CERT_PATH).is_file() && Path::new(AKMODS_KEY_PATH).is_file()
+}
+
+/// Enrollment probe for the akmods certificate itself. Deliberately NOT a
+/// subject match over `mokutil --list-enrolled`: that list is checked for
+/// the "KythOS Secure Boot" subject elsewhere, but the akmods certificate
+/// is generated per machine with its own subject — `--test-key` asks
+/// mokutil about this exact certificate file instead.
+fn akmods_cert_enrolled() -> bool {
+    command_ok(
+        &[
+            "mokutil".into(),
+            "--test-key".into(),
+            AKMODS_CERT_PATH.into(),
+        ],
+        Duration::from_secs(30),
+    )
+}
+
+/// Generate the per-machine akmods keypair — but only when neither half
+/// exists. NEVER overwrite an existing pair: replacing the certificate
+/// orphans every firmware enrollment of the old one, and modules signed
+/// with it would stop loading. A partial pair (one half present) is also
+/// left untouched; the gate defers and the state surfaces the problem
+/// instead of silently rotating the key.
+fn generate_akmods_keypair_once() -> Result<(), String> {
+    if Path::new(AKMODS_CERT_PATH).exists() || Path::new(AKMODS_KEY_PATH).exists() {
+        return Ok(());
+    }
+    run_checked(
+        &["kmodgenca".into(), "-a".into()],
+        "generate akmods module-signing keypair",
+        Duration::from_secs(300),
+    )
+}
+
+/// Defer the build until the akmods certificate is enrolled: persist the
+/// state for the Hub and spell out the remediation. The pending marker is
+/// deliberately left in place by the caller, so the next boot retries.
+fn defer_nvidia_build_for_enrollment() {
+    update_nvidia_state("secureboot-enrollment-required");
+    eprintln!(
+        "kyth-hardware-policy: Secure Boot is enabled, but the akmods \
+         module-signing certificate ({AKMODS_CERT_PATH}) is not enrolled in \
+         this machine's MOK list — a module built now would be unsigned and \
+         the kernel would refuse to load it, so the NVIDIA build is \
+         deferred. Enroll the akmods certificate manually from a terminal: \
+         `mokutil --import {AKMODS_CERT_PATH}`, then reboot and confirm the \
+         enrollment in MokManager; the build retries automatically on the \
+         next boot. Note: `ujust enroll-secureboot` enrolls the separate \
+         KythOS Secure Boot certificate only — it does NOT enroll the \
+         akmods certificate; the mokutil import above is the required step."
+    );
+}
+
+/// Signing preparation for the deferred build: probe Secure Boot, keypair,
+/// and enrollment, act on the side effects the gate demands (one-time
+/// keypair generation; state + remediation when enrollment is missing),
+/// and return the decision for the build itself. Runs under the akmods
+/// lock so the generation check-and-create cannot race a second build.
+fn ensure_nvidia_module_signing() -> Result<NvidiaSigningGate, String> {
+    let sb_enabled = secure_boot_enabled();
+    let keypair_present = akmods_keypair_present();
+    let cert_enrolled = sb_enabled && keypair_present && akmods_cert_enrolled();
+    let gate = nvidia_signing_gate(sb_enabled, keypair_present, cert_enrolled);
+    match gate {
+        NvidiaSigningGate::NotRequired => {}
+        NvidiaSigningGate::BuildSigned => {
+            eprintln!(
+                "kyth-hardware-policy: Secure Boot is enabled and the akmods \
+                 signing certificate is enrolled; akmods will sign the \
+                 NVIDIA module during the build"
+            );
+        }
+        NvidiaSigningGate::GenerateKeypairAndDefer => {
+            generate_akmods_keypair_once()?;
+            eprintln!(
+                "kyth-hardware-policy: generated the per-machine akmods \
+                 module-signing keypair under /etc/pki/akmods"
+            );
+            defer_nvidia_build_for_enrollment();
+        }
+        NvidiaSigningGate::AwaitEnrollment => {
+            defer_nvidia_build_for_enrollment();
+        }
+    }
+    Ok(gate)
+}
+
+/// Whether the built NVIDIA module actually carries a signature: `modinfo`
+/// reports a non-empty PKCS#7 signer (or signature key id) only for signed
+/// modules. An unsigned module — the failure this gate exists to catch —
+/// reports both fields empty.
+fn nvidia_module_signed() -> bool {
+    ["signer", "sig_key_id"].iter().any(|field| {
+        run(
+            &[
+                "modinfo".into(),
+                "-F".into(),
+                (*field).into(),
+                "nvidia".into(),
+            ],
+            Duration::from_secs(30),
+        )
+        .is_ok_and(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        })
+    })
+}
+
+/// Outcome of the locked build section, so the caller can decide whether
+/// the pending marker clears and which status the Hub should show.
+enum NvidiaBuildOutcome {
+    /// Module was already present when re-checked under the lock.
+    AlreadyPresent,
+    /// Build ran and (where required) verified signed.
+    Built,
+    /// Build deferred: the akmods certificate is not enrolled yet. The
+    /// signing-prep step already persisted the state and remediation.
+    DeferredForEnrollment,
+    /// Build ran under Secure Boot with an enrolled certificate, but the
+    /// resulting module carries no signature.
+    BuiltUnsigned,
+}
+
 /// Deferred slow path, run by `kyth-nvidia-akmods.service`: build the NVIDIA
 /// kernel module under the akmods lock, then clear the pending marker and
 /// flip the persisted status to `proprietary-ready`.
@@ -357,9 +539,18 @@ fn build_nvidia_akmods() -> Result<(), String> {
         return Ok(());
     }
     let lock = acquire(DEFAULT_LOCK_PATH, DEFAULT_TIMEOUT).map_err(|error| error.to_string())?;
-    let result = (|| {
+    let outcome = (|| {
         if nvidia_module_present() {
-            return Ok::<(), String>(());
+            return Ok::<NvidiaBuildOutcome, String>(NvidiaBuildOutcome::AlreadyPresent);
+        }
+        // Signing prep stays inside the lock: the keypair existence check
+        // and one-time generation must not race a second build.
+        let gate = ensure_nvidia_module_signing()?;
+        match gate {
+            NvidiaSigningGate::GenerateKeypairAndDefer | NvidiaSigningGate::AwaitEnrollment => {
+                return Ok(NvidiaBuildOutcome::DeferredForEnrollment);
+            }
+            NvidiaSigningGate::NotRequired | NvidiaSigningGate::BuildSigned => {}
         }
         let output = run(
             &[
@@ -374,13 +565,35 @@ fn build_nvidia_akmods() -> Result<(), String> {
         if !output.status.success() {
             return Err("NVIDIA module build failed".into());
         }
-        Ok(())
+        if gate == NvidiaSigningGate::BuildSigned && !nvidia_module_signed() {
+            return Ok(NvidiaBuildOutcome::BuiltUnsigned);
+        }
+        Ok(NvidiaBuildOutcome::Built)
     })();
     drop(lock);
-    result?;
-    clear_nvidia_akmods_pending();
-    update_nvidia_state("proprietary-ready");
-    Ok(())
+    match outcome? {
+        // Deferred is not a failure: the unit must not fail every boot
+        // while it waits for a human enrollment step. The pending marker
+        // stays, so the next boot retries automatically.
+        NvidiaBuildOutcome::DeferredForEnrollment => Ok(()),
+        NvidiaBuildOutcome::BuiltUnsigned => {
+            update_nvidia_state("proprietary-unsigned");
+            eprintln!(
+                "kyth-hardware-policy: the NVIDIA module build finished, but \
+                 the module carries no signature even though the akmods \
+                 certificate is enrolled — it cannot load under Secure Boot \
+                 lockdown. Keeping the pending marker so the next boot \
+                 retries; if this persists, the akmods signing convention \
+                 (keypair under /etc/pki/akmods) has likely changed."
+            );
+            Ok(())
+        }
+        NvidiaBuildOutcome::AlreadyPresent | NvidiaBuildOutcome::Built => {
+            clear_nvidia_akmods_pending();
+            update_nvidia_state("proprietary-ready");
+            Ok(())
+        }
+    }
 }
 
 fn apply_nvidia_kernel_policy() -> Result<(), String> {
@@ -748,6 +961,44 @@ mod tests {
         // Clearing an absent marker is a no-op, not an error.
         clear_nvidia_akmods_pending();
         std::env::remove_var("KYTH_HARDWARE_POLICY_PENDING");
+    }
+
+    #[test]
+    fn nvidia_signing_gate_decision_table() {
+        // Secure Boot off: signing is never required, whatever the keypair
+        // or enrollment state — the build proceeds unsigned immediately.
+        for keypair_present in [false, true] {
+            for cert_enrolled in [false, true] {
+                assert_eq!(
+                    nvidia_signing_gate(false, keypair_present, cert_enrolled),
+                    NvidiaSigningGate::NotRequired,
+                );
+            }
+        }
+        // Secure Boot on, keypair present, certificate enrolled: build —
+        // akmods signs during the build and the result is verified.
+        assert_eq!(
+            nvidia_signing_gate(true, true, true),
+            NvidiaSigningGate::BuildSigned
+        );
+        // Secure Boot on, no keypair: generate once, then defer — the
+        // fresh certificate is not enrolled yet, so building now would
+        // produce a module the kernel refuses to load. (The enrolled flag
+        // is meaningless without a certificate and must not change this.)
+        assert_eq!(
+            nvidia_signing_gate(true, false, false),
+            NvidiaSigningGate::GenerateKeypairAndDefer
+        );
+        assert_eq!(
+            nvidia_signing_gate(true, false, true),
+            NvidiaSigningGate::GenerateKeypairAndDefer
+        );
+        // Secure Boot on, keypair present, certificate not enrolled: defer
+        // with enrollment required — no build, no regeneration.
+        assert_eq!(
+            nvidia_signing_gate(true, true, false),
+            NvidiaSigningGate::AwaitEnrollment
+        );
     }
 
     #[test]

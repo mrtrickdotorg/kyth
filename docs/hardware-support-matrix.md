@@ -17,9 +17,9 @@
 |---|---|---|---|
 | `asus-rog-ally` | experimental | `universal` | `form-factor.handheld`, `input.controller-first` |
 | `valve-handheld` | experimental | `universal` | `form-factor.handheld`, `input.controller-first` |
-| `amd-nvidia-hybrid` | supported | `universal` | `gpu.hybrid`, `gpu.offload` |
-| `intel-nvidia-hybrid` | supported | `universal` | `gpu.hybrid`, `gpu.offload` |
-| `nvidia-proprietary` | supported | `universal` | `gpu.nvidia`, `nvidia.proprietary`, `wayland.explicit-sync` |
+| `amd-nvidia-hybrid` | experimental | `universal` | `gpu.hybrid`, `gpu.offload` |
+| `intel-nvidia-hybrid` | experimental | `universal` | `gpu.hybrid`, `gpu.offload` |
+| `nvidia-proprietary` | experimental | `universal` | `gpu.nvidia`, `nvidia.proprietary`, `wayland.explicit-sync` |
 | `amd-graphics` | supported | `universal` | `gpu.amd`, `vulkan.radv`, `video.vaapi` |
 | `intel-graphics` | supported | `universal` | `gpu.intel`, `vulkan.anv`, `video.vaapi` |
 | `baseline` | supported | `universal` | `atomic-updates`, `hardware-policy`, `plasma-wayland` |
