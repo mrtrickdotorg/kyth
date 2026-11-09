@@ -9,11 +9,15 @@ REPO_ROOT="$(git -C "${SCRIPT_DIR}/../.." rev-parse --show-toplevel)"
 usage() {
 	cat <<'EOF'
 Usage: vm-acceptance.sh --iso PATH [--update-ref IMAGE] [--artifacts DIR]
-                        [--timeout-minutes N] [--allow-tcg]
+                        [--timeout-minutes N] [--allow-tcg] [--network-check]
 
 Without --update-ref, validates live boot, bundled-image installation, and the
 first installed boot. With --update-ref, also stages that image, boots it,
 stages rollback, and verifies the original digest after the rollback boot.
+
+With --network-check, the guest additionally verifies that the installed
+system can resolve and reach its target registry. It is off by default so
+hermetic runs without outbound networking do not false-fail.
 
 Booting a full desktop OS under software emulation (no /dev/kvm) is too slow
 to finish inside any practical timeout, so hardware acceleration is required
@@ -27,6 +31,7 @@ UPDATE_REF=
 ARTIFACTS=
 TIMEOUT_MINUTES=75
 ALLOW_TCG=0
+NETWORK_CHECK=0
 while (($#)); do
 	case "$1" in
 	--iso)
@@ -47,6 +52,10 @@ while (($#)); do
 		;;
 	--allow-tcg)
 		ALLOW_TCG=1
+		shift
+		;;
+	--network-check)
+		NETWORK_CHECK=1
 		shift
 		;;
 	--help | -h)
@@ -150,6 +159,9 @@ if [[ -n "${UPDATE_REF}" ]]; then
 	}
 	QEMU_ARGS+=(-fw_cfg "name=opt/com.kyth/update-ref,string=${UPDATE_REF}")
 fi
+if ((NETWORK_CHECK)); then
+	QEMU_ARGS+=(-fw_cfg "name=opt/com.kyth/network-check,string=1")
+fi
 
 echo "Acceptance artifacts: ${ARTIFACTS}"
 set +e
@@ -206,11 +218,28 @@ grep -q '^KYTH_ACCEPTANCE:INSTALLED_READY:' "${SERIAL_LOG}" ||
 		echo "Installed boot readiness sentinel missing" >&2
 		exit 1
 	}
+grep -q '^KYTH_ACCEPTANCE:INSTALLED_SELINUX_OK:' "${SERIAL_LOG}" ||
+	{
+		echo "Installed SELinux enforcing sentinel missing" >&2
+		exit 1
+	}
+grep -q '^KYTH_ACCEPTANCE:FIRSTBOOT_OK:' "${SERIAL_LOG}" ||
+	{
+		echo "First-boot completion sentinel missing" >&2
+		exit 1
+	}
 grep -q '^KYTH_ACCEPTANCE:COMPLETE:' "${SERIAL_LOG}" ||
 	{
 		echo "Acceptance completion sentinel missing" >&2
 		exit 1
 	}
+if ((NETWORK_CHECK)); then
+	grep -q '^KYTH_ACCEPTANCE:INSTALLED_NETWORK_OK:' "${SERIAL_LOG}" ||
+		{
+			echo "Installed network check sentinel missing" >&2
+			exit 1
+		}
+fi
 if [[ -n "${UPDATE_REF}" ]]; then
 	for phase in UPDATE_STAGED UPDATE_BOOTED ROLLBACK_STAGED ROLLBACK_BOOTED; do
 		grep -q "^KYTH_ACCEPTANCE:${phase}:" "${SERIAL_LOG}" ||

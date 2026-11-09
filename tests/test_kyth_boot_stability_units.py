@@ -802,6 +802,28 @@ else:
         self.assertIn("systemctl disable NetworkManager-wait-online.service", body)
         self.assertNotIn("systemctl enable NetworkManager-wait-online.service", body)
 
+    def test_proton_timer_enable_is_gated_on_signing_anchor(self) -> None:
+        body = (ROOT / "build_files/scripts/branding/31-ujust-recipes.sh").read_text(
+            encoding="utf-8"
+        )
+        # The gate reads the /ctx source of the anchor (fragment 99
+        # installs it only later) and uses the exact marker string the
+        # Rust verifier keys on (update_manifest.rs), so the build gate
+        # and the runtime gate can never disagree about whether a real
+        # certificate shipped.
+        gate = (
+            'if grep -q -- "-----BEGIN PGP PUBLIC KEY BLOCK-----" '
+            "/ctx/config/updater-signing-keys.asc; then"
+        )
+        self.assertIn(gate, body)
+        enable = "systemctl enable kyth-proton-cachyos-update.timer"
+        # Exactly one enable, and it sits inside the gate's if-block:
+        # while the anchor is the placeholder every updater run refuses,
+        # so an unconditional enable would park a failed unit per install.
+        self.assertEqual(body.count(enable), 1)
+        self.assertLess(body.index(gate), body.index(enable))
+        self.assertLess(body.index(enable), body.index("\nfi", body.index(enable)))
+
     def test_storage_maint_is_timer_only(self) -> None:
         body = (ROOT / "build_files/kyth-storage-maint.service").read_text(
             encoding="utf-8"

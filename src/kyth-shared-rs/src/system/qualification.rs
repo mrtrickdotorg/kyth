@@ -434,6 +434,8 @@ pub fn acceptance_report(
         "LIVE_SMOKE_OK",
         "INSTALL_COMPLETE",
         "INSTALLED_READY",
+        "INSTALLED_SELINUX_OK",
+        "FIRSTBOOT_OK",
         "INSTALLED_SMOKE_OK",
         "COMPLETE",
     ];
@@ -523,13 +525,16 @@ mod tests {
             "now",
         );
         assert_eq!(report.identity["installed_image"], "sha256:x");
+        // 20 required phases (8 base incl. INSTALLED_SELINUX_OK and
+        // FIRSTBOOT_OK, 6 hub, 6 update); only LIVE_READY and
+        // INSTALL_COMPLETE are present in the fixture log.
         assert_eq!(
             report
                 .checks
                 .iter()
                 .filter(|check| check.status == "fail")
                 .count(),
-            16
+            18
         );
         assert_eq!(report.overall(), "fail");
     }

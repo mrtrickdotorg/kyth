@@ -373,6 +373,45 @@ fn verify_tpm_encryption(target_disk: &str) -> Result<String, String> {
     Err("TPM2 encryption was requested but no TPM-bound keyslot (systemd-tpm2 token) was found; the disk cannot be unlocked automatically".to_string())
 }
 
+/// Extract the `SELINUX=` mode from config contents, following the parse
+/// precedent of `selinux_type_from_config` in kyth-shared-rs: skip blank
+/// and comment lines, match the key exactly (never `SELINUXTYPE`), and let
+/// the first occurrence win. The value is trimmed and lowercased.
+fn selinux_mode_from_config(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "SELINUX" {
+            continue;
+        }
+        return Some(value.trim().to_lowercase());
+    }
+    None
+}
+
+/// The live ISO boots `enforcing=0` as a scoped live-session fallback; the
+/// installed system must not inherit a weakened posture. Verify the
+/// deployment's own /etc/selinux/config pins `SELINUX=enforcing`, failing
+/// closed on any other mode, a missing setting, or a missing file.
+fn verify_selinux_enforcing(etc: &Path) -> Result<String, String> {
+    let config_path = etc.join("selinux").join("config");
+    regular_file(&config_path, "SELinux configuration")?;
+    let contents = fs::read_to_string(&config_path)
+        .map_err(|error| format!("could not read installed SELinux configuration: {error}"))?;
+    match selinux_mode_from_config(&contents) {
+        Some(mode) if mode == "enforcing" => Ok("SELinux mode is enforcing".to_string()),
+        Some(other) => Err(format!(
+            "installed SELinux mode is {other:?}, not enforcing"
+        )),
+        None => Err("installed SELinux configuration has no SELINUX= setting".to_string()),
+    }
+}
+
 pub(crate) fn validate(input: AssuranceInput) -> Result<Vec<AssuranceCheck>, String> {
     let root = safe_target_root(&input.target_root)?;
     real_directory(&root, "target root")?;
@@ -459,6 +498,10 @@ pub(crate) fn validate(input: AssuranceInput) -> Result<Vec<AssuranceCheck>, Str
         .map_err(|error| format!("could not read installed fstab: {error}"))?;
     let fstab_entries = parse_fstab_entries(&fstab_content)?;
 
+    // The live session boots enforcing=0; the installed system must boot
+    // enforcing. Fail the install if its SELinux config says otherwise.
+    let selinux_detail = verify_selinux_enforcing(&etc)?;
+
     // M8: a `tpm2` install must leave a TPM-bound LUKS keyslot behind;
     // without it the disk cannot unlock at boot. Fail the install.
     let encryption_detail = if input.encryption.trim().eq_ignore_ascii_case("tpm2") {
@@ -524,6 +567,11 @@ pub(crate) fn validate(input: AssuranceInput) -> Result<Vec<AssuranceCheck>, Str
             detail: format!("{} fstab entries parsed and valid", fstab_entries.len()),
         },
         AssuranceCheck {
+            name: "selinux".to_string(),
+            status: "pass".to_string(),
+            detail: selinux_detail,
+        },
+        AssuranceCheck {
             name: "encryption".to_string(),
             status: "pass".to_string(),
             detail: encryption_detail,
@@ -576,6 +624,13 @@ mod tests {
         )
         .unwrap();
         std::fs::write(etc.join("plasma-setup-done"), "").unwrap();
+        let selinux = etc.join("selinux");
+        std::fs::create_dir_all(&selinux).unwrap();
+        std::fs::write(
+            selinux.join("config"),
+            "# fixture\nSELINUX=enforcing\nSELINUXTYPE=targeted\n",
+        )
+        .unwrap();
         // A valid data entry plus an ESP entry whose UUID cannot resolve:
         // the ESP stage must fail closed deterministically (mount fails)
         // instead of depending on the machine running the test.
@@ -704,5 +759,72 @@ mod tests {
         assert!(validate(outside)
             .unwrap_err()
             .contains("not inside the target root"));
+    }
+
+    #[test]
+    fn selinux_enforcing_is_reported_in_the_check_vec() {
+        // Drop the fixture's ESP entry: with no ESP to mount, validation
+        // runs to completion and returns the full check vec.
+        let directory = target_fixture();
+        let etc = directory.path().join(DEPLOY).join("etc");
+        fs::write(
+            etc.join("fstab"),
+            "# generated\nUUID=ABCD-1234 /var/home btrfs subvol=@home,compress=zstd:1 0 0\n",
+        )
+        .unwrap();
+        let checks = validate(input(directory.path())).expect("fixture target should validate");
+        let selinux = checks
+            .iter()
+            .find(|check| check.name == "selinux")
+            .expect("selinux check must be reported");
+        assert_eq!(selinux.status, "pass");
+        assert_eq!(selinux.detail, "SELinux mode is enforcing");
+    }
+
+    #[test]
+    fn selinux_permissive_fails_closed() {
+        let directory = target_fixture();
+        let etc = directory.path().join(DEPLOY).join("etc");
+        fs::write(
+            etc.join("selinux/config"),
+            "SELINUX=permissive\nSELINUXTYPE=targeted\n",
+        )
+        .unwrap();
+        let error = validate(input(directory.path())).expect_err("permissive must fail");
+        assert!(error.contains("SELinux"), "unexpected error: {error}");
+        assert!(error.contains("not enforcing"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn selinux_disabled_fails_closed() {
+        let directory = target_fixture();
+        let etc = directory.path().join(DEPLOY).join("etc");
+        fs::write(etc.join("selinux/config"), "SELINUX=disabled\n").unwrap();
+        let error = validate(input(directory.path())).expect_err("disabled must fail");
+        assert!(error.contains("SELinux"), "unexpected error: {error}");
+        assert!(error.contains("not enforcing"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn selinux_missing_config_fails_closed() {
+        let directory = target_fixture();
+        let etc = directory.path().join(DEPLOY).join("etc");
+        fs::remove_dir_all(etc.join("selinux")).unwrap();
+        let error = validate(input(directory.path())).expect_err("missing config must fail");
+        assert!(error.contains("SELinux"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn selinux_type_only_config_fails_closed() {
+        // SELINUXTYPE names the policy; it must never be read as the mode.
+        let directory = target_fixture();
+        let etc = directory.path().join(DEPLOY).join("etc");
+        fs::write(etc.join("selinux/config"), "SELINUXTYPE=targeted\n").unwrap();
+        let error = validate(input(directory.path())).expect_err("type-only config must fail");
+        assert!(error.contains("SELinux"), "unexpected error: {error}");
+        assert!(
+            error.contains("no SELINUX= setting"),
+            "unexpected error: {error}"
+        );
     }
 }

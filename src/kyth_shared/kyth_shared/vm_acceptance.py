@@ -17,6 +17,7 @@ from kyth_shared.commands import run, run_text
 FW_CFG_ROOT = Path("/sys/firmware/qemu_fw_cfg/by_name/opt/com.kyth")
 ENABLE_FILE = FW_CFG_ROOT / "acceptance/raw"
 UPDATE_FILE = FW_CFG_ROOT / "update-ref/raw"
+NETWORK_CHECK_FILE = FW_CFG_ROOT / "network-check/raw"
 STATE_DIR = Path("/var/lib/kyth/vm-acceptance")
 STATE_FILE = STATE_DIR / "state"
 SERIAL_DEVICE = Path("/dev/ttyS0")
@@ -45,6 +46,10 @@ def enabled() -> bool:
 
 def read_update_ref() -> str:
     return _read_fw_cfg(UPDATE_FILE)
+
+
+def network_check_enabled() -> bool:
+    return _read_fw_cfg(NETWORK_CHECK_FILE) == "1"
 
 
 def valid_update_ref(value: str) -> bool:
@@ -135,8 +140,71 @@ def run_smoke_check(phase: str) -> None:
     emit(f"{phase}_SMOKE_OK", f"warnings-allowed={result.returncode}")
 
 
+def _selinux_enforcing() -> None:
+    result = run_text(["getenforce"], timeout=10)
+    mode = result.stdout.strip() if result is not None else ""
+    if result is None or result.returncode != 0 or mode != "Enforcing":
+        fail(f'installed system reports SELinux mode "{mode}", expected Enforcing')
+    emit("INSTALLED_SELINUX_OK", "Enforcing")
+
+
+def _failed_units(output: str) -> list[str]:
+    units = []
+    for line in output.splitlines():
+        stripped = line.strip().lstrip("●").strip()
+        if stripped:
+            units.append(stripped.split()[0])
+    return units
+
+
+def _first_boot_check() -> None:
+    result = run_text(["systemctl", "--failed", "--no-legend"], timeout=30)
+    if result is None or result.returncode != 0:
+        fail("systemctl --failed did not complete")
+    failed = _failed_units(result.stdout)
+    if failed:
+        fail(
+            f"installed system has {len(failed)} failed unit(s): "
+            + ", ".join(failed)
+        )
+    result = run_text(
+        ["systemctl", "show", "-p", "Result", "--value", "kyth-hw-setup.service"],
+        timeout=10,
+    )
+    value = result.stdout.strip() if result is not None else ""
+    if result is None or result.returncode != 0 or value != "success":
+        fail(f'kyth-hw-setup.service finished with Result="{value}", expected "success"')
+    emit("FIRSTBOOT_OK", str(len(failed)))
+
+
+def _registry_host(reference: str) -> str:
+    return reference.split("/", 1)[0]
+
+
+def _network_check() -> None:
+    host = _registry_host(_installer_target_ref())
+    resolved = run_text(["getent", "hosts", host], timeout=10)
+    if resolved is None or resolved.returncode != 0:
+        fail(f"registry host {host} did not resolve")
+    probe = run_text(
+        [
+            "curl", "-fsS", "-o", "/dev/null", "-w", "%{http_code}",
+            "--max-time", "30", f"https://{host}/v2/",
+        ],
+        timeout=40,
+    )
+    code_text = probe.stdout.strip() if probe is not None else ""
+    try:
+        code = int(code_text)
+    except ValueError:
+        code = 0
+    if not 100 <= code < 500:
+        fail(f'registry {host} answered HTTP "{code_text}", expected a status below 500')
+    emit("INSTALLED_NETWORK_OK", str(code))
+
+
 def _installer_target_ref() -> str:
-    default = "ghcr.io/kyth-os/kyth:testing"
+    default = "ghcr.io/mrtrickdotorg/kyth:testing"
     try:
         for line in INSTALLER_ENV_FILE.read_text(encoding="utf-8").splitlines():
             if line.startswith("KYTH_TARGET_IMAGE="):
@@ -467,6 +535,10 @@ def run_installed_lifecycle() -> None:
         fail("installed display manager did not become ready")
     if state == "fresh":
         emit("INSTALLED_READY", "display-manager-active")
+        _selinux_enforcing()
+        _first_boot_check()
+        if network_check_enabled():
+            _network_check()
         run_smoke_check("INSTALLED")
         run_hub_acceptance()
         initial = booted_digest()

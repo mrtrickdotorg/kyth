@@ -158,10 +158,12 @@ class InstallerAssuranceCoverageTests(unittest.TestCase):
             root = Path(tmp)
             (root / "hostname").write_text("kyth\n")
             (root / "fstab").write_text("# generated\n")
+            (root / "selinux").mkdir()
+            (root / "selinux" / "config").write_text("SELINUX=enforcing\n")
             with self.assertRaisesRegex(RuntimeError, "Could not verify installed account"):
                 validate_installed_target(root, InstallRequest(hostname="kyth", username="alice"))
             checks = validate_installed_target(root, InstallRequest(hostname="kyth", username=""))
-        self.assertEqual([check.name for check in checks], ["hostname", "filesystem"])
+        self.assertEqual([check.name for check in checks], ["hostname", "filesystem", "selinux"])
 
     def test_installed_target_requires_bootloader_when_root_is_given(self):
         request = InstallRequest(hostname="kyth", username="")
@@ -172,6 +174,8 @@ class InstallerAssuranceCoverageTests(unittest.TestCase):
             etc = root / "etc"
             (etc / "hostname").write_text("kyth\n")
             (etc / "fstab").write_text("# generated\n")
+            (etc / "selinux").mkdir()
+            (etc / "selinux" / "config").write_text("SELINUX=enforcing\n")
             with self.assertRaisesRegex(RuntimeError, "no bootloader"):
                 validate_installed_target(etc, request, root=root)
             deploy = root / "ostree" / "deploy" / "default"

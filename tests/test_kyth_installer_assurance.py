@@ -36,8 +36,10 @@ class InstallerAssuranceTests(unittest.TestCase):
             (etc / "hostname").write_text("kyth-box\n")
             (etc / "passwd").write_text("root:x:0:0::/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n")
             (etc / "fstab").write_text("# generated\n")
+            (etc / "selinux").mkdir()
+            (etc / "selinux" / "config").write_text("# fixture\nSELINUX=enforcing\nSELINUXTYPE=targeted\n")
             checks = validate_installed_target(etc, request)
-        self.assertEqual({check.name for check in checks}, {"hostname", "account", "filesystem"})
+        self.assertEqual({check.name for check in checks}, {"hostname", "account", "filesystem", "selinux"})
 
     def test_missing_bootloader_on_mounted_root_fails_closed(self):
         request = InstallRequest(hostname="kyth", username="")
@@ -46,6 +48,8 @@ class InstallerAssuranceTests(unittest.TestCase):
             etc.mkdir()
             (etc / "hostname").write_text("kyth\n")
             (etc / "fstab").write_text("# generated\n")
+            (etc / "selinux").mkdir()
+            (etc / "selinux" / "config").write_text("SELINUX=enforcing\n")
             with self.assertRaisesRegex(RuntimeError, "no bootloader"):
                 validate_installed_target(etc, request, root=Path(tmp))
 
@@ -57,11 +61,33 @@ class InstallerAssuranceTests(unittest.TestCase):
             etc.mkdir()
             (etc / "hostname").write_text("kyth\n")
             (etc / "fstab").write_text("# generated\n")
+            (etc / "selinux").mkdir()
+            (etc / "selinux" / "config").write_text("SELINUX=enforcing\n")
             entries = root / "boot" / "loader" / "entries"
             entries.mkdir(parents=True)
             (entries / "kyth.conf").write_text("title KythOS\n")
             checks = validate_installed_target(etc, request, root=root)
         self.assertIn("bootloader", {check.name for check in checks})
+
+    def test_installed_selinux_permissive_fails_closed(self):
+        request = InstallRequest(hostname="kyth", username="")
+        with tempfile.TemporaryDirectory() as tmp:
+            etc = Path(tmp)
+            (etc / "hostname").write_text("kyth\n")
+            (etc / "fstab").write_text("# generated\n")
+            (etc / "selinux").mkdir()
+            (etc / "selinux" / "config").write_text("SELINUX=permissive\nSELINUXTYPE=targeted\n")
+            with self.assertRaisesRegex(RuntimeError, "not enforcing"):
+                validate_installed_target(etc, request)
+
+    def test_installed_selinux_missing_config_fails_closed(self):
+        request = InstallRequest(hostname="kyth", username="")
+        with tempfile.TemporaryDirectory() as tmp:
+            etc = Path(tmp)
+            (etc / "hostname").write_text("kyth\n")
+            (etc / "fstab").write_text("# generated\n")
+            with self.assertRaisesRegex(RuntimeError, "not enforcing"):
+                validate_installed_target(etc, request)
 
     def test_missing_installed_account_fails_closed(self):
         request = InstallRequest(hostname="kyth", username="alice")

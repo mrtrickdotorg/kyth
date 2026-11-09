@@ -168,6 +168,42 @@ def _bootloader_installed(root: Path) -> str | None:
     return None
 
 
+def _selinux_check(etc: Path) -> AssuranceCheck:
+    """Require the installed SELinux config to pin SELINUX=enforcing.
+
+    The live session boots enforcing=0 as a scoped fallback; the installed
+    system must not inherit a weakened posture. Parse like the native
+    checker: skip blank/comment lines, match the SELINUX key exactly
+    (never SELINUXTYPE), first occurrence wins, value trimmed/lowercased.
+    """
+    config = etc / "selinux" / "config"
+    try:
+        contents = config.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"Installed SELinux mode is not enforcing: could not read "
+            f"/etc/selinux/config: {exc}"
+        ) from exc
+    mode = None
+    for raw_line in contents.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != "SELINUX":
+            continue
+        mode = value.strip().lower()
+        break
+    if mode is None:
+        raise RuntimeError(
+            "Installed SELinux mode is not enforcing: /etc/selinux/config "
+            "has no SELINUX= setting."
+        )
+    if mode != "enforcing":
+        raise RuntimeError(f"Installed SELinux mode is {mode!r}, not enforcing.")
+    return AssuranceCheck("selinux", "pass", "enforcing")
+
+
 def validate_installed_target(
     etc: Path, request: InstallRequest, *, root: Path | None = None,
 ) -> list[AssuranceCheck]:
@@ -198,6 +234,8 @@ def validate_installed_target(
     if not fstab.is_file():
         raise RuntimeError("Installed deployment is missing /etc/fstab.")
     checks.append(AssuranceCheck("filesystem", "pass", "Installed fstab is present"))
+
+    checks.append(_selinux_check(etc))
 
     if root is not None:
         reason = _bootloader_installed(root)

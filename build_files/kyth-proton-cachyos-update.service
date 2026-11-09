@@ -5,6 +5,10 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# Skip (do not fail) while the updater signing anchor is still the
+# placeholder: with no real certificate in it every run is refused, so
+# there is nothing to update until the image ships a real key.
+ExecCondition=/bin/sh -c 'grep -q "-----BEGIN PGP PUBLIC KEY BLOCK-----" /usr/share/kyth/updater-signing-keys.asc'
 ExecStart=/usr/bin/kyth-proton-cachyos-update
 StateDirectory=kyth/proton-cachyos
 StateDirectoryMode=0700

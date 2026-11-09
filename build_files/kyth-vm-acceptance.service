@@ -2,8 +2,12 @@
 Description=KythOS unattended VM acceptance guest
 After=network-online.target
 Wants=network-online.target
-# QEMU fw_cfg acceptance flag; the guest binary also checks this itself.
-ConditionPathExists=/sys/firmware/qemu_fw_cfg/by_name/kyth/acceptance/raw
+# No unit Condition on the QEMU fw_cfg acceptance flag: the guest binary
+# self-gates on /sys/firmware/qemu_fw_cfg/by_name/opt/com.kyth/acceptance/raw
+# and exits successfully when it is absent. A ConditionPathExists here
+# previously pointed at by_name/kyth/acceptance/raw — a path that never
+# exists — so systemd skipped this unit on every boot and the acceptance
+# guest never ran at all.
 
 [Service]
 Type=oneshot

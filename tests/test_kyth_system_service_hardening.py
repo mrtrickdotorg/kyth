@@ -105,6 +105,20 @@ class SystemServiceHardeningTests(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", probe)
         self.assertIn("CacheDirectory=kyth", probe)
 
+    def test_proton_update_skips_while_signing_anchor_is_placeholder(self) -> None:
+        body = (ROOT / "build_files/kyth-proton-cachyos-update.service").read_text(
+            encoding="utf-8"
+        )
+        # ExecCondition skips (not fails) the run while the installed
+        # anchor carries no certificate: every gated update is refused
+        # until a real updater signing key ships.
+        self.assertIn(
+            "ExecCondition=/bin/sh -c 'grep -q "
+            '"-----BEGIN PGP PUBLIC KEY BLOCK-----" '
+            "/usr/share/kyth/updater-signing-keys.asc'",
+            body,
+        )
+
     def test_privileged_service_can_reach_flatpak_system_repo(self) -> None:
         # kyth-privileged's flatpak_update operation runs
         # `/usr/bin/flatpak update --system -y` as root, so unlike the

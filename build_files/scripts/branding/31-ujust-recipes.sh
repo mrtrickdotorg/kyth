@@ -38,7 +38,19 @@ install -m 0644 /ctx/kyth-duperemove.timer /usr/lib/systemd/system/kyth-duperemo
 install -m 0644 /ctx/kyth-scx-loader.service /usr/lib/systemd/system/scx_loader.service
 systemctl enable kyth-local-bin-migrate.service 2>/dev/null || true
 systemctl enable kyth-duperemove.timer 2>/dev/null || true
-systemctl enable kyth-proton-cachyos-update.timer 2>/dev/null || true
+# The GE-Proton updater refuses every run while the updater signing anchor
+# is still the placeholder (no PGP certificate in
+# /ctx/config/updater-signing-keys.asc), so enabling the weekly timer now
+# would park a failed unit on every install. Enable it only when the anchor
+# carries a real certificate — the image that first ships one turns the
+# timer on automatically. Manual runs stay available via
+# `ujust update-proton-cachyos`. The marker string is the exact one the
+# Rust verifier keys on (update_manifest.rs) so the build gate and the
+# runtime gate can never disagree. (Fragment 99 installs the anchor later;
+# the gate reads the /ctx source, not the installed copy.)
+if grep -q -- "-----BEGIN PGP PUBLIC KEY BLOCK-----" /ctx/config/updater-signing-keys.asc; then
+	systemctl enable kyth-proton-cachyos-update.timer 2>/dev/null || true
+fi
 # No NetworkManager-wait-online.service here on purpose: it stalls every boot
 # up to its timeout on metered/slow/offline links, and every Kyth network
 # waiter already skips cleanly offline (flathub-setup exits 0 with no default

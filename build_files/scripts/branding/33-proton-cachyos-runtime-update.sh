@@ -1,13 +1,18 @@
 # shellcheck shell=bash
 # ── GE-Proton runtime update path ─────────────────────────────────────────────
-# The weekly kyth-proton-cachyos-update.timer installs GE-Proton to
-# /var/lib/kyth/proton-cachyos/ (/var is writable on an immutable system) and
-# is the ONLY source of GE-Proton on this image — there is no build-time
-# install in /usr/share/steam/compatibilitytools.d/ (that RUN layer was
-# removed from the Dockerfile). This means a fresh install has no
-# GE-Proton until the timer first succeeds over the network, and the live
-# ISO never gets one at all (the timer is explicitly disabled there — see
-# installer/build.sh's kyth-proton-cachyos-update.timer disable).
+# GE-Proton has two sources on this image. The baseline is the build-time
+# layer: the Dockerfile installs the CI-pinned GE-Proton via
+# build_files/scripts/proton-cachyos.sh into
+# /usr/share/steam/compatibilitytools.d/, so a fresh install has a working
+# GE-Proton offline. The weekly kyth-proton-cachyos-update.timer is the
+# refresh path: it installs newer GE-Proton releases to
+# /var/lib/kyth/proton-cachyos/ (/var is writable on an immutable system),
+# which Steam also scans via STEAM_EXTRA_COMPAT_TOOLS_PATHS. The timer is
+# enabled at build time only when the updater signing anchor carries a
+# real certificate (see branding/31-ujust-recipes.sh) — while the anchor
+# is the placeholder the updater refuses every run — and it is disabled
+# outright on the live ISO (see installer/build.sh's
+# kyth-proton-cachyos-update.timer disable).
 # NOTE: the timer/unit/directory keep their historical `proton-cachyos` names;
 # the payload is GE-Proton from GloriousEggroll/proton-ge-custom.
 # The directory must exist at first boot regardless — Lutris (and Steam) call

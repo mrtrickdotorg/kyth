@@ -127,7 +127,11 @@ While the placeholder is in place, every gated update is refused with an
 explicit "no KythOS updater signing key is installed yet" error. That is
 the intended behaviour, not a bypass: the mechanism ships complete and
 fail-closed, and updates resume once a real key ships in an image update
-and the first signed manifest is published.
+and the first signed manifest is published. The weekly GE-Proton timer
+is enabled at build time only when the anchor carries a real
+certificate, so replacing the placeholder (the ceremony's final step)
+is also what turns the timer on; until then installs carry no failing
+unit and manual `ujust update-proton-cachyos` runs remain available.
 
 Verification inputs can be overridden by environment for testing and
 recovery: `KYTH_UPDATER_KEYRING_PATH`, `KYTH_UPDATER_MANIFEST_URL`,

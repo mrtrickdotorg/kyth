@@ -31,9 +31,20 @@ class VmAcceptanceTests(unittest.TestCase):
     def test_guest_is_firmware_gated_and_covers_lifecycle(self):
         text = pathlib.Path(vm_acceptance.__file__).read_text(encoding="utf-8")
         self.assertIn("/sys/firmware/qemu_fw_cfg/by_name/opt/com.kyth", text)
-        self.assertIn("ExecCondition", UNIT.read_text(encoding="utf-8"))
+        # The unit carries no Condition on the fw_cfg flag: the guest
+        # binary self-gates (run() exits SUCCESS when the flag is absent).
+        # A ConditionPathExists previously pointed at
+        # by_name/kyth/acceptance/raw — a path that never exists, since
+        # the real flag is by_name/opt/com.kyth/acceptance/raw — so the
+        # unit was skipped on every boot and the guest never ran. There
+        # is likewise deliberately no ExecCondition (it would race QEMU
+        # exposing the flag); the negative space for both is pinned here.
+        unit_text = UNIT.read_text(encoding="utf-8")
+        self.assertNotIn("ConditionPathExists=", unit_text)
+        self.assertNotIn("ExecCondition=", unit_text)
         for phase in (
             "LIVE_READY", "INSTALL_COMPLETE", "INSTALLED_READY",
+            "INSTALLED_SELINUX_OK", "FIRSTBOOT_OK",
             "UPDATE_STAGED", "UPDATE_BOOTED", "ROLLBACK_STAGED",
             "ROLLBACK_BOOTED", "COMPLETE", "FAILED", "HUB_BINARY_OK",
             "HUB_DEEP_LINKS_OK", "HUB_SECOND_LAUNCH_OK",
@@ -419,7 +430,7 @@ class InstallerTargetRefAndStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("kyth_shared.vm_acceptance.INSTALLER_ENV_FILE", pathlib.Path(tmp) / "absent"):
                 self.assertEqual(
-                    vm_acceptance._installer_target_ref(), "ghcr.io/kyth-os/kyth:testing"
+                    vm_acceptance._installer_target_ref(), "ghcr.io/mrtrickdotorg/kyth:testing"
                 )
 
     def test_installer_target_ref_defaults_when_key_missing(self):
@@ -428,7 +439,7 @@ class InstallerTargetRefAndStateTests(unittest.TestCase):
             env_file.write_text("OTHER=1\n")
             with mock.patch("kyth_shared.vm_acceptance.INSTALLER_ENV_FILE", env_file):
                 self.assertEqual(
-                    vm_acceptance._installer_target_ref(), "ghcr.io/kyth-os/kyth:testing"
+                    vm_acceptance._installer_target_ref(), "ghcr.io/mrtrickdotorg/kyth:testing"
                 )
 
     def test_state_value_defaults_to_fresh(self):
@@ -456,6 +467,87 @@ class InstallerTargetRefAndStateTests(unittest.TestCase):
                  mock.patch("kyth_shared.vm_acceptance.power"):
                 with self.assertRaises(SystemExit):
                     vm_acceptance._initial_digest()
+
+
+class InstalledTruthCheckTests(unittest.TestCase):
+    def test_failed_units_parser_handles_bullets_and_empty_output(self):
+        self.assertEqual(vm_acceptance._failed_units(""), [])
+        self.assertEqual(vm_acceptance._failed_units("\n"), [])
+        self.assertEqual(
+            vm_acceptance._failed_units(
+                "● foo.service loaded failed failed Foo Service\n"
+                "bar.service loaded failed failed Bar Service\n"
+            ),
+            ["foo.service", "bar.service"],
+        )
+
+    def test_selinux_enforcing_accepts_enforcing(self):
+        with mock.patch("kyth_shared.vm_acceptance.run_text", return_value=_completed(0, "Enforcing\n")), \
+             mock.patch("kyth_shared.vm_acceptance.emit") as emit:
+            vm_acceptance._selinux_enforcing()
+        emit.assert_called_once_with("INSTALLED_SELINUX_OK", "Enforcing")
+
+    def test_selinux_enforcing_fails_when_permissive(self):
+        with mock.patch("kyth_shared.vm_acceptance.run_text", return_value=_completed(0, "Permissive\n")), \
+             mock.patch("kyth_shared.vm_acceptance.emit"), \
+             mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._selinux_enforcing()
+
+    def test_first_boot_check_emits_ok_with_zero_failed(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            side_effect=[_completed(0, ""), _completed(0, "success\n")],
+        ), mock.patch("kyth_shared.vm_acceptance.emit") as emit:
+            vm_acceptance._first_boot_check()
+        emit.assert_called_once_with("FIRSTBOOT_OK", "0")
+
+    def test_first_boot_check_fails_with_failed_units(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            return_value=_completed(0, "● foo.service loaded failed failed Foo\n"),
+        ), mock.patch("kyth_shared.vm_acceptance.emit"), \
+             mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._first_boot_check()
+
+    def test_first_boot_check_fails_when_hw_setup_did_not_succeed(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            side_effect=[_completed(0, ""), _completed(0, "failed\n")],
+        ), mock.patch("kyth_shared.vm_acceptance.emit"), \
+             mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._first_boot_check()
+
+    def test_network_check_emits_http_code(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance._installer_target_ref",
+            return_value="ghcr.io/example/kyth:testing",
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            side_effect=[_completed(0, "140.82.121.34 ghcr.io\n"), _completed(0, "401")],
+        ), mock.patch("kyth_shared.vm_acceptance.emit") as emit:
+            vm_acceptance._network_check()
+        emit.assert_called_once_with("INSTALLED_NETWORK_OK", "401")
+
+    def test_network_check_fails_when_registry_unreachable(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance._installer_target_ref",
+            return_value="ghcr.io/example/kyth:testing",
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            side_effect=[_completed(0, "140.82.121.34 ghcr.io\n"), _completed(0, "000")],
+        ), mock.patch("kyth_shared.vm_acceptance.emit"), \
+             mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._network_check()
+
+    def test_registry_host_derivation(self):
+        self.assertEqual(
+            vm_acceptance._registry_host("ghcr.io/example/kyth:testing"), "ghcr.io"
+        )
+        self.assertEqual(vm_acceptance._registry_host("ghcr.io"), "ghcr.io")
 
 
 class RunSmokeCheckTests(unittest.TestCase):
@@ -597,6 +689,9 @@ class RunInstalledLifecycleTests(unittest.TestCase):
                  mock.patch("kyth_shared.vm_acceptance.STATE_FILE", state_dir / "state"), \
                  mock.patch("kyth_shared.vm_acceptance.read_update_ref", return_value=""), \
                  mock.patch("kyth_shared.vm_acceptance.wait_for_desktop", return_value=True), \
+                 mock.patch("kyth_shared.vm_acceptance._selinux_enforcing"), \
+                 mock.patch("kyth_shared.vm_acceptance._first_boot_check"), \
+                 mock.patch("kyth_shared.vm_acceptance.network_check_enabled", return_value=False), \
                  mock.patch("kyth_shared.vm_acceptance.run_smoke_check") as mock_smoke, \
                  mock.patch("kyth_shared.vm_acceptance.run_hub_acceptance"), \
                  mock.patch("kyth_shared.vm_acceptance.booted_digest", return_value="sha256:aaa"), \
@@ -618,6 +713,9 @@ class RunInstalledLifecycleTests(unittest.TestCase):
                      return_value="ghcr.io/example/kyth:testing",
                  ), \
                  mock.patch("kyth_shared.vm_acceptance.wait_for_desktop", return_value=True), \
+                 mock.patch("kyth_shared.vm_acceptance._selinux_enforcing"), \
+                 mock.patch("kyth_shared.vm_acceptance._first_boot_check"), \
+                 mock.patch("kyth_shared.vm_acceptance.network_check_enabled", return_value=False), \
                  mock.patch("kyth_shared.vm_acceptance.run_smoke_check"), \
                  mock.patch("kyth_shared.vm_acceptance.run_hub_acceptance"), \
                  mock.patch("kyth_shared.vm_acceptance.booted_digest", return_value="sha256:aaa"), \

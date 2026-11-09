@@ -333,11 +333,27 @@ class SmokeCheck:
             ("kyth-hw-setup.service", "First-boot hardware setup"),
             ("kyth-flathub-setup.service", "Flathub setup"),
             ("kyth-default-flatpaks.service", "Default Flatpaks"),
-            ("kyth-proton-cachyos-update.timer", "GE-Proton timer"),
             ("kyth-duperemove.timer", "Game cache dedupe timer"),
             ("kyth-local-bin-migrate.service", "Local bin migration"),
         ):
             self.check_unit(unit, label, enabled=True)
+        # The GE-Proton timer is enabled at build time only once the
+        # updater signing anchor carries a real certificate (see
+        # branding/31-ujust-recipes.sh): while the anchor is the
+        # placeholder every updater run is refused, so a disabled timer
+        # is the expected state, not a failure. The marker string is the
+        # same one the updater's verifier keys on.
+        anchor = Path("/usr/share/kyth/updater-signing-keys.asc")
+        try:
+            anchor_text = anchor.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            anchor_text = ""
+        if "-----BEGIN PGP PUBLIC KEY BLOCK-----" in anchor_text:
+            self.check_unit(
+                "kyth-proton-cachyos-update.timer", "GE-Proton timer", enabled=True
+            )
+        else:
+            self.warn("GE-Proton timer", "disabled until the updater signing key ships")
         self.check_command("kyth-full-update", "KythOS full updater")
         for command, label in (
             ("kyth-ai-dev", "AI developer environment helper"),

@@ -84,6 +84,56 @@ class SmokeCheckTests(unittest.TestCase):
         self.assertEqual(session.level, "FAIL")
         self.assertIn("journalctl -u plasmalogin", session.detail)
 
+    def _background_with_anchor(self, anchor_text: str | None):
+        """Run background_and_tools with a fixtured signing anchor file."""
+        checker = SmokeCheck(quiet=True)
+
+        def fake_read_text(path, *args, **kwargs):
+            if str(path) == "/usr/share/kyth/updater-signing-keys.asc":
+                if anchor_text is None:
+                    raise OSError("anchor not installed")
+                return anchor_text
+            return ""
+
+        with (
+            mock.patch.object(checker, "check_unit") as check_unit,
+            mock.patch.object(checker, "check_command"),
+            mock.patch.object(pathlib.Path, "read_text", fake_read_text),
+        ):
+            checker.background_and_tools()
+        return checker, check_unit
+
+    def test_proton_timer_is_warning_while_anchor_is_placeholder(self) -> None:
+        checker, check_unit = self._background_with_anchor("# PLACEHOLDER\n")
+        units = [call.args[0] for call in check_unit.call_args_list]
+        self.assertNotIn("kyth-proton-cachyos-update.timer", units)
+        timer = next(item for item in checker.results if item.name == "GE-Proton timer")
+        self.assertEqual(timer.level, "WARN")
+        self.assertEqual(timer.detail, "disabled until the updater signing key ships")
+
+    def test_proton_timer_is_warning_when_anchor_is_missing(self) -> None:
+        checker, check_unit = self._background_with_anchor(None)
+        units = [call.args[0] for call in check_unit.call_args_list]
+        self.assertNotIn("kyth-proton-cachyos-update.timer", units)
+        timer = next(item for item in checker.results if item.name == "GE-Proton timer")
+        self.assertEqual(timer.level, "WARN")
+
+    def test_proton_timer_is_required_once_anchor_has_certificate(self) -> None:
+        checker, check_unit = self._background_with_anchor(
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\n...\n"
+        )
+        timer_calls = [
+            call
+            for call in check_unit.call_args_list
+            if call.args[0] == "kyth-proton-cachyos-update.timer"
+        ]
+        self.assertEqual(len(timer_calls), 1)
+        self.assertEqual(timer_calls[0].args[1], "GE-Proton timer")
+        self.assertEqual(timer_calls[0].kwargs, {"enabled": True})
+        self.assertFalse(
+            [item for item in checker.results if item.name == "GE-Proton timer"]
+        )
+
     def test_health_report_has_stable_json_schema(self) -> None:
         report = from_smoke_results(
             [

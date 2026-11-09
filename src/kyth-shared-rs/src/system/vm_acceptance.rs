@@ -59,6 +59,10 @@ pub fn update_ref() -> String {
     read_trimmed(format!("{FW_CFG_ROOT}/update-ref/raw"))
 }
 
+pub fn network_check_enabled() -> bool {
+    read_trimmed(format!("{FW_CFG_ROOT}/network-check/raw")) == "1"
+}
+
 pub fn booted_digest_from_json(output: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(output).ok()?;
     let image = value.get("status")?.get("booted")?.get("image")?;
@@ -219,6 +223,128 @@ fn smoke_check(phase: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The installed system must boot with SELinux Enforcing. The live ISO
+/// boots permissive so the install itself is not blocked by labelling,
+/// and nothing else asserts the installed deployment did not stay that
+/// way.
+fn selinux_enforcing() -> io::Result<()> {
+    let output = run_bounded(&["getenforce".into()], Duration::from_secs(10));
+    let mode = output
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default();
+    if output.is_ok_and(|output| output.status.success()) && mode == "Enforcing" {
+        emit("INSTALLED_SELINUX_OK", "Enforcing");
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "installed system reports SELinux mode {mode:?}, expected Enforcing"
+    )))
+}
+
+/// Pure parse of `systemctl --failed --no-legend` output: one unit name
+/// per non-empty line. systemd prefixes failed units with a bullet that
+/// `--no-legend` does not suppress on every version, so strip it.
+pub fn failed_units_from_output(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .trim_start_matches('●')
+                .trim()
+                .split_whitespace()
+                .next()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// First-boot completion truth: the smoke check samples individual
+/// invariants, but a boot that left units failed or never completed the
+/// hardware-setup oneshot is not a finished first boot.
+fn first_boot_check() -> io::Result<()> {
+    let output = run_bounded(
+        &["systemctl".into(), "--failed".into(), "--no-legend".into()],
+        Duration::from_secs(30),
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other("systemctl --failed did not complete"));
+    }
+    let failed = failed_units_from_output(&String::from_utf8_lossy(&output.stdout));
+    if !failed.is_empty() {
+        return Err(io::Error::other(format!(
+            "installed system has {} failed unit(s): {}",
+            failed.len(),
+            failed.join(", ")
+        )));
+    }
+    let result = run_bounded(
+        &[
+            "systemctl".into(),
+            "show".into(),
+            "-p".into(),
+            "Result".into(),
+            "--value".into(),
+            "kyth-hw-setup.service".into(),
+        ],
+        Duration::from_secs(10),
+    )?;
+    let value = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+    if !result.status.success() || value != "success" {
+        return Err(io::Error::other(format!(
+            "kyth-hw-setup.service finished with Result={value:?}, expected \"success\""
+        )));
+    }
+    emit("FIRSTBOOT_OK", failed.len().to_string());
+    Ok(())
+}
+
+/// Registry host portion of an image reference (everything before the
+/// first path separator).
+pub fn registry_host(reference: &str) -> String {
+    reference.split('/').next().unwrap_or_default().to_owned()
+}
+
+/// Opt-in (fw_cfg `network-check`) registry reachability truth: the
+/// update path is only real if the installed system can resolve and
+/// reach the registry it would pull from. Off by default so hermetic
+/// runs without outbound networking do not false-fail.
+fn network_check() -> io::Result<()> {
+    let host = registry_host(&installer_target_ref());
+    let resolved = run_bounded(
+        &["getent".into(), "hosts".into(), host.clone()],
+        Duration::from_secs(10),
+    );
+    if !resolved.is_ok_and(|output| output.status.success()) {
+        return Err(io::Error::other(format!(
+            "registry host {host} did not resolve"
+        )));
+    }
+    let probe = run_bounded(
+        &[
+            "curl".into(),
+            "-fsS".into(),
+            "-o".into(),
+            "/dev/null".into(),
+            "-w".into(),
+            "%{http_code}".into(),
+            "--max-time".into(),
+            "30".into(),
+            format!("https://{host}/v2/"),
+        ],
+        Duration::from_secs(40),
+    )?;
+    let code_text = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+    let code = code_text.parse::<u32>().unwrap_or(0);
+    if !(100..500).contains(&code) {
+        return Err(io::Error::other(format!(
+            "registry {host} answered HTTP {code_text:?}, expected a status below 500"
+        )));
+    }
+    emit("INSTALLED_NETWORK_OK", code.to_string());
+    Ok(())
+}
+
 fn installer_target_ref() -> String {
     fs::read_to_string(INSTALLER_ENV_FILE)
         .ok()
@@ -230,6 +356,37 @@ fn installer_target_ref() -> String {
         })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "ghcr.io/mrtrickdotorg/kyth:testing".into())
+}
+
+/// Pure parse of the digest-pinned source image the live image was built
+/// with (`KYTH_SOURCE_IMAGE` in the installer env file). Kept separate
+/// from the file read so the parse is unit-testable, mirroring
+/// `booted_digest_from_json`.
+pub fn source_ref_from_env(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("KYTH_SOURCE_IMAGE=")
+                .map(|value| value.trim().trim_matches(['\'', '"']).to_owned())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// The install source must come from the pin the image build wrote,
+/// never from a hardcoded registry reference: a floating tag could
+/// resolve to a different image than the one the live media was built
+/// and signed for. Fail closed when the pin is absent (the Python parity
+/// fixture pins this exact error message).
+fn installer_source_ref() -> io::Result<String> {
+    fs::read_to_string(INSTALLER_ENV_FILE)
+        .ok()
+        .and_then(|contents| source_ref_from_env(&contents))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "pinned installer source is missing from live image",
+            )
+        })
 }
 
 #[cfg(unix)]
@@ -268,6 +425,12 @@ fn install_from_live_iso() -> io::Result<()> {
         ));
     }
     let target_ref = installer_target_ref();
+    let source_ref = installer_source_ref()?;
+    if !valid_update_ref(&source_ref) {
+        return Err(io::Error::other(
+            "installer source image reference contains unsupported characters",
+        ));
+    }
     emit("INSTALL_STARTED", target.display().to_string());
     run_logged(
         &[
@@ -275,7 +438,7 @@ fn install_from_live_iso() -> io::Result<()> {
             "install".into(),
             "to-disk".into(),
             "--source-imgref".into(),
-            "ghcr.io/kyth-os/kyth:latest".into(),
+            source_ref,
             "--target-imgref".into(),
             target_ref.clone(),
             "--filesystem".into(),
@@ -707,6 +870,11 @@ fn installed_lifecycle() -> io::Result<()> {
     match state_value().as_str() {
         "fresh" => {
             emit("INSTALLED_READY", "display-manager-active");
+            selinux_enforcing()?;
+            first_boot_check()?;
+            if network_check_enabled() {
+                network_check()?;
+            }
             smoke_check("INSTALLED")?;
             if !Path::new(HUB_BINARY).is_file() {
                 return Err(io::Error::other(
@@ -832,6 +1000,45 @@ mod tests {
             deployment_count_from_json("{\"deployments\":[{\"id\":1}] }"),
             1
         );
+    }
+
+    #[test]
+    fn parses_pinned_installer_source_from_env() {
+        assert_eq!(
+            source_ref_from_env(
+                "KYTH_TARGET_IMAGE=x\nKYTH_SOURCE_IMAGE=ghcr.io/mrtrickdotorg/kyth@sha256:abc\n"
+            ),
+            Some("ghcr.io/mrtrickdotorg/kyth@sha256:abc".into())
+        );
+        assert_eq!(source_ref_from_env("KYTH_TARGET_IMAGE=x\n"), None);
+        assert_eq!(source_ref_from_env(""), None);
+        assert_eq!(
+            source_ref_from_env("KYTH_SOURCE_IMAGE='ghcr.io/mrtrickdotorg/kyth:testing'\n"),
+            Some("ghcr.io/mrtrickdotorg/kyth:testing".into())
+        );
+        assert_eq!(source_ref_from_env("KYTH_SOURCE_IMAGE=\n"), None);
+    }
+
+    #[test]
+    fn parses_failed_units_from_systemctl_output() {
+        assert!(failed_units_from_output("").is_empty());
+        assert!(failed_units_from_output("\n").is_empty());
+        assert_eq!(
+            failed_units_from_output(
+                "● foo.service loaded failed failed Foo Service\n\
+                 bar.service loaded failed failed Bar Service\n"
+            ),
+            vec!["foo.service".to_string(), "bar.service".to_string()]
+        );
+    }
+
+    #[test]
+    fn derives_registry_host_from_reference() {
+        assert_eq!(
+            registry_host("ghcr.io/mrtrickdotorg/kyth:testing"),
+            "ghcr.io"
+        );
+        assert_eq!(registry_host("ghcr.io"), "ghcr.io");
     }
 
     #[test]
