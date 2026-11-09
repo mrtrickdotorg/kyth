@@ -61,7 +61,10 @@ jobs:
     name: Prepare metadata (${{ inputs.source_tag }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      verified_event: ${{ steps.verify_event.outputs.verified_event }}
     permissions:
+      actions: read
       contents: write
       packages: read
     concurrency:
@@ -84,6 +87,51 @@ jobs:
           # GitHub Apps report as name[bot] (cursor[bot], dependabot[bot], …).
           [[ "${ORIGINAL_ACTOR}" =~ ^([A-Za-z0-9-]+(\[bot\])?)?$ ]]
 
+      - name: Verify originating build event
+        id: verify_event
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            // H12: inputs.original_event is free text on manual dispatch,
+            // validated by regex only, so a dispatcher could claim
+            // 'schedule' and select the reviewer-free stable-release-auto
+            // environment. Derive the event from the API instead: the
+            // build run that actually produced this commit records its
+            // own event, which a dispatcher cannot forge. No completed
+            // build run for the SHA leaves verified_event empty, and the
+            // publish environment selection fails closed on empty.
+            const { owner, repo } = context.repo;
+            const headSha = process.env.SOURCE_GITHUB_SHA || process.env.SOURCE_SHA;
+            const workflows = await github.paginate(
+              github.rest.actions.listRepoWorkflows,
+              { owner, repo, per_page: 100 }
+            );
+            const buildWorkflow = workflows.find((workflow) =>
+              workflow.name === 'Build container image' &&
+              workflow.path === '.github/workflows/build.yml' &&
+              workflow.state === 'active'
+            );
+            let verifiedEvent = '';
+            if (buildWorkflow && headSha) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRuns,
+                {
+                  owner,
+                  repo,
+                  workflow_id: buildWorkflow.id,
+                  head_sha: headSha,
+                  per_page: 100,
+                }
+              );
+              const buildRun = runs.find((r) => r.status === 'completed');
+              if (buildRun) verifiedEvent = buildRun.event;
+            }
+            core.info(`Verified originating build event for ${headSha}: '${verifiedEvent}'`);
+            core.setOutput('verified_event', verifiedEvent);
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_GITHUB_SHA: ${{ inputs.source_github_sha }}
+
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -95,6 +143,7 @@ jobs:
         uses: ./.github/actions/preflight-image
         with:
           image-tag: ${{ inputs.source_tag }}
+          source-digest: ${{ inputs.source_digest }}
       - name: Prepare metadata variables
         id: meta
         env:
@@ -389,8 +438,10 @@ jobs:
     # The previous expression trusted `inputs.original_actor` (free-text on
     # manual dispatch, forgeable by any write-collaborator) and compared a
     # user login against the org name (never matches). Schedule-triggered
-    # rebuilds use the reviewer-free stable-release-auto environment.
-    environment: ${{ (inputs.source_tag == 'testing' || inputs.source_tag == 'testing-cachy') && 'testing-release' || (inputs.original_event == 'schedule' && 'stable-release-auto' || 'stable-release') }}
+    # rebuilds use the reviewer-free stable-release-auto environment, now
+    # selected by the prepare job's API-verified build event (H12) — the
+    # free-text original_event input no longer selects anything.
+    environment: ${{ (inputs.source_tag == 'testing' || inputs.source_tag == 'testing-cachy') && 'testing-release' || (needs.prepare.outputs.verified_event == 'schedule' && 'stable-release-auto' || 'stable-release') }}
     permissions:
       actions: write
       contents: write
@@ -626,7 +677,7 @@ jobs:
               "source_tag": ${{ toJSON(inputs.source_tag) }},
               "source_digest": ${{ toJSON(inputs.source_digest) }},
               "source_sha": ${{ toJSON(inputs.source_sha) }},
-              "run_acceptance": "false"
+              "run_acceptance": ${{ inputs.source_tag == 'latest' && '"true"' || '"false"' }}
             }
 
       - name: Trigger CVE scan

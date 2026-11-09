@@ -525,12 +525,16 @@ jobs:
   publish:
     name: Publish ISO (${{ inputs.source_tag || needs.build.outputs.effective_tag }})
     needs: [build, acceptance]
-    # A skipped acceptance (emergency dispatch) still publishes; a failed or
-    # cancelled one must not.
+    # Stable publishes only when this run's acceptance passed (the ISO is
+    # built from the pinned digest, so the pass is digest-exact). A skipped
+    # acceptance (emergency dispatch) still publishes for testing only; a
+    # failed or cancelled one never publishes.
     if: >-
       ${{ !cancelled()
       && needs.build.result == 'success'
-      && (needs.acceptance.result == 'success' || needs.acceptance.result == 'skipped') }}
+      && (needs.acceptance.result == 'success'
+        || (needs.acceptance.result == 'skipped'
+          && (inputs.source_tag || needs.build.outputs.effective_tag) == 'testing')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # As a reusable workflow this sees the caller's github context: stable
@@ -832,16 +836,6 @@ jobs:
           cp "${ATTESTATION_BUNDLE_PATH}" "${ISO}.intoto.jsonl"
           cp "${ATTESTATION_BUNDLE_PATH}" "output/live-iso/${CHANNEL_BASENAME}.intoto.jsonl"
 
-      - name: Upload ISO to Cloudflare R2
-        uses: ./.github/actions/upload-r2
-        with:
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          r2-endpoint-url: ${{ secrets.R2_ENDPOINT_URL }}
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          iso-basename: ${{ needs.build.outputs.iso_basename }}
-          channel-basename: ${{ needs.build.outputs.channel_basename }}
-
       - name: Publish GitHub releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -872,3 +866,13 @@ jobs:
             --iso-changelog "${ISO_CHANGELOG}" \
             --source-dir "output/live-iso" \
             --run-id "${RUN_ID}"
+
+      - name: Upload ISO to Cloudflare R2
+        uses: ./.github/actions/upload-r2
+        with:
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          r2-endpoint-url: ${{ secrets.R2_ENDPOINT_URL }}
+          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+          iso-basename: ${{ needs.build.outputs.iso_basename }}
+          channel-basename: ${{ needs.build.outputs.channel_basename }}

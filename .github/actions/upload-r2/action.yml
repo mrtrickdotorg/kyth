@@ -71,21 +71,25 @@ runs:
         ISO="${SOURCE_DIR}/${ISO_BASENAME}"
         CHANNEL="${SOURCE_DIR}/${CHANNEL_BASENAME}"
 
-        for artifact in "${ISO}" "${ISO}-CHECKSUM" "${ISO}.sig" "${ISO}.bundle" "${ISO}.intoto.jsonl" "${ISO}.json"; do
+        # Sidecars land before the ISO in both sets: a consumer that sees
+        # the ISO key must always find its checksum/signature beside it.
+        for artifact in "${ISO}-CHECKSUM" "${ISO}.sig" "${ISO}.bundle" "${ISO}.intoto.jsonl" "${ISO}.json" "${ISO}"; do
           aws s3 cp "${artifact}" \
             "s3://${BUCKET}/$(basename "${artifact}")" \
             --endpoint-url "${R2_ENDPOINT}" \
             --no-progress
         done
 
-        aws s3 cp "${ISO}" "s3://${BUCKET}/$(basename "${CHANNEL}")" \
-          --endpoint-url "${R2_ENDPOINT}" --no-progress
         for suffix in -CHECKSUM .sig .bundle .intoto.jsonl .json; do
           aws s3 cp "${CHANNEL}${suffix}" \
             "s3://${BUCKET}/$(basename "${CHANNEL}${suffix}")" \
             --endpoint-url "${R2_ENDPOINT}" \
             --no-progress
         done
+        # The channel key is the pointer consumers poll: it moves last,
+        # once every sidecar (and the immutable set above) is in place.
+        aws s3 cp "${ISO}" "s3://${BUCKET}/$(basename "${CHANNEL}")" \
+          --endpoint-url "${R2_ENDPOINT}" --no-progress
 
     # Retention runs after a successful upload and purges immutable build
     # sets beyond the newest few per channel (the bucket grew to ~3 TB

@@ -112,6 +112,109 @@ class WorkflowArtifactContracts(unittest.TestCase):
         self.assertNotIn('RELEASE_ID="${DATE}-${SHORT_SHA}', workflow)
 
 
+class PublicationStagingContracts(unittest.TestCase):
+    def test_publish_final_uses_immutable_version_or_staging_destination(self):
+        workflow = (ROOT / ".github/workflows/build.yml").read_text(
+            encoding="utf-8"
+        )
+        publish = workflow.split(
+            "- name: Publish and validate rechunked image", 1
+        )[1].split("- name: Publish immutable build metadata", 1)[0]
+
+        # The floating tag is promoted by supply-chain after signing; build
+        # publishes only the immutable version tag, or a run-unique staging
+        # tag when validation was explicitly skipped.
+        self.assertNotIn("PRIMARY_TAG", publish)
+        self.assertIn(
+            'DESTINATION_REF="${IMAGE_FULL}:${EXPECTED_VERSION}"', publish
+        )
+        self.assertIn('"docker://${DESTINATION_REF}"', publish)
+        self.assertIn(
+            'VALIDATED: ${{ needs.plan.outputs.validated }}', publish
+        )
+        self.assertIn(
+            "STAGING_TAG: staging-${{ steps.resolve_tag.outputs.tag }}-"
+            "${{ github.run_id }}-${{ github.run_attempt }}",
+            publish,
+        )
+        self.assertIn('if [[ "${VALIDATED}" != "true" ]]; then', publish)
+        self.assertIn(
+            'DESTINATION_REF="${IMAGE_FULL}:${STAGING_TAG}"', publish
+        )
+
+        metadata_tags = publish.split('DIGEST="$(cat "${DIGEST_FILE}")"', 1)[
+            1
+        ].split("LAYERS=", 1)[0]
+        self.assertIn('if [[ "${VALIDATED}" == "true" ]]; then', metadata_tags)
+        self.assertIn(
+            'if [[ "${tag}" != "${EXPECTED_VERSION}" ]]; then', metadata_tags
+        )
+
+    def test_validated_state_gates_supply_chain_dispatch(self):
+        workflow = (ROOT / ".github/workflows/build.yml").read_text(
+            encoding="utf-8"
+        )
+        gate = workflow.split("  gate:", 1)[1].split("  destination_gate:", 1)[0]
+        self.assertIn(
+            "validated: ${{ steps.check.outputs.validated }}", gate
+        )
+        self.assertIn(
+            "core.setOutput('validated', allOk ? 'true' : 'false');", gate
+        )
+        dispatch = gate.split("if (eventName === 'workflow_dispatch')", 1)[
+            1
+        ].split("if (eventName === 'push')", 1)[0]
+        self.assertIn("core.setOutput('validated', 'false');", dispatch)
+        self.assertIn(
+            "core.setOutput('validated', ok ? 'true' : 'false');", gate
+        )
+        self.assertIn("core.setOutput('validated', 'true');", gate)
+
+        plan = workflow.split("  plan:", 1)[1].split("  build_push:", 1)[0]
+        self.assertIn("validated: ${{ needs.gate.outputs.validated }}", plan)
+
+        finalize = workflow.split("  finalize:", 1)[1]
+        dispatch_step = finalize.split(
+            "- name: Dispatch supply chain metadata", 1
+        )[1].split("uses: ./.github/actions/dispatch-workflow", 1)[0]
+        self.assertIn(
+            "if: needs.plan.outputs.validated == 'true'", dispatch_step
+        )
+
+    def test_preflight_image_can_address_an_image_by_digest(self):
+        action = (
+            ROOT / ".github/actions/preflight-image/action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("source-digest:", action)
+        self.assertIn("SOURCE_DIGEST: ${{ inputs.source-digest }}", action)
+        self.assertIn(
+            'image="ghcr.io/${GITHUB_REPOSITORY,,}@${SOURCE_DIGEST}"', action
+        )
+        self.assertIn('docker manifest inspect "${image}"', action)
+
+    def test_main_branch_build_requires_mok_key(self):
+        workflow = (ROOT / ".github/workflows/build.yml").read_text(
+            encoding="utf-8"
+        )
+        build_final = workflow.split("- name: Build final image", 1)[1].split(
+            "- name: Login rootful Podman to GHCR", 1
+        )[0]
+        guard = (
+            'if [[ "${MATRIX_BRANCH}" == "main" && -z "${MOK_KEY:-}" ]]; then '
+            'echo "::error::MOK_KEY secret is required for main-branch builds '
+            "— refusing to build stable with Secure Boot signing silently "
+            'disabled" >&2; exit 1; fi'
+        )
+        self.assertIn("MOK_KEY is optional on non-main branches only", build_final)
+        self.assertIn("required on main", build_final)
+        self.assertIn(guard, build_final)
+        signing_block = build_final.index("SECUREBOOT_SIGNING_REQUESTED=1")
+        guard_at = build_final.index(guard)
+        build_at = build_final.index("docker buildx build \\")
+        self.assertLess(signing_block, guard_at)
+        self.assertLess(guard_at, build_at)
+
+
 class ReleaseChainingContracts(unittest.TestCase):
     def test_testing_base_stage_refuses_a_non_f45_base(self):
         """A workflow_run build uses main's build.yml and passes an F44 base arg."""

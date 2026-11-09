@@ -52,6 +52,7 @@ jobs:
       contents: read
     outputs:
       ok: ${{ steps.check.outputs.ok }}
+      validated: ${{ steps.check.outputs.validated }}
       head_sha: ${{ steps.check.outputs.head_sha }}
       head_branch: ${{ steps.check.outputs.head_branch }}
     steps:
@@ -102,6 +103,7 @@ jobs:
               core.setOutput('head_sha', mainBranch.commit.sha);
               core.setOutput('head_branch', 'main');
               core.setOutput('ok', allOk ? 'true' : 'false');
+              core.setOutput('validated', allOk ? 'true' : 'false');
               return;
             }
             if (eventName === 'workflow_dispatch') {
@@ -117,6 +119,7 @@ jobs:
               } else if (skip) {
                 core.warning('Validation gate explicitly skipped via skip_validation input');
                 core.setOutput('ok', 'true');
+                core.setOutput('validated', 'false');
               } else {
                 core.setOutput('ok', 'false');
               }
@@ -146,6 +149,7 @@ jobs:
                   const ok = validation.conclusion === 'success';
                   core.info(`Validation ${validation.conclusion} for ${sha}${ok ? ' — proceeding' : ' — gating build'}`);
                   core.setOutput('ok', ok ? 'true' : 'false');
+                  core.setOutput('validated', ok ? 'true' : 'false');
                   return;
                 }
                 if (Date.now() > deadline) {
@@ -186,6 +190,7 @@ jobs:
             }
             core.info(`Validation succeeded for ${headSha} (${headBranch}) — proceeding`);
             core.setOutput('ok', 'true');
+            core.setOutput('validated', 'true');
 
   destination_gate:
     name: Destination testing preflight (hard-disabled)
@@ -291,6 +296,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       branches: ${{ steps.branches.outputs.branches }}
+      validated: ${{ needs.gate.outputs.validated }}
       # NOT needs.gate.outputs.head_sha directly: for a `schedule` trigger,
       # gate's `context.sha` resolves to the default branch's (main's) tip
       # regardless of which branches this matrixes over (branches=["main",
@@ -663,8 +669,9 @@ jobs:
             [[ -n "${label}" ]] && LABEL_ARGS+=(--label "${label}")
           done < <(printf '%s\n%s\n' "${STEPS_METADATA_OUTPUTS_LABELS}" "${STEPS_BUILD_LABELS_OUTPUTS_LABELS}")
 
-          # MOK_KEY is optional — builds without it, or with a stale key, skip
-          # vmlinuz signing gracefully for the regular container image.
+          # MOK_KEY is optional on non-main branches only — builds without it,
+          # or with a stale key, skip vmlinuz signing gracefully there. It is
+          # required on main, where the guard below refuses an unsigned build.
           # To enable Secure Boot: add MOK_KEY as a repository secret containing
           # the PEM-encoded RSA private key matching build_files/secureboot/kyth-secureboot.cer.
           MOK_SECRET_ARG=()
@@ -680,6 +687,7 @@ jobs:
           SYSCONFIG_HASH="$(./build_files/scripts/hash-sysconfig.sh)"
           GAMING_VERSIONS_HASH="$(./build_files/scripts/hash-gaming-versions.sh --print)"
 
+          if [[ "${MATRIX_BRANCH}" == "main" && -z "${MOK_KEY:-}" ]]; then echo "::error::MOK_KEY secret is required for main-branch builds — refusing to build stable with Secure Boot signing silently disabled" >&2; exit 1; fi
           docker buildx build \
             --secret id=github_token,env=GITHUB_TOKEN \
             "${MOK_SECRET_ARG[@]}" \
@@ -829,14 +837,18 @@ jobs:
         env:
           IMAGE_FULL: ${{ steps.build_final.outputs.image }}
           SOURCE_REF: ${{ steps.rechunk.outputs.ref }}
-          PRIMARY_TAG: ${{ steps.resolve_tag.outputs.tag }}
+          VALIDATED: ${{ needs.plan.outputs.validated }}
+          STAGING_TAG: staging-${{ steps.resolve_tag.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
           TAGS: ${{ steps.metadata.outputs.tags }}
           EXPECTED_VERSION: ${{ steps.checkout_sha.outputs.image_version }}
           EXPECTED_REVISION: ${{ steps.checkout_sha.outputs.sha }}
         run: |
           exec 3>>"${GITHUB_OUTPUT}"
           set -euo pipefail
-          PRIMARY_REF="${IMAGE_FULL}:${PRIMARY_TAG}"
+          DESTINATION_REF="${IMAGE_FULL}:${EXPECTED_VERSION}"
+          if [[ "${VALIDATED}" != "true" ]]; then
+            DESTINATION_REF="${IMAGE_FULL}:${STAGING_TAG}"
+          fi
           SKOPEO_COMPRESSION_ARGS=(
             --dest-compress-format zstd:chunked
             --dest-compress-level 3
@@ -860,7 +872,7 @@ jobs:
               --digestfile "${DIGEST_FILE}" \
               --retry-times 3 \
               "${SOURCE_REF}" \
-              "docker://${PRIMARY_REF}" 2>&1 | tee "${PUBLISH_LOG}"; then
+              "docker://${DESTINATION_REF}" 2>&1 | tee "${PUBLISH_LOG}"; then
               publish_succeeded=true
               break
             else
@@ -877,14 +889,16 @@ jobs:
 
           DIGEST="$(cat "${DIGEST_FILE}")"
           build_files/scripts/validate-digest.sh "${DIGEST}"
-          for tag in ${TAGS}; do
-            if [[ "${tag}" != "${PRIMARY_TAG}" ]]; then
-              docker buildx imagetools create \
-                --prefer-index=false \
-                --tag "${IMAGE_FULL}:${tag}" \
-                "${IMAGE_FULL}@${DIGEST}"
-            fi
-          done
+          if [[ "${VALIDATED}" == "true" ]]; then
+            for tag in ${TAGS}; do
+              if [[ "${tag}" != "${EXPECTED_VERSION}" ]]; then
+                docker buildx imagetools create \
+                  --prefer-index=false \
+                  --tag "${IMAGE_FULL}:${tag}" \
+                  "${IMAGE_FULL}@${DIGEST}"
+              fi
+            done
+          fi
 
           LAYERS="$(docker buildx imagetools inspect "${IMAGE_FULL}@${DIGEST}" --format '{{ len .Image.RootFS.DiffIDs }}')"
           LABELS_JSON="$(docker buildx imagetools inspect "${IMAGE_FULL}@${DIGEST}" --format '{{ json .Image.Config.Labels }}')"
@@ -1034,6 +1048,7 @@ jobs:
       # The live ISO is built from the fedora flavor only, so dispatch_iso is
       # false for cachy legs.
       - name: Dispatch supply chain metadata
+        if: needs.plan.outputs.validated == 'true'
         uses: ./.github/actions/dispatch-workflow
         with:
           workflow: supply-chain.yml

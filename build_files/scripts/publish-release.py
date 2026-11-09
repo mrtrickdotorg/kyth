@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
 
-from release_identity import r2_download_url
+from release_identity import SUPPORTED_CHANNELS, r2_download_url
 
 def run_command(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     print(f"Running: {' '.join(args)}")
@@ -20,6 +21,78 @@ def run_command(args: list[str], check: bool = True) -> subprocess.CompletedProc
         if check:
             raise subprocess.CalledProcessError(result.returncode, args)
     return result
+
+def artifact_paths(source_dir: Path, basename: str) -> list[Path]:
+    """The ISO and the five sidecars every publish attaches for it."""
+    base = source_dir / basename
+    return [
+        base,
+        Path(f"{base}-CHECKSUM"),
+        Path(f"{base}.sig"),
+        Path(f"{base}.bundle"),
+        Path(f"{base}.intoto.jsonl"),
+        Path(f"{base}.json"),
+    ]
+
+def sha256_hexdigest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def preflight(args: argparse.Namespace) -> tuple[int, str]:
+    """Validate the publish inputs before any mutation.
+
+    Returns (0, changelog_content) when the inputs are publishable, or
+    (1, "") after printing the problem. Publishing used to discover bad
+    inputs halfway through — a garbage source tag silently became a
+    --latest stable release, an unreadable changelog published empty
+    notes, and nothing checked the artifacts or their checksums before
+    the first gh call mutated release state.
+    """
+    if args.source_tag not in SUPPORTED_CHANNELS:
+        print(
+            f"error: unsupported source tag {args.source_tag!r}: "
+            f"expected one of {', '.join(sorted(SUPPORTED_CHANNELS))}",
+            file=sys.stderr,
+        )
+        return 1, ""
+
+    try:
+        changelog_content = args.iso_changelog.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read ISO changelog {args.iso_changelog}: {exc}", file=sys.stderr)
+        return 1, ""
+    if not changelog_content.strip():
+        print(f"error: ISO changelog {args.iso_changelog} is empty", file=sys.stderr)
+        return 1, ""
+
+    basenames = list(dict.fromkeys((args.iso_basename, args.channel_basename)))
+    artifacts = [path for basename in basenames for path in artifact_paths(args.source_dir, basename)]
+    for path in dict.fromkeys(artifacts):
+        if not path.is_file() or path.stat().st_size == 0:
+            print(f"error: expected release artifact missing or empty: {path}", file=sys.stderr)
+            return 1, ""
+
+    for basename in basenames:
+        iso_path = args.source_dir / basename
+        checksum_path = Path(f"{iso_path}-CHECKSUM")
+        try:
+            recorded = checksum_path.read_text(encoding="utf-8").split()
+        except (OSError, ValueError) as exc:
+            print(f"error: cannot read checksum file {checksum_path}: {exc}", file=sys.stderr)
+            return 1, ""
+        actual = sha256_hexdigest(iso_path)
+        if not recorded or recorded[0].lower() != actual:
+            print(
+                f"error: checksum mismatch for {iso_path}: {checksum_path} records "
+                f"{recorded[0] if recorded else '<nothing>'}, computed {actual}",
+                file=sys.stderr,
+            )
+            return 1, ""
+
+    return 0, changelog_content
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create GitHub Releases and upload artifacts.")
@@ -38,7 +111,13 @@ def main() -> int:
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args()
 
-    # Form titles and options
+    # Preflight: refuse bad inputs before the first gh invocation.
+    preflight_rc, changelog_content = preflight(args)
+    if preflight_rc != 0:
+        return preflight_rc
+
+    # Form titles and options. Preflight has already pinned source_tag to
+    # SUPPORTED_CHANNELS, so the else branch is exactly the stable channel.
     if args.source_tag == "testing":
         channel_title = "Kyth Live ISO - Testing"
         immutable_title = f"Kyth Live ISO - Testing - {args.release_id}"
@@ -53,13 +132,6 @@ def main() -> int:
     immutable_iso_url = r2_download_url(args.iso_basename)
     channel_iso_url = r2_download_url(args.channel_basename)
     immutable_release_url = f"https://github.com/{args.repo}/releases/tag/{args.immutable_tag}"
-
-    # Read changelog notes
-    try:
-        changelog_content = args.iso_changelog.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:
-        import logging; logging.getLogger(__name__).debug("handled in publish-release.py", exc_info=True)
-        changelog_content = ""
 
     # 1. Generate Immutable Release Notes
     immutable_notes_lines = [
@@ -87,7 +159,7 @@ def main() -> int:
                        "--notes-file", str(immutable_notes_file)]
     if prerelease:
         create_imm_args.append("--prerelease")
-    
+
     # Create the immutable release — or refresh it if one already exists.
     # This workflow cancels in progress, so a superseded run's publish job
     # can create the release moments before this run reaches the same step;
@@ -133,10 +205,11 @@ def main() -> int:
     channel_notes_file = Path("channel_notes.md")
     channel_notes_file.write_text("\n".join(channel_notes_lines).strip() + "\n", encoding="utf-8")
 
-    # Delete existing channel release if exists
-    run_command(["gh", "release", "delete", args.channel_tag, "--yes"], check=False)
-
-    # Create Channel Release
+    # Create the channel release — or refresh it if one already exists,
+    # mirroring the immutable release above. This used to delete and
+    # recreate the channel release on every publish, which left a window
+    # where the moving tag 404'd and discarded the release's state;
+    # converging via view -> edit/create has neither problem.
     create_chan_args = ["gh", "release", "create", args.channel_tag,
                         "--target", args.source_sha,
                         "--title", channel_title,
@@ -146,7 +219,20 @@ def main() -> int:
     if latest:
         create_chan_args.append("--latest")
 
-    run_command(create_chan_args)
+    if run_command(["gh", "release", "view", args.channel_tag], check=False).returncode == 0:
+        edit_chan_args = ["gh", "release", "edit", args.channel_tag,
+                          "--title", channel_title,
+                          "--notes-file", str(channel_notes_file)]
+        if prerelease:
+            edit_chan_args.append("--prerelease")
+        if latest:
+            # gh release edit accepts --latest ("Explicitly mark the
+            # release as Latest"), so a refresh keeps the stable channel
+            # marked exactly as a fresh create would.
+            edit_chan_args.append("--latest")
+        run_command(edit_chan_args)
+    else:
+        run_command(create_chan_args)
 
     # Upload Channel Artifacts
     channel_path = args.source_dir / args.channel_basename

@@ -2,8 +2,12 @@ name: Preflight image availability
 description: Confirm the target OCI image exists in the registry.
 inputs:
   image-tag:
-    description: Tag of the image to check.
+    description: Tag of the image to check when no source digest is supplied.
     required: true
+  source-digest:
+    description: Digest of the image to check; takes precedence over image-tag.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -11,8 +15,13 @@ runs:
       shell: bash
       env:
         SOURCE_TAG: ${{ inputs.image-tag }}
+        SOURCE_DIGEST: ${{ inputs.source-digest }}
       run: |
         set -euo pipefail
         image="ghcr.io/${GITHUB_REPOSITORY,,}:${SOURCE_TAG}"
+        if [[ -n "${SOURCE_DIGEST}" ]]; then
+          [[ "${SOURCE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image="ghcr.io/${GITHUB_REPOSITORY,,}@${SOURCE_DIGEST}"
+        fi
         echo "Checking ${image} availability..."
         docker manifest inspect "${image}" >/dev/null
