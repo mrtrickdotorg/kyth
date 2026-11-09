@@ -227,9 +227,13 @@ export async function runGuardianCheck(investigate = false): Promise<string> {
 export async function waitGuardianCheck(job: string): Promise<string> {
   trackJob("guardian", job);
   try {
+    // The backend bounds a Guardian run by the HubAction tier (900s);
+    // at the shared cadence (500ms for 30s, then 2s) 600 probes wait
+    // ~18.5 minutes, so a slow check is not abandoned — and untracked,
+    // Cancel lost — at the old ~4.5-minute limit while it still runs.
     return resolveTerminalJob(await pollJobUntilSettled("guardian", job, {
       statusCommand: "guardian_check_status",
-      limit: 180,
+      limit: 600,
       lostContactMessage: "Lost contact with the Guardian check; refresh the page in a moment.",
       timeoutMessage: "Guardian is still running; refresh the page in a moment.",
     }));
@@ -2034,7 +2038,7 @@ export async function enterKaliTerminal(): Promise<string> {
 export async function installSecHostTool(flatpakId: string): Promise<string> {
   if (!inTauriShell()) throw new Error("Security tools are available from the installed Kyth Hub.");
   const job = securityJob(await invoke<SecurityActionLaunch>("sec_host_tool_install", { flatpak_id: flatpakId }));
-  return await pollSecurityJob(job, 240); // up to 12 minutes
+  return await pollSecurityJob(job, 1400); // up to 70 minutes (the backend FlatpakTransfer bound is 60 minutes per install)
 }
 export async function uninstallSecHostTool(flatpakId: string): Promise<string> {
   if (!inTauriShell()) throw new Error("Security tools are available from the installed Kyth Hub.");
@@ -2083,7 +2087,7 @@ function gamingJob(launch: GamingActionLaunch): string { if (launch.state !== "r
 export async function installGamingTool(flatpakId: string): Promise<string> {
   if (!inTauriShell()) throw new Error("Gaming tools are available from the installed Kyth Hub.");
   const job = gamingJob(await invoke<GamingActionLaunch>("gaming_tool_install", { flatpak_id: flatpakId }));
-  return await pollGamingJob(job, 240); // up to 12 minutes
+  return await pollGamingJob(job, 1400); // up to 70 minutes (the backend FlatpakTransfer bound is 60 minutes per install)
 }
 export async function uninstallGamingTool(flatpakId: string): Promise<string> {
   if (!inTauriShell()) throw new Error("Gaming tools are available from the installed Kyth Hub.");
@@ -2149,8 +2153,11 @@ function devToolsJob(launch: DevToolsActionLaunch): string {
 }
 
 /** Launch the wizard's install job for exactly the tools the user picked.
- * Up to 20 minutes: box creation plus package/npm installs for a full
- * catalog selection can legitimately take a while on a fresh box. */
+ * Up to ~100 minutes: the backend budget is two ExtendedWork steps
+ * (2 × 1800s) plus a 600s ToolInstall step per host-level tool —
+ * 5400s for a full catalog selection today (3 host tools) — and box
+ * creation plus package/npm installs can legitimately take a while
+ * on a fresh box. */
 export async function installSelectedDevTools(selectedIds: string[]): Promise<string> {
   if (!inTauriShell()) throw new Error("Dev Tools setup is available from the installed Kyth Hub.");
   const job = devToolsJob(await invoke<DevToolsActionLaunch>("dev_tools_install_selection", { selected_ids: selectedIds }));
@@ -2161,7 +2168,7 @@ export async function installSelectedDevTools(selectedIds: string[]): Promise<st
   try {
     const state = await pollJobUntilSettled("dev-tools", job, {
       statusCommand: "dev_tools_job_status",
-      limit: 400,
+      limit: 2000,
       baseIntervalMs: 3000,
       maxNulls: 10,
       lostContactMessage: "Lost contact with the dev tools install; check back in a moment.",

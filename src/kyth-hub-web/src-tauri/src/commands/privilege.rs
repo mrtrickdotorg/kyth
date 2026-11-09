@@ -297,12 +297,13 @@ fn tag_privileged(detail: String) -> String {
     format!("{PRIVILEGED_ERROR_TAG} {detail}")
 }
 
-pub(crate) fn send_request(request: Value) -> Result<String, String> {
-    send_request_inner(request, None)
-}
-
-/// Like `send_request`, but the connection is registered under `job` so
-/// privileged_action_cancel can shut it down mid-operation.
+/// Send a privileged-daemon request on a connection registered under
+/// `job`: a cancel for that job shuts the connection down, the daemon
+/// treats the vanished client as abandonment and kills the operation,
+/// and the worker's blocked read fails. Every send goes through here —
+/// there is deliberately no unregistered variant, because a request
+/// nobody can cancel leaves root work running to its own timeout after
+/// the user has dismissed the job.
 fn send_request_for_job(request: Value, job: &str) -> Result<String, String> {
     send_request_inner(request, Some(job))
 }
@@ -479,7 +480,11 @@ pub(crate) fn bitlocker_request(device: &str, key: &str) -> Result<Value, String
     )
 }
 
-pub(crate) fn flatpak_uninstall(app_id: &str) -> Result<String, String> {
+/// System-scope Flatpak uninstall for the app-install worker in main.rs:
+/// the connection is registered under the caller's app-install job id,
+/// so that job's cancel (install_cancel) shuts it down and the daemon
+/// abandons the uninstall instead of running to its own timeout.
+pub(crate) fn flatpak_uninstall(app_id: &str, job: &str) -> Result<String, String> {
     let request = validated_request(
         "flatpak_uninstall",
         &PrivilegedPayload {
@@ -487,12 +492,15 @@ pub(crate) fn flatpak_uninstall(app_id: &str) -> Result<String, String> {
             ..Default::default()
         },
     )?;
-    send_request(request)
+    send_request_for_job(request, job)
 }
 
-pub(crate) fn flatpak_update() -> Result<String, String> {
+/// System phase of the app-update worker in main.rs; registered under
+/// the caller's app-update job id for the same cancel reason as
+/// `flatpak_uninstall`.
+pub(crate) fn flatpak_update(job: &str) -> Result<String, String> {
     let request = validated_request("flatpak_update", &PrivilegedPayload::default())?;
-    send_request(request)
+    send_request_for_job(request, job)
 }
 
 #[tauri::command]
@@ -525,11 +533,24 @@ fn cancel_privileged_job(job: &str) -> bool {
     if !jobs().cancel(job) {
         return false;
     }
-    if let Some(stream) = unregister_stream(job) {
-        // shutdown() applies to the socket, not this fd: the worker's
-        // stream sees it too, which is what unblocks its read.
-        let _ = stream.shutdown(Shutdown::Both);
-    }
+    shutdown_stream_for_job(job);
+    true
+}
+
+/// Shut down the daemon connection registered under `job`, if one is
+/// registered, without touching any job store. The app-install cancel
+/// path (main.rs `install_cancel`) uses this for the flatpak jobs: they
+/// live in the app-installs store, so `cancel_privileged_job`'s store
+/// mark does not apply to them, but their privileged phase registers its
+/// connection under the same job id, and shutting it down is what makes
+/// the daemon abandon the operation mid-flight.
+pub(crate) fn shutdown_stream_for_job(job: &str) -> bool {
+    let Some(stream) = unregister_stream(job) else {
+        return false;
+    };
+    // shutdown() applies to the socket, not this fd: the worker's
+    // stream sees it too, which is what unblocks its read.
+    let _ = stream.shutdown(Shutdown::Both);
     true
 }
 
@@ -649,6 +670,31 @@ mod tests {
         );
         // A second cancel is a no-op: the job is already terminal.
         assert!(!super::cancel_privileged_job(&job));
+    }
+
+    #[test]
+    fn shutdown_stream_for_job_reaches_a_job_from_another_store() {
+        use std::io::Read;
+
+        // App-install jobs live in main.rs's store, not this module's, so
+        // their cancel path cannot mark them here — it can only shut the
+        // registered connection down. The peer must still observe EOF,
+        // which is what makes the daemon abandon the operation.
+        let (worker_side, mut daemon_side) = std::os::unix::net::UnixStream::pair().unwrap();
+        let job = format!("flatpak-update-test-{}", std::process::id());
+        super::register_stream(&job, &worker_side);
+        assert!(super::shutdown_stream_for_job(&job));
+        daemon_side
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            daemon_side.read(&mut buf).unwrap(),
+            0,
+            "peer must see EOF after the shutdown"
+        );
+        // The registration is consumed: a second shutdown is a no-op.
+        assert!(!super::shutdown_stream_for_job(&job));
     }
 
     #[test]

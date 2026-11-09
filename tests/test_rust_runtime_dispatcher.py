@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -48,6 +49,48 @@ class RustRuntimeDispatcherTest(unittest.TestCase):
         self.assertNotIn("bash -c", text)
         self.assertIn("write_atomic", text)
         self.assertIn("validate_token", text)
+
+    def test_greenboot_arms_delegate_to_boot_health(self):
+        text = RUNTIME.read_text(encoding="utf-8")
+
+        def arm(start_marker: str, end_marker: str) -> str:
+            start = text.index(start_marker)
+            return text[start:text.index(end_marker, start)]
+
+        required = arm('"greenboot-required" =>', '"greenboot-success" =>')
+        success = arm('"greenboot-success" =>', '"greenboot-failure" =>')
+        failure = arm('"greenboot-failure" =>', '"vpnc-script" =>')
+
+        # Every hook still stamps the last-hook-ran marker before it
+        # delegates; the marker carries no health semantics of its own.
+        for segment in (required, success, failure):
+            self.assertIn('"/run/kyth-state/greenboot-state"', segment)
+            self.assertIn("write_atomic", segment)
+            self.assertIn('"/usr/bin/kyth-boot-health"', segment)
+
+        # required.d runs the real checks; the child exit code is the
+        # hook's result, under a bound covering the checker's worst case.
+        self.assertIn('"check".into()', required)
+        self.assertIn("run_timeout", required)
+        self.assertIn("GREENBOOT_CHECK_TIMEOUT", required)
+        # green.d records the booted digest as known-good.
+        self.assertIn('"mark-healthy".into()', success)
+        # red.d books the failure toward quarantine/rollback.
+        self.assertIn('"record-failure".into()', failure)
+        self.assertIn('"--reason".into()', failure)
+        self.assertIn('"greenboot required checks failed".into()', failure)
+        self.assertIn("GREENBOOT_RECORD_FAILURE_TIMEOUT", failure)
+
+        bounds = dict(re.findall(
+            r"const (GREENBOOT_\w+_TIMEOUT): Duration = Duration::from_secs\((\d+)\)",
+            text,
+        ))
+        # The check polls up to 300 s for the display stack; a shorter
+        # delegation bound would score slow-but-healthy boots red.
+        self.assertGreaterEqual(int(bounds["GREENBOOT_CHECK_TIMEOUT"]), 300)
+        # Must outlast the 60 s rollback kyth-boot-health runs internally
+        # once the quarantine threshold is crossed.
+        self.assertGreater(int(bounds["GREENBOOT_RECORD_FAILURE_TIMEOUT"]), 60)
 
     def test_runtime_binary_compiles(self):
         result = subprocess.run(

@@ -1690,7 +1690,7 @@ fn uninstall_flatpak(app_id: String) -> Result<InstallActionLaunch, String> {
             return;
         };
         let result: Result<(bool, String), String> = if scope == "system" {
-            privileged_flatpak_uninstall(&app_id).map(|detail| (true, detail))
+            privileged_flatpak_uninstall(&app_id, &job_for_thread).map(|detail| (true, detail))
         } else {
             // A stalled mirror must surface as a timeout, not a forever
             // "running" job: bounded by the flatpak transfer tier.
@@ -1724,8 +1724,8 @@ fn uninstall_flatpak(app_id: String) -> Result<InstallActionLaunch, String> {
     })
 }
 
-fn privileged_flatpak_uninstall(app_id: &str) -> Result<String, String> {
-    commands::privilege::flatpak_uninstall(app_id)
+fn privileged_flatpak_uninstall(app_id: &str, job: &str) -> Result<String, String> {
+    commands::privilege::flatpak_uninstall(app_id, job)
 }
 
 #[tauri::command]
@@ -1814,12 +1814,14 @@ fn update_flatpaks() -> Result<InstallActionLaunch, String> {
         // A cancel during the user phase must not fall through into system
         // mutations: the job is already marked cancelled, and finish() never
         // overwrites a cancelled job, so returning here is the whole fix.
-        // (A cancel that lands mid-flight in phase 2 still waits for the
-        // daemon's own bounded reply; the socket read cannot be preempted.)
+        // (Phase 2 registers its daemon connection under this job id, so a
+        // cancel that lands mid-flight in phase 2 shuts the connection
+        // down and the daemon abandons the operation; left uncancelled,
+        // the daemon's own 900s OPERATION_TIMEOUT still bounds the wait.)
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let system_result = commands::privilege::flatpak_update().map(|_| ());
+        let system_result = commands::privilege::flatpak_update(&job_for_thread).map(|_| ());
         let (state, detail) = match (user_result, system_result) {
             (Ok(()), Ok(())) => {
                 let (remaining, verification_detail) =
@@ -1932,11 +1934,19 @@ fn install_status(job: String) -> InstallStatus {
     }
 }
 
-/// Cancel a running install job: its process is killed within one poll tick
-/// and the job reads `cancelled` from then on.
+/// Cancel a running install job: its process is killed within one poll
+/// tick, a worker blocked on the privileged daemon has its connection
+/// shut down instead, and the job reads `cancelled` from then on.
 #[tauri::command]
 fn install_cancel(job: String) -> InstallStatus {
     app_installs().cancel(&job);
+    // A system-scope flatpak uninstall/update worker may be blocked on
+    // its privileged-daemon connection, which it registered under this
+    // same job id: shutting it down makes the daemon abandon the
+    // operation instead of running to its own timeout behind a cancelled
+    // job. No-op for jobs with no registered connection — user-scope
+    // process workers are stopped by the store's cancel flag above.
+    commands::privilege::shutdown_stream_for_job(&job);
     install_status(job)
 }
 

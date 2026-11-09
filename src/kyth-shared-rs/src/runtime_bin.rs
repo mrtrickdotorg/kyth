@@ -23,6 +23,19 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// build after a kernel bump legitimately takes 5-15 minutes.
 const HARDWARE_APPLY_TIMEOUT: Duration = Duration::from_secs(1200);
 
+/// Matches `TimeoutStartSec=600` in the greenboot-healthcheck drop-in
+/// (branding/35): `kyth-boot-health check` polls up to 300 s for the
+/// display manager and a DRM device (boot_runtime's DEFAULT_DEADLINE) on
+/// top of its own bounded sub-checks, so the 120 s default bound would
+/// kill a slow-but-healthy check mid-wait and score a good boot red.
+const GREENBOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
+/// `kyth-boot-health record-failure` books the failure and, once the
+/// digest crosses the quarantine threshold, runs `bootc rollback` —
+/// which kyth-boot-health itself bounds at 60 s. 300 s leaves that
+/// rollback untruncatable headroom for the bootc status query and the
+/// state write around it.
+const GREENBOOT_RECORD_FAILURE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// `kyth-hw-setup` and `kyth-retry-hardware-setup` both mean "apply the
 /// hardware policy now". They used to exec the kyth-privileged *daemon* (a
 /// socket server that must run as root with CAP_CHOWN), so the oneshot unit
@@ -2330,10 +2343,42 @@ fn delegate(name: &str, args: &[String]) -> io::Result<ExitCode> {
             run("mokutil", &["--import".into(), cert.display().to_string()])
         }
         "rotate-mok" => run("mokutil", &["--list-enrolled".into()]),
-        "greenboot-success" | "greenboot-required" | "greenboot-failure" => {
+        // The greenboot hooks delegate to kyth-boot-health, which owns
+        // the digest-aware state machine (docs/update-safety.md steps
+        // 4-6): check the boot, record it known-good, or book the
+        // failure toward quarantine/rollback. The /run marker stays as
+        // a last-hook-ran signal; it carries no health semantics.
+        "greenboot-required" => {
             let state = Path::new("/run/kyth-state/greenboot-state");
             write_atomic(state, format!("{name}\n").as_bytes())?;
-            Ok(ExitCode::SUCCESS)
+            // The child's exit code is the hook's result: a failed (or
+            // missing) checker must fail required.d so greenboot scores
+            // the boot red — fail closed, never marker-only success.
+            run_timeout(
+                "/usr/bin/kyth-boot-health",
+                &["check".into()],
+                GREENBOOT_CHECK_TIMEOUT,
+            )
+        }
+        "greenboot-success" => {
+            let state = Path::new("/run/kyth-state/greenboot-state");
+            write_atomic(state, format!("{name}\n").as_bytes())?;
+            // mark-healthy is a bootc status query plus a state write —
+            // well inside the default 120 s bound.
+            run("/usr/bin/kyth-boot-health", &["mark-healthy".into()])
+        }
+        "greenboot-failure" => {
+            let state = Path::new("/run/kyth-state/greenboot-state");
+            write_atomic(state, format!("{name}\n").as_bytes())?;
+            run_timeout(
+                "/usr/bin/kyth-boot-health",
+                &[
+                    "record-failure".into(),
+                    "--reason".into(),
+                    "greenboot required checks failed".into(),
+                ],
+                GREENBOOT_RECORD_FAILURE_TIMEOUT,
+            )
         }
         "vpnc-script" => run("resolvectl", &["status".into()]),
         "finalize-staged" => run("/usr/libexec/kyth-finalize-staged", args),
@@ -2479,6 +2524,21 @@ mod tests {
                     || shipped.contains(&format!("/run/kyth-state/{marker}"))
             );
         }
+    }
+
+    #[test]
+    fn greenboot_timeouts_cover_boot_health_worst_cases() {
+        // kyth-boot-health check polls up to 300 s for the display stack
+        // (boot_runtime DEFAULT_DEADLINE) and greenboot-healthcheck
+        // allows the hook 600 s; delegating under the 120 s default
+        // would kill slow-but-healthy checks and score good boots red.
+        assert!(GREENBOOT_CHECK_TIMEOUT >= Duration::from_secs(300));
+        assert!(GREENBOOT_CHECK_TIMEOUT > COMMAND_TIMEOUT);
+        // record-failure's bootc rollback is bounded at 60 s inside
+        // kyth-boot-health itself; the delegation must leave it headroom
+        // rather than truncate a rollback in flight.
+        assert!(GREENBOOT_RECORD_FAILURE_TIMEOUT > Duration::from_secs(60));
+        assert!(GREENBOOT_RECORD_FAILURE_TIMEOUT > COMMAND_TIMEOUT);
     }
 
     #[test]
