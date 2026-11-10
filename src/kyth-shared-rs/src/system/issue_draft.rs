@@ -13,7 +13,7 @@ pub const TRUNCATION_NOTE: &str =
     "\n\n[Report body truncated for the browser URL. A full local draft was saved by kyth-report-issue.]";
 pub const BODY_PLACEHOLDER: &str =
     "Describe what happened, what you expected, and what you were doing just before it happened.";
-pub const DEFAULT_REPO_URL: &str = "https://github.com/kyth-os/kyth";
+pub const DEFAULT_REPO_URL: &str = "https://github.com/mrtrickdotorg/kyth";
 
 pub fn draft_dir() -> PathBuf {
     if let Some(state) = std::env::var_os("XDG_STATE_HOME") {

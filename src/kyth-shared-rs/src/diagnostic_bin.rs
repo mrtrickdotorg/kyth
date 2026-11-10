@@ -334,13 +334,23 @@ fn controller_check() -> ExitCode {
     } else {
         report.failed("Input subsystem", "/dev/input missing");
     }
-    let detected = controllers::detect_controllers();
-    if let Some((name, _)) = detected.usb_controllers.first() {
-        report.passed("Controller detected", name);
-    } else if let Some(name) = detected.input_nodes.first() {
-        report.passed("Controller detected", name);
-    } else {
-        report.warned("Controller detected", "none found; plug in or pair a controller and rerun");
+    // A failed detection probe is a failed check, not a "none found"
+    // warning: the report must not reassure from a read that never ran.
+    let detected = match controllers::detect_controllers() {
+        Ok(detected) => Some(detected),
+        Err(error) => {
+            report.failed("Controller detection", format!("detection failed: {error}"));
+            None
+        }
+    };
+    if let Some(detected) = &detected {
+        if let Some((name, _)) = detected.usb_controllers.first() {
+            report.passed("Controller detected", name);
+        } else if let Some(name) = detected.input_nodes.first() {
+            report.passed("Controller detected", name);
+        } else {
+            report.warned("Controller detected", "none found; plug in or pair a controller and rerun");
+        }
     }
     if command_exists("bluetoothctl") {
         let output = stdout(&["bluetoothctl", "devices"], 5);

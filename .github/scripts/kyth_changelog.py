@@ -261,8 +261,16 @@ def previous_image_release_digest(
     release_pattern = re.compile(
         rf"^image-{re.escape(channel_tag)}-(\d{{8}})-(\d+)-(\d+)-([0-9a-f]{{8}})$"
     )
+    # Release bodies record the image under the owner that published
+    # them: ghcr.io/mrtrickdotorg/kyth since the org move,
+    # ghcr.io/kyth-os/kyth in pre-move bodies, which remain valid
+    # baselines. (The Hub's release_body_digest accepts the same two
+    # owners.) Matching only the old owner silently dropped every
+    # post-move release, so no previous digest — and therefore no SBOM
+    # baseline — was ever found.
     digest_pattern = re.compile(
-        r"^Image: `ghcr\.io/kyth-os/kyth@(sha256:[0-9a-f]{64})`$", re.MULTILINE
+        r"^Image: `ghcr\.io/(?:mrtrickdotorg|kyth-os)/kyth@(sha256:[0-9a-f]{64})`$",
+        re.MULTILINE,
     )
     candidates: list[tuple[tuple[str, int, int, str], str]] = []
     for release in releases:

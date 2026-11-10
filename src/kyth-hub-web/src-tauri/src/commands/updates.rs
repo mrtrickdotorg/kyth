@@ -920,20 +920,27 @@ pub(crate) struct JustRecipeResponse {
 }
 
 #[tauri::command]
-pub(crate) async fn just_list() -> Vec<JustRecipeResponse> {
+pub(crate) async fn just_list() -> Result<Vec<JustRecipeResponse>, String> {
     // P6: `just --list` is bounded at 10 s; keep it off the async workers.
+    // Fallible: a failed `just --list` (or a panicked list task) used to
+    // resolve to an empty vec, which the section renders as "No just
+    // recipes found" for a listing that never happened. The rejection
+    // lands on the section's fallback note instead; a successful empty
+    // listing still resolves to an empty vec.
     tauri::async_runtime::spawn_blocking(|| {
-        kyth_shared::system::just::just_list()
-            .into_iter()
-            .map(|recipe| JustRecipeResponse {
-                name: recipe.name,
-                params: recipe.params,
-                comment: recipe.comment,
-            })
-            .collect::<Vec<_>>()
+        kyth_shared::system::just::just_list().map(|recipes| {
+            recipes
+                .into_iter()
+                .map(|recipe| JustRecipeResponse {
+                    name: recipe.name,
+                    params: recipe.params,
+                    comment: recipe.comment,
+                })
+                .collect::<Vec<_>>()
+        })
     })
     .await
-    .unwrap_or_default()
+    .map_err(|err| format!("Recipe list check failed: {err}"))?
 }
 
 fn just_output_detail(recipe: &str, output: &std::process::Output) -> String {
@@ -1509,12 +1516,18 @@ pub(crate) fn branch_display_name(tag: Option<String>) -> String {
 }
 
 #[tauri::command]
-pub(crate) async fn pending_updates_summary() -> std::collections::HashMap<String, String> {
+pub(crate) async fn pending_updates_summary(
+) -> Result<std::collections::HashMap<String, String>, String> {
+    // Fallible: a panicked summary task used to resolve to an empty map,
+    // which the App updates card read as a completed check with nothing
+    // pending. The rejection lands on the card's "Couldn't check" state;
+    // per-source indeterminacy inside a completed summary still travels
+    // as the map's "unknown" values.
     tauri::async_runtime::spawn_blocking(
         kyth_shared::system::updates_unified::pending_updates_summary,
     )
     .await
-    .unwrap_or_default()
+    .map_err(|err| format!("Pending updates check failed: {err}"))
 }
 
 #[tauri::command]

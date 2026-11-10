@@ -1,6 +1,10 @@
 # Pull the upstream Fedora bootc base and apply KythOS branding.
 # Build with: docker build -t localhost/kyth-base:stable build_base/
 # Override the base via: docker build --build-arg BASE_IMAGE=quay.io/fedora/fedora-kinoite:45 build_base/
+# The digest on the ARG line below is a recorded snapshot, not what CI
+# builds: CI floats to the tag's current digest (build.yml), while local
+# builds use this pin. build_files/scripts/check-base-pin-drift.sh reports
+# when the two diverge; it runs from `just build-base` and from CI.
 ARG BASE_IMAGE=quay.io/fedora/fedora-kinoite:45@sha256:46f29041214b576b7804539acdaf2993c4b014fc45bf390ff6f257cf4173e2d6
 FROM ${BASE_IMAGE}
 

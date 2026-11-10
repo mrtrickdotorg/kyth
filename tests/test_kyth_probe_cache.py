@@ -268,10 +268,9 @@ class CollectSnapshotTests(unittest.TestCase):
                 return "xone_hid 40960 0\n"
             return ""
 
-        with mock.patch.object(controller_mod, "command_stdout", side_effect=output), \
-             mock.patch.object(controller_mod.os, "listdir", return_value=[]), \
+        with mock.patch.object(controller_mod.os, "listdir", return_value=[]), \
              mock.patch.object(controller_mod.shutil, "which", return_value=None):
-            result = controller_mod.detect_controllers()
+            result = controller_mod.detect_controllers(runner=output)
 
         self.assertTrue(result["xone_dongle"])
         self.assertTrue(result["xone_loaded"])
@@ -323,6 +322,90 @@ class CollectSnapshotTests(unittest.TestCase):
         self.assertEqual(sections["bootc-status-text"], "text")
         self.assertEqual(sections["flatpak-apps"], ["com.a.B", "com.c.D"])
         self.assertIs(sections["nvidia-detect"], False)
+
+
+class ControllerProbeContractTests(unittest.TestCase):
+    """Mirror of the Rust controllers contract: a failed primary probe is
+    an error (surfaced by the probe framework as a FAILED section), never
+    an all-empty "no controllers" detection."""
+
+    def test_failing_lsusb_probe_is_an_error_not_an_empty_detection(self):
+        def runner(command, timeout):
+            raise controller_mod.ControllerProbeError(
+                f"{command[0]} failed (exit 1): simulated failure"
+            )
+
+        with self.assertRaises(controller_mod.ControllerProbeError) as caught:
+            controller_mod.detect_controllers(runner=runner)
+        self.assertIn("lsusb", str(caught.exception))
+
+    def test_failing_lsmod_probe_is_an_error_not_an_empty_detection(self):
+        def runner(command, timeout):
+            if command[0] == "lsusb":
+                return ""
+            raise controller_mod.ControllerProbeError(
+                f"{command[0]} failed (exit 1): simulated failure"
+            )
+
+        with self.assertRaises(controller_mod.ControllerProbeError) as caught:
+            controller_mod.detect_controllers(runner=runner)
+        self.assertIn("lsmod", str(caught.exception))
+
+    def test_successful_empty_probes_are_an_empty_detection(self):
+        def runner(command, timeout):
+            return ""
+
+        with mock.patch.object(controller_mod.os, "listdir", return_value=[]), \
+             mock.patch.object(controller_mod.shutil, "which", return_value=None):
+            result = controller_mod.detect_controllers(runner=runner)
+
+        self.assertEqual(result["usb_controllers"], [])
+        self.assertFalse(result["xone_loaded"])
+        self.assertFalse(result["xpadneo_loaded"])
+        self.assertFalse(result["hid_ps_loaded"])
+        self.assertFalse(result["dualsense_found"])
+        self.assertFalse(result["ds4_found"])
+        self.assertFalse(result["switch_pro_found"])
+
+    def test_checked_runner_raises_on_nonzero_exit_and_spawn_failure(self):
+        failed = mock.Mock(returncode=1, stdout="", stderr="usbfs busy")
+        with mock.patch.object(controller_mod, "run_command", return_value=failed):
+            with self.assertRaises(controller_mod.ControllerProbeError) as caught:
+                controller_mod.command_stdout_checked(["lsusb"], timeout=6)
+        self.assertIn("lsusb failed (exit 1)", str(caught.exception))
+        self.assertIn("usbfs busy", str(caught.exception))
+
+        with mock.patch.object(controller_mod, "run_command", return_value=None):
+            with self.assertRaises(controller_mod.ControllerProbeError) as caught:
+                controller_mod.command_stdout_checked(["lsusb"], timeout=6)
+        self.assertIn("could not run lsusb", str(caught.exception))
+
+        ok = mock.Mock(returncode=0, stdout="Bus 001 Device 002: ID 045e:02e6\n", stderr="")
+        with mock.patch.object(controller_mod, "run_command", return_value=ok):
+            self.assertEqual(
+                controller_mod.command_stdout_checked(["lsusb"], timeout=6),
+                ok.stdout,
+            )
+
+    def test_failed_detection_marks_probe_section_failed_not_empty(self):
+        collectors = (
+            probe_mod.ProbeCollector(
+                "controllers", ("controllers-detect",), probe_mod._collect_controllers
+            ),
+        )
+        with mock.patch.object(
+            controller_mod,
+            "detect_controllers",
+            side_effect=controller_mod.ControllerProbeError(
+                "lsusb failed (exit 1): simulated failure"
+            ),
+        ):
+            results = probe_mod.collect_probe_results(collectors)
+
+        result = results["controllers-detect"]
+        self.assertEqual(result.status, probe_mod.ProbeStatus.FAILED)
+        self.assertIn("lsusb", result.error)
+        self.assertIsNone(result.data)
 
 
 if __name__ == "__main__":

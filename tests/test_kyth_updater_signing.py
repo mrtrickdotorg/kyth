@@ -37,6 +37,11 @@ class UpdaterSigningContractTests(unittest.TestCase):
             'DEFAULT_KEYRING_PATH: &str = "/usr/share/kyth/updater-signing-keys.asc"',
             'COMPONENT_RCLONE: &str = "rclone"',
             'COMPONENT_GE_PROTON: &str = "ge-proton"',
+            # Replay floor: verified manifests are bound to the newest
+            # `issued` the updater has ever accepted.
+            "pub fn check_and_record_floor(",
+            'FLOOR_PATH_ENV: &str = "KYTH_UPDATER_FLOOR_PATH"',
+            'FLOOR_FILENAME: &str = "updater-manifest-floor"',
         ):
             self.assertIn(expected, source)
         # The placeholder anchor must refuse, never fall through.
@@ -56,6 +61,12 @@ class UpdaterSigningContractTests(unittest.TestCase):
             "overlapping_primaries_in_anchor_both_verify",
             "artifact_digest_must_match_manifest_pin",
             "unknown_manifest_schema_is_refused",
+            "issued_timestamp_parser_is_strict",
+            "manifest_without_issued_is_refused",
+            "floor_records_first_acceptance_and_accepts_equal",
+            "floor_advances_when_newer_manifest_arrives",
+            "replayed_manifest_is_refused_by_floor",
+            "corrupt_floor_state_is_refused",
         ):
             self.assertIn(f"fn {test_name}(", source)
 
@@ -118,10 +129,72 @@ class UpdaterSigningContractTests(unittest.TestCase):
             "Release flow",
             "Rotation",
             "Failure semantics",
+            "Replay protection",
             "fail closed",
             "/usr/share/kyth/updater-signing-keys.asc",
+            "/var/lib/kyth/proton-cachyos/updater-manifest-floor",
+            "/var/lib/kyth/rclone-update/updater-manifest-floor",
         ):
             self.assertIn(expected, doc)
+
+
+class GeneratorIssuedGuardTests(unittest.TestCase):
+    """The generator keeps `issued` strictly increasing across
+    publications, so a skewed generator clock cannot produce a
+    manifest every updated client refuses as a replay."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        import sys
+
+        scripts = str(ROOT / "build_files" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        spec = importlib.util.spec_from_file_location("generate_updater_manifest", GENERATOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cls.generator = module
+
+    def test_no_published_manifest_uses_current_time(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+        issued, warning = self.generator.next_issued(None, now)
+        self.assertEqual(issued, "2026-11-09T12:00:00Z")
+        self.assertIsNone(warning)
+
+    def test_clock_ahead_of_published_uses_current_time(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+        issued, warning = self.generator.next_issued("2026-11-02T09:30:00Z", now)
+        self.assertEqual(issued, "2026-11-09T12:00:00Z")
+        self.assertIsNone(warning)
+
+    def test_clock_behind_published_bumps_one_second_past(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+        issued, warning = self.generator.next_issued("2026-11-09T12:00:05Z", now)
+        self.assertEqual(issued, "2026-11-09T12:00:06Z")
+        self.assertIsNotNone(warning)
+
+    def test_same_second_regeneration_bumps(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+        issued, warning = self.generator.next_issued("2026-11-09T12:00:00Z", now)
+        self.assertEqual(issued, "2026-11-09T12:00:01Z")
+        self.assertIsNotNone(warning)
+
+    def test_unparseable_published_issued_disengages_guard(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+        issued, warning = self.generator.next_issued("not-a-timestamp", now)
+        self.assertEqual(issued, "2026-11-09T12:00:00Z")
+        self.assertIsNone(warning)
 
 
 if __name__ == "__main__":

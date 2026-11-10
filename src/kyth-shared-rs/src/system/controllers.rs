@@ -3,12 +3,38 @@
 
 use std::fs;
 
-fn command_stdout(cmd: &str, args: &[&str], timeout_secs: u64) -> String {
+/// Run a detection probe and return its stdout, or explain the failure.
+/// The old shape collapsed spawn errors, timeouts and non-zero exits into
+/// an empty string, so a broken `lsusb` read as "no controllers plugged
+/// in" — the failure-disguised-as-empty defect. Detection verdicts are
+/// only meaningful when the probes actually ran, so probe failure is an
+/// `Err` the caller surfaces instead of an empty result.
+fn command_stdout_checked(cmd: &str, args: &[&str], timeout_secs: u64) -> Result<String, String> {
     let mut argv = vec![cmd.to_string()];
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
-    crate::system::process::run_bounded(&argv, std::time::Duration::from_secs(timeout_secs))
-        .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-        .unwrap_or_default()
+    let output =
+        crate::system::process::run_bounded(&argv, std::time::Duration::from_secs(timeout_secs))
+            .map_err(|err| format!("could not run {cmd}: {err}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let how = match output.status.code() {
+        Some(code) => format!("{cmd} failed (exit {code})"),
+        None => format!("{cmd} was stopped before it finished"),
+    };
+    if stderr.is_empty() {
+        Err(how)
+    } else {
+        Err(format!("{how}: {stderr}"))
+    }
+}
+
+/// Best-effort stdout for auxiliary probes whose output is informational
+/// text rather than a detection verdict (the `dualsensectl` status blurb):
+/// a failure there means "no blurb", never a wrong verdict.
+fn command_stdout_best_effort(cmd: &str, args: &[&str], timeout_secs: u64) -> String {
+    command_stdout_checked(cmd, args, timeout_secs).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -99,9 +125,26 @@ fn parse_usb_controllers(usb_text: &str) -> UsbControllerParse {
     parsed
 }
 
-pub fn detect_controllers() -> ControllersDetect {
-    let usb_text = command_stdout("lsusb", &[], 6);
-    let lsmod_text = command_stdout("lsmod", &[], 4);
+/// Detect connected controllers and loaded controller drivers.
+///
+/// Fallible: when a primary probe (`lsusb` / `lsmod`) cannot run or exits
+/// non-zero, the detection did not happen and the caller gets an `Err` —
+/// never a struct whose empty fields impersonate "nothing connected".
+/// Genuinely-absent things stay non-errors: a missing `/dev/input/by-id`
+/// directory or efivars tree just yields empty/false fields, and the
+/// `dualsensectl` status blurb is best-effort informational text.
+pub fn detect_controllers() -> Result<ControllersDetect, String> {
+    detect_controllers_with(&command_stdout_checked)
+}
+
+/// [`detect_controllers`] with the probe runner injected, so the contract
+/// (failing probe → `Err`, successful empty probe → empty `Ok`) is
+/// unit-testable without running real system commands.
+fn detect_controllers_with(
+    run: &dyn Fn(&str, &[&str], u64) -> Result<String, String>,
+) -> Result<ControllersDetect, String> {
+    let usb_text = run("lsusb", &[], 6)?;
+    let lsmod_text = run("lsmod", &[], 4)?;
     let parsed = parse_usb_controllers(&usb_text);
     let input_nodes = fs::read_dir("/dev/input/by-id")
         .ok()
@@ -136,11 +179,11 @@ pub fn detect_controllers() -> ControllersDetect {
 
     let modules = lsmod_text.to_lowercase().replace('-', "_");
     let dualsensectl_out = if parsed.dualsense_found && which("dualsensectl") {
-        command_stdout("dualsensectl", &["status", "0"], 3)
+        command_stdout_best_effort("dualsensectl", &["status", "0"], 3)
     } else {
         String::new()
     };
-    ControllersDetect {
+    Ok(ControllersDetect {
         usb_controllers: parsed.controllers,
         input_nodes,
         xone_dongle: parsed.xone_dongle,
@@ -153,7 +196,7 @@ pub fn detect_controllers() -> ControllersDetect {
         dualsensectl_out,
         secure_boot,
         jstest_available: which("jstest-gtk"),
-    }
+    })
 }
 
 fn which(command: &str) -> bool {
@@ -180,10 +223,51 @@ mod tests {
     }
 
     #[test]
-    fn detect_returns_struct() {
-        let d = detect_controllers();
-        // Just verify it doesn't panic and fields are bool/vec
-        let _ = d.xone_loaded;
-        assert!(d.usb_controllers.len() <= 20);
+    fn failing_lsusb_probe_is_an_error_not_an_empty_detection() {
+        let run = |cmd: &str, _args: &[&str], _timeout: u64| -> Result<String, String> {
+            Err(format!("{cmd} failed (exit 1): simulated failure"))
+        };
+        let err = detect_controllers_with(&run).unwrap_err();
+        assert!(err.contains("lsusb"), "error names the failed probe: {err}");
+    }
+
+    #[test]
+    fn failing_lsmod_probe_is_an_error_not_an_empty_detection() {
+        let run = |cmd: &str, _args: &[&str], _timeout: u64| -> Result<String, String> {
+            match cmd {
+                "lsusb" => Ok(String::new()),
+                other => Err(format!("{other} failed (exit 1): simulated failure")),
+            }
+        };
+        let err = detect_controllers_with(&run).unwrap_err();
+        assert!(err.contains("lsmod"), "error names the failed probe: {err}");
+    }
+
+    #[test]
+    fn successful_empty_probes_are_an_empty_detection() {
+        // The probes ran fine and found nothing: a legitimate "no
+        // controllers" answer, distinct from a failed probe above.
+        let run = |_cmd: &str, _args: &[&str], _timeout: u64| -> Result<String, String> {
+            Ok(String::new())
+        };
+        let d = detect_controllers_with(&run).expect("empty probes still detect");
+        assert!(d.usb_controllers.is_empty());
+        assert!(!d.xone_loaded && !d.xpadneo_loaded && !d.hid_ps_loaded);
+        assert!(!d.dualsense_found && !d.ds4_found && !d.switch_pro_found);
+    }
+
+    #[test]
+    fn successful_probes_feed_the_detection() {
+        let run = |cmd: &str, _args: &[&str], _timeout: u64| -> Result<String, String> {
+            match cmd {
+                "lsusb" => Ok("Bus 001 Device 002: ID 054c:0ce6 Sony DualSense\n".to_string()),
+                "lsmod" => Ok("hid_playstation 40960 0\n".to_string()),
+                _ => Ok(String::new()),
+            }
+        };
+        let d = detect_controllers_with(&run).expect("fixture probes detect");
+        assert!(d.dualsense_found);
+        assert!(d.hid_ps_loaded);
+        assert_eq!(d.usb_controllers.len(), 1);
     }
 }

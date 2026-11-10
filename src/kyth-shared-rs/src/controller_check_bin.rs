@@ -3,8 +3,31 @@ use kyth_shared::system::controllers::detect_controllers;
 use kyth_shared::system::smoke_check::Report;
 use std::path::Path;
 fn main() {
-    let d = detect_controllers();
     let mut r = Report::default();
+    // A failed detection probe is a failed check, not a "none found"
+    // warning: the readiness report must not reassure from a read that
+    // never happened.
+    let d = match detect_controllers() {
+        Ok(detected) => detected,
+        Err(error) => {
+            r.failed(
+                "Controller detection",
+                format!("detection failed: {error}"),
+                "Controller Readiness",
+            );
+            println!("Controller Check\n");
+            for row in &r.results {
+                println!(
+                    "{:5} {:24} {}",
+                    format!("{:?}", row.level).to_uppercase(),
+                    row.name,
+                    row.detail
+                );
+            }
+            println!("\nResult: controller readiness has failures.");
+            std::process::exit(r.exit_code_with_strict(true));
+        }
+    };
     if Path::new("/dev/input").is_dir() {
         r.passed(
             "Input subsystem",

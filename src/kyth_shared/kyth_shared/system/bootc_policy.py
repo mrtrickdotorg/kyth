@@ -5,6 +5,10 @@ import re
 from dataclasses import dataclass
 
 REGISTRY = "ghcr.io/kyth-os/kyth"
+# Post-move canonical registry; the Rust policy recognizes both the
+# legacy and destination registries, and so does this mirror.
+DESTINATION_REGISTRY = "ghcr.io/mrtrickdotorg/kyth"
+_KNOWN_REGISTRIES = (REGISTRY, DESTINATION_REGISTRY)
 
 
 def default_phase(mode: str) -> str:
@@ -27,7 +31,9 @@ def parse_update_phase(line: str, mode: str) -> str | None:
         (("deploying",), "Deploying new OS image…"),
         (("no update available", "already booted"), "Already on the latest image — nothing to download."),
     )
-    if "resolved" in lo and ("image" in lo or REGISTRY in lo):
+    if "resolved" in lo and (
+        "image" in lo or any(registry in lo for registry in _KNOWN_REGISTRIES)
+    ):
         return "Resolving OS image version…"
     if "fetching" in lo and ("manifest" in lo or "sha256" in lo):
         return "Fetching image manifest…"

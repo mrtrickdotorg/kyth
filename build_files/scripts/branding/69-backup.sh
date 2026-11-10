@@ -18,7 +18,7 @@ install -d /usr/lib/systemd/user
 cat >/usr/lib/systemd/user/kyth-backup.service <<'BACKUP_SERVICE'
 [Unit]
 Description=KythOS full /home backup (restic + btrfs send to USB)
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 # The binary refuses to run against a same-disk repo without
 # allow_same_disk, and exits nonzero on any restic failure so the timer
 # records the failure instead of faking a healthy backup.

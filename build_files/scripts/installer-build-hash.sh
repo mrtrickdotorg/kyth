@@ -17,7 +17,6 @@ git ls-files -z \
 	installer/Containerfile \
 	installer/build.sh \
 	installer/iso.yaml \
-	installer/calamares \
 	src/kyth-installer-web \
 	src/kyth-shared-rs \
 	third_party/gtk-glib-0.18.5 \

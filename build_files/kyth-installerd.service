@@ -1,6 +1,6 @@
 [Unit]
 Description=KythOS installer privileged API service
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 After=local-fs.target
 # No ConditionPathExists= on the session token: a missing token must fail
 # visibly (daemon exits nonzero -> Restart=on-failure loop) instead of

@@ -550,6 +550,13 @@ jobs:
           echo "image=${IMAGE}" >&3
           echo "digest=${DIGEST}" >&3
           echo "pinned=${IMAGE}@${DIGEST}" >&3
+          # This step floats by design (it builds ${IMAGE}@${DIGEST}, not
+          # the digest recorded in build_base/Dockerfile), so surface any
+          # drift between the in-tree pin and what CI is about to build:
+          # local builds use the pin, and a stale pin silently splits the
+          # two bases. Informational only — warn mode never fails the run.
+          KYTH_BASE_CURRENT_DIGEST="${DIGEST}" \
+            build_files/scripts/check-base-pin-drift.sh || true
 
       - name: Build base image
         id: build_base

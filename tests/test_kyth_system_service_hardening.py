@@ -62,6 +62,13 @@ class SystemServiceHardeningTests(unittest.TestCase):
         self.assertIn("NoNewPrivileges=yes", body)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", body)
         self.assertIn("PID 1's mount namespace", body)
+        # The watcher is the only writer of the Hub's update snapshot and
+        # writes one on every exit path; an AC-power condition would skip
+        # the unit outright on battery, leaving the Hub with stale update
+        # state indefinitely. The check must run on battery too. (The
+        # directive is matched in `Key=` form: the unit's comment names
+        # ConditionACPower while explaining why it must not gate.)
+        self.assertNotIn("\nConditionACPower=", "\n" + body)
         for directive in (
             "PrivateTmp=yes",
             "ProtectSystem=",

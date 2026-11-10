@@ -9,6 +9,11 @@ releases — and prints the offline signing + publishing steps. It never
 signs anything itself and needs no credentials beyond an optional
 GITHUB_TOKEN for API rate limits: signing is a deliberate manual step
 on the key owner's own hardware.
+
+The manifest's `issued` timestamp is the replay-protection sequence:
+clients refuse any manifest issued older than the newest they have
+already accepted, so this script keeps `issued` strictly increasing
+across publications (see next_issued).
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from release_identity import R2_PUBLIC_BASE_URL
@@ -121,10 +126,73 @@ def ge_proton_entry(version: str | None) -> dict:
     }
 
 
-def build_manifest(rclone_version: str | None, ge_proton_version: str | None) -> dict:
+ISSUED_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def parse_issued(value: object) -> datetime | None:
+    """Parse a manifest `issued` timestamp in the generator's format."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value.strip(), ISSUED_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def next_issued(published_issued: str | None, now: datetime) -> tuple[str, str | None]:
+    """The `issued` value for a new manifest, plus a warning if bumped.
+
+    Clients refuse any manifest whose `issued` is older than the newest
+    they have already accepted (the replay floor in the Rust verifier),
+    so `issued` must strictly increase across publications. Normally it
+    is just the current UTC time; if this machine's clock is behind the
+    currently published manifest (or a regeneration lands in the same
+    second), bump to one second past the published value instead of
+    emitting a manifest every updated client would refuse.
+    """
+    candidate = now.astimezone(timezone.utc)
+    published = parse_issued(published_issued)
+    if published is not None and candidate <= published:
+        bumped = published + timedelta(seconds=1)
+        warning = (
+            f"this machine's clock ({candidate.strftime(ISSUED_FORMAT)}) is not ahead of "
+            f"the published manifest's issued ({published.strftime(ISSUED_FORMAT)}); "
+            f"issuing at {bumped.strftime(ISSUED_FORMAT)} so updated clients do not "
+            "refuse the new manifest as a replay. Check this machine's clock."
+        )
+        return bumped.strftime(ISSUED_FORMAT), warning
+    return candidate.strftime(ISSUED_FORMAT), None
+
+
+def fetch_published_issued() -> str | None:
+    """The `issued` of the manifest currently published on R2, if any.
+
+    Best effort: any failure (nothing published yet, network error,
+    unexpected shape) returns None and the monotonic guard in
+    next_issued simply does not engage — the verifier-side floor is
+    the actual replay protection; this only keeps a skewed generator
+    clock from producing a stillborn manifest. Uses fetch_text, not
+    fetch_json, so no GitHub token is ever sent to the R2 host.
+    """
+    try:
+        manifest = json.loads(fetch_text(f"{R2_PUBLIC_BASE_URL}/{MANIFEST_FILENAME}"))
+    except Exception:
+        return None
+    issued = manifest.get("issued") if isinstance(manifest, dict) else None
+    return issued if isinstance(issued, str) else None
+
+
+def build_manifest(
+    rclone_version: str | None,
+    ge_proton_version: str | None,
+    published_issued: str | None = None,
+) -> dict:
+    issued, warning = next_issued(published_issued, datetime.now(timezone.utc))
+    if warning:
+        print(f"WARNING: {warning}", file=sys.stderr)
     return {
         "schema": 1,
-        "issued": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "issued": issued,
         "updates": [
             rclone_entry(rclone_version),
             ge_proton_entry(ge_proton_version),
@@ -148,7 +216,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    manifest = build_manifest(args.rclone_version, args.ge_proton_version)
+    manifest = build_manifest(
+        args.rclone_version, args.ge_proton_version, fetch_published_issued()
+    )
     args.output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     for entry in manifest["updates"]:
         digest = entry.get("sha256") or entry.get("sha512")

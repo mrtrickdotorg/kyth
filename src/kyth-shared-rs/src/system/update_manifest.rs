@@ -29,6 +29,17 @@
 //!     missing or invalid signature, no manifest entry for the resolved
 //!     version, digest mismatch — is an error, and the callers refuse
 //!     the install and keep the current version.
+//!   * Replay bound: a valid signature proves a manifest is genuine,
+//!     not that it is current — an old manifest stays validly signed
+//!     forever, so a stale mirror or a replayed response could roll a
+//!     client back to a vulnerable version whose digest still verifies.
+//!     Each updater therefore keeps a floor file recording the `issued`
+//!     timestamp of the newest manifest it has ever accepted, and
+//!     refuses any manifest issued earlier than that floor. The bound
+//!     is the manifest's own signed timestamp compared against local
+//!     state; the client wall clock is never consulted. A rollback is
+//!     still possible exactly as documented: publish a *freshly issued*
+//!     manifest that approves the older version.
 //!
 //! Until a real public key replaces the shipped placeholder anchor, the
 //! anchor contains no key material and every gated update is refused
@@ -62,6 +73,13 @@ pub const KEYRING_PATH_ENV: &str = "KYTH_UPDATER_KEYRING_PATH";
 pub const MANIFEST_URL_ENV: &str = "KYTH_UPDATER_MANIFEST_URL";
 pub const SIGNATURE_URL_ENV: &str = "KYTH_UPDATER_MANIFEST_SIGNATURE_URL";
 pub const KEYS_URL_ENV: &str = "KYTH_UPDATER_KEYS_URL";
+pub const FLOOR_PATH_ENV: &str = "KYTH_UPDATER_FLOOR_PATH";
+
+/// Replay-floor state file name, kept in each updater's own state
+/// directory (see [`floor_state_path`]). The file holds one line: the
+/// `issued` timestamp, as unix seconds, of the newest signed manifest
+/// that updater has accepted.
+pub const FLOOR_FILENAME: &str = "updater-manifest-floor";
 
 /// Only manifest schema this build understands. Unknown schemas fail
 /// closed: a future format must not be half-interpreted by old images.
@@ -104,6 +122,33 @@ pub fn signature_url() -> String {
 
 pub fn keys_url() -> String {
     env_or(KEYS_URL_ENV, &default_keys_url())
+}
+
+/// Where one updater's replay-floor state lives. Each updater writes
+/// only inside state it already owns: GE-Proton's unit grants it
+/// `/var/lib/kyth/proton-cachyos` (its `StateDirectory`, the one path
+/// writable under its `ProtectSystem=strict` sandbox), and the rclone
+/// updater runs unsandboxed as root via sudo, so it gets a sibling
+/// directory. No shared location is writable by both, and none is
+/// needed: each updater only ever approves its own component, so a
+/// per-updater floor gives each component the full guarantee — a
+/// manifest older than the newest that component's updater has
+/// accepted is refused. `KYTH_UPDATER_FLOOR_PATH` overrides the whole
+/// path (tests, operator recovery).
+pub fn floor_state_path(component: &str) -> PathBuf {
+    if let Some(path) = std::env::var(FLOOR_PATH_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(path);
+    }
+    let dir = match component {
+        COMPONENT_GE_PROTON => PathBuf::from("/var/lib/kyth/proton-cachyos"),
+        COMPONENT_RCLONE => PathBuf::from("/var/lib/kyth/rclone-update"),
+        other => PathBuf::from(format!("/var/lib/kyth/{other}")),
+    };
+    dir.join(FLOOR_FILENAME)
 }
 
 /// One approved update tuple from the signed manifest.
@@ -178,6 +223,32 @@ impl UpdateManifest {
         Ok(manifest)
     }
 
+    /// The manifest's `issued` timestamp as unix seconds — the
+    /// monotonic value the replay floor compares. A manifest without a
+    /// usable `issued` is refused: the field has been emitted by the
+    /// generator since the format was introduced, and no signed
+    /// manifest was ever published without one (the trust anchor is
+    /// still a placeholder, so no real manifest exists yet), so
+    /// requiring it strands nothing. Without it a replayed manifest
+    /// cannot be told apart from a current one.
+    pub fn issued_unix(&self) -> Result<i64, String> {
+        let issued = self.issued.trim();
+        if issued.is_empty() {
+            return Err(
+                "signed updater manifest has no 'issued' timestamp; manifests without one \
+                 are refused so a replayed manifest cannot pass as current — regenerate \
+                 and re-sign the manifest (see docs/updater-signing.md)"
+                    .to_string(),
+            );
+        }
+        parse_issued_unix(issued).ok_or_else(|| {
+            format!(
+                "signed updater manifest 'issued' timestamp {issued:?} is not a valid \
+                 RFC 3339 timestamp; refusing it (see docs/updater-signing.md)"
+            )
+        })
+    }
+
     /// Exactly one entry must approve the (component, version, artifact)
     /// being installed. Zero matches means the update was never approved;
     /// duplicates mean the manifest itself is ambiguous. Both refuse.
@@ -205,6 +276,221 @@ impl UpdateManifest {
                 "signed updater manifest approves {component} {version} ({artifact}) more than once"
             )),
         }
+    }
+}
+
+/// Days from 1970-01-01 for a proleptic Gregorian date
+/// (Howard Hinnant's days-from-civil algorithm).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400; // [0, 399]
+    let month_prime = i64::from((month + 9) % 12); // Mar=0 .. Feb=11
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Strict RFC 3339 timestamp → unix seconds, with no date crate: this
+/// crate deliberately carries no time dependency for one comparison.
+/// Accepts exactly `YYYY-MM-DDTHH:MM:SS` with an optional fractional
+/// part and a `Z` or `±HH:MM` offset — the shape the manifest
+/// generator emits (`%Y-%m-%dT%H:%M:%SZ`) plus sane variants. Anything
+/// else returns `None`; callers fail closed on `None`. A leap-second
+/// `:60` is clamped to `:59` (unix time cannot represent it and the
+/// floor only needs second-level ordering).
+fn parse_issued_unix(issued: &str) -> Option<i64> {
+    let bytes = issued.as_bytes();
+    let digit = |index: usize| -> Option<i64> {
+        bytes
+            .get(index)
+            .filter(|byte| byte.is_ascii_digit())
+            .map(|byte| i64::from(byte - b'0'))
+    };
+    let two_digits = |index: usize| -> Option<i64> { Some(digit(index)? * 10 + digit(index + 1)?) };
+    let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let month = two_digits(5)?;
+    let day = two_digits(8)?;
+    if !matches!(bytes.get(10), Some(b'T') | Some(b't')) {
+        return None;
+    }
+    if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let hour = two_digits(11)?;
+    let minute = two_digits(14)?;
+    let second = two_digits(17)?;
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == start {
+            return None;
+        }
+    }
+    let offset_seconds: i64 = match bytes.get(index) {
+        Some(b'Z') | Some(b'z') => {
+            index += 1;
+            0
+        }
+        Some(sign @ (b'+' | b'-')) => {
+            if bytes.get(index + 3) != Some(&b':') {
+                return None;
+            }
+            let offset_hour = two_digits(index + 1)?;
+            let offset_minute = two_digits(index + 4)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            index += 6;
+            let magnitude = offset_hour * 3600 + offset_minute * 60;
+            if *sign == b'-' {
+                -magnitude
+            } else {
+                magnitude
+            }
+        }
+        _ => return None,
+    };
+    if index != bytes.len() {
+        return None;
+    }
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let (month, day) = (month as u32, day as u32);
+    if day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second.min(59) - offset_seconds)
+}
+
+/// Read the recorded floor. A missing file is the first-run state
+/// (`Ok(None)`); any other read failure is an error — guessing at the
+/// floor would quietly reopen the replay window.
+fn read_floor(path: &Path) -> Result<Option<i64>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot read the updater manifest floor state at {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    let text = raw.trim();
+    // Canonical form only: decimal digits. A torn or hand-mangled file
+    // fails closed rather than being interpreted leniently.
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "updater manifest floor state at {} is corrupt (expected a single unix \
+             timestamp, found {text:?}); refusing updates so replay protection stays \
+             intact. To re-baseline the floor, delete {} and re-run the updater: the \
+             next validly signed manifest will be accepted and recorded",
+            path.display(),
+            path.display()
+        ));
+    }
+    text.parse::<i64>().map(Some).map_err(|error| {
+        format!(
+            "updater manifest floor state at {} is corrupt ({error}); refusing updates. \
+             To re-baseline the floor, delete {} and re-run the updater",
+            path.display(),
+            path.display()
+        )
+    })
+}
+
+/// Persist a new floor atomically: write a sibling temp file, fsync,
+/// rename over the floor file, so a crash or power loss can never
+/// leave a torn floor behind (a torn file would read as corrupt and
+/// refuse updates until an operator re-baselines it).
+fn record_floor(path: &Path, issued_unix: i64) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "cannot create the updater manifest floor directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| FLOOR_FILENAME.to_string());
+    let temp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let write = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(format!("{issued_unix}\n").as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        // Best-effort directory fsync so the rename itself is durable.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = write {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!(
+            "cannot record the updater manifest floor at {}: {error}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The replay bound, applied to every verified manifest before it may
+/// approve anything: the manifest's `issued` must be at least the
+/// floor (the newest `issued` this updater has ever accepted), and a
+/// strictly newer manifest advances the floor *before* the caller acts
+/// on it — so once this system has seen a newer signed manifest, older
+/// ones are dead even if the newer one did not approve the version
+/// being resolved. Acceptance without recording would silently drop
+/// the protection for the next run, so a floor that cannot be recorded
+/// is a refusal, not a warning. Equal is accepted without a write:
+/// re-checking the same manifest is the normal idempotent path.
+pub fn check_and_record_floor(path: &Path, manifest: &UpdateManifest) -> Result<(), String> {
+    let issued_unix = manifest.issued_unix()?;
+    match read_floor(path)? {
+        None => record_floor(path, issued_unix),
+        Some(floor) if issued_unix < floor => Err(format!(
+            "signed updater manifest issued {:?} (unix {issued_unix}) is older than the \
+             newest manifest this updater has already accepted (floor: unix {floor}); \
+             refusing a replayed or rolled-back manifest. To roll back deliberately, \
+             publish a freshly generated manifest approving the older version instead \
+             (see docs/updater-signing.md)",
+            manifest.issued.trim()
+        )),
+        Some(floor) if issued_unix == floor => Ok(()),
+        Some(_) => record_floor(path, issued_unix),
     }
 }
 
@@ -343,7 +629,8 @@ pub fn verify_signed_manifest(
 
 /// Full updater gate: fetch the signed manifest, its detached
 /// signature, and the published key file; verify the signature against
-/// the image-baked trust anchor; return the single manifest entry
+/// the image-baked trust anchor; apply the replay floor
+/// ([`check_and_record_floor`]); return the single manifest entry
 /// approving (component, version, artifact). Any failure is an error
 /// and the caller must refuse the install.
 pub fn approve_update(
@@ -394,6 +681,10 @@ pub fn approve_update(
         &manifest_bytes,
         &signature_bytes,
     )?;
+    // The signature proves this manifest is genuine, not that it is
+    // current: bind it to the newest manifest this updater has already
+    // accepted before it may approve anything.
+    check_and_record_floor(&floor_state_path(component), &manifest)?;
     manifest.find(component, version, artifact)
 }
 
@@ -674,5 +965,163 @@ mod tests {
         let error = UpdateManifest::parse(br#"{"schema": 99, "updates": []}"#)
             .expect_err("an unknown schema must fail closed");
         assert!(error.contains("not supported"), "unexpected error: {error}");
+    }
+
+    /// A manifest carrying a given `issued`, for floor tests.
+    fn manifest_issued(issued: &str) -> UpdateManifest {
+        UpdateManifest::parse(
+            format!(r#"{{"schema": 1, "issued": "{issued}", "updates": []}}"#).as_bytes(),
+        )
+        .expect("floor-test manifest must parse")
+    }
+
+    #[test]
+    fn issued_timestamp_parser_is_strict() {
+        // The generator's exact shape, plus sane RFC 3339 variants.
+        assert_eq!(
+            parse_issued_unix("2026-10-19T00:00:00Z"),
+            Some(1_792_368_000)
+        );
+        assert_eq!(
+            parse_issued_unix("2026-10-19T02:00:00+02:00"),
+            Some(1_792_368_000)
+        );
+        assert_eq!(
+            parse_issued_unix("2026-10-18T19:00:00-05:00"),
+            Some(1_792_368_000)
+        );
+        assert_eq!(
+            parse_issued_unix("2026-10-19T00:00:00.500Z"),
+            Some(1_792_368_000)
+        );
+        assert_eq!(
+            parse_issued_unix("2024-02-29T12:00:00Z"),
+            Some(1_709_208_000)
+        );
+        // Everything malformed or out of range is refused, never
+        // half-parsed into a comparison value.
+        for bad in [
+            "",
+            "2026-10-19",
+            "2026-10-19 00:00:00Z",
+            "2026-10-19T00:00:00",
+            "2026-10-19T00:00:00Zjunk",
+            "2026-13-19T00:00:00Z",
+            "2026-10-32T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2026-10-19T24:00:00Z",
+            "2026-10-19T00:60:00Z",
+            "2026-10-19T00:00:00+24:00",
+            "not-a-timestamp",
+        ] {
+            assert_eq!(parse_issued_unix(bad), None, "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn manifest_without_issued_is_refused() {
+        let manifest = UpdateManifest::parse(br#"{"schema": 1, "updates": []}"#)
+            .expect("a manifest without 'issued' still parses");
+        let error = manifest
+            .issued_unix()
+            .expect_err("a missing 'issued' must refuse at the floor");
+        assert!(error.contains("no 'issued'"), "unexpected error: {error}");
+        let manifest = manifest_issued("yesterday-ish");
+        let error = manifest
+            .issued_unix()
+            .expect_err("an unparseable 'issued' must refuse at the floor");
+        assert!(
+            error.contains("not a valid RFC 3339"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn floor_records_first_acceptance_and_accepts_equal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state").join(FLOOR_FILENAME);
+        let manifest = manifest_issued("2026-10-19T00:00:00Z");
+        // First run: no state file, acceptance records the floor.
+        check_and_record_floor(&path, &manifest).expect("first acceptance must succeed");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("floor file must exist"),
+            "1792368000\n"
+        );
+        // Idempotent re-check of the same manifest: accepted, and the
+        // floor is not rewritten.
+        check_and_record_floor(&path, &manifest).expect("an equal manifest must be accepted");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("floor file must remain"),
+            "1792368000\n"
+        );
+    }
+
+    #[test]
+    fn floor_advances_when_newer_manifest_arrives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(FLOOR_FILENAME);
+        check_and_record_floor(&path, &manifest_issued("2026-10-19T00:00:00Z"))
+            .expect("first acceptance must succeed");
+        check_and_record_floor(&path, &manifest_issued("2026-11-02T09:30:00Z"))
+            .expect("a newer manifest must be accepted");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("floor file must exist"),
+            format!(
+                "{}\n",
+                parse_issued_unix("2026-11-02T09:30:00Z").expect("parse")
+            )
+        );
+        // The temp sibling is consumed by the rename, never left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read state dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp floor files left: {leftovers:?}");
+    }
+
+    #[test]
+    fn replayed_manifest_is_refused_by_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(FLOOR_FILENAME);
+        check_and_record_floor(&path, &manifest_issued("2026-11-02T09:30:00Z"))
+            .expect("the newer manifest must be accepted");
+        // A stale mirror (or an attacker) replays the older, still
+        // validly signed manifest: its checksums verify, its signature
+        // verifies — the floor is the only thing that refuses it.
+        let error = check_and_record_floor(&path, &manifest_issued("2026-10-19T00:00:00Z"))
+            .expect_err("a replayed older manifest must be refused");
+        assert!(error.contains("older"), "unexpected error: {error}");
+        assert!(error.contains("replayed"), "unexpected error: {error}");
+        // The refusal must not move the floor.
+        assert_eq!(
+            read_floor(&path).expect("floor must still read"),
+            parse_issued_unix("2026-11-02T09:30:00Z")
+        );
+    }
+
+    #[test]
+    fn corrupt_floor_state_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(FLOOR_FILENAME);
+        let manifest = manifest_issued("2026-10-19T00:00:00Z");
+        for corrupt in ["garbage", "", "  \n", "1792368000.5", "-42", "0x10"] {
+            std::fs::write(&path, corrupt).expect("write corrupt floor");
+            let error = check_and_record_floor(&path, &manifest)
+                .expect_err("a corrupt floor must refuse, never be ignored");
+            assert!(
+                error.contains("corrupt"),
+                "content {corrupt:?}: unexpected error: {error}"
+            );
+            // The refusal names the recovery: delete to re-baseline.
+            assert!(
+                error.contains("delete"),
+                "content {corrupt:?}: unexpected error: {error}"
+            );
+        }
+        // And the documented recovery works: after deletion the next
+        // valid manifest is accepted and records a fresh floor.
+        std::fs::remove_file(&path).expect("delete corrupt floor");
+        check_and_record_floor(&path, &manifest).expect("re-baselined floor must accept");
     }
 }

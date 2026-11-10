@@ -1,6 +1,6 @@
 
 ARG BASE_IMAGE=localhost/kyth-base:stable
-ARG IMAGE_OWNER=kyth-os
+ARG IMAGE_OWNER=mrtrickdotorg
 # CI pins this to a digest-qualified ref (ghcr.io/...@sha256:...) via
 # --build-arg BASE_IMAGE="${STEPS_UPSTREAM_BASE_OUTPUTS_PINNED}" in
 # .github/workflows/build.yml; local `localhost` alias is intentional for

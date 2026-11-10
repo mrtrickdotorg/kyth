@@ -344,7 +344,7 @@ class HubWebCoverageTests(unittest.TestCase):
         body = re.search(r"fn open_feedback_issue\(.*?\n\}", MAIN_RS, re.S)
         self.assertIsNotNone(body, "open_feedback_issue not found")
         text = body.group(0)
-        self.assertIn('"https://github.com/kyth-os/kyth"', text)
+        self.assertIn('"https://github.com/mrtrickdotorg/kyth"', text)
         self.assertIn("kyth_shared::diagnostic_report::github_issue_url", text)
         self.assertIn("kyth_shared::diagnostics_scrub::scrub_logs", text)
         # No raw interpolation of either argument into the URL.

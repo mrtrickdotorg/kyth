@@ -6,11 +6,11 @@
 
 **A calm Linux desktop for people coming from Windows—built for games, work, creativity, and a way back when something goes wrong.**
 
-[Download stable](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-latest.iso) · [Try testing](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-testing.iso) · [Get help](https://github.com/kyth-os/kyth/discussions) · [Report a bug](https://github.com/kyth-os/kyth/issues)
+[Download stable](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-latest.iso) · [Try testing](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-testing.iso) · [Get help](https://github.com/mrtrickdotorg/kyth/discussions) · [Report a bug](https://github.com/mrtrickdotorg/kyth/issues)
 
-[![Build](https://github.com/kyth-os/kyth/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/kyth-os/kyth/actions/workflows/build.yml)
-[![Live ISO](https://github.com/kyth-os/kyth/actions/workflows/build-live-iso.yml/badge.svg?branch=testing)](https://github.com/kyth-os/kyth/actions/workflows/build-live-iso.yml)
-[![CVE Scan](https://github.com/kyth-os/kyth/actions/workflows/cve-scan.yml/badge.svg)](https://github.com/kyth-os/kyth/actions/workflows/cve-scan.yml)
+[![Build](https://github.com/mrtrickdotorg/kyth/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/mrtrickdotorg/kyth/actions/workflows/build.yml)
+[![Live ISO](https://github.com/mrtrickdotorg/kyth/actions/workflows/build-live-iso.yml/badge.svg?branch=testing)](https://github.com/mrtrickdotorg/kyth/actions/workflows/build-live-iso.yml)
+[![CVE Scan](https://github.com/mrtrickdotorg/kyth/actions/workflows/cve-scan.yml/badge.svg)](https://github.com/mrtrickdotorg/kyth/actions/workflows/cve-scan.yml)
 
 </div>
 
@@ -83,7 +83,7 @@ Rust is not the point of using KythOS; dependable desktop behavior is. It is one
 | **Stable** | You want the current daily-driver release. | [Download stable ISO](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-latest.iso) |
 | **Testing** | You want to help try new work before it reaches stable. | [Download testing ISO](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-testing.iso) |
 
-You need an x86-64 PC, a USB drive, and at least 8 GB of RAM for the live environment. **Back up anything important before changing partitions or selecting an install disk.**
+You need an x86-64 PC, a USB drive, at least 8 GB of RAM for the live environment, and an internet connection for the install itself: the installer downloads the system image (about 8.5 GiB) during setup — the live USB does not carry an offline copy, so KythOS cannot be installed without a connection. **Back up anything important before changing partitions or selecting an install disk.**
 
 1. Download the ISO for the channel you chose.
 2. Verify the download against its published checksum (substitute the
@@ -102,7 +102,7 @@ for signature/provenance verification and the channel rollback procedure.
 5. Read the disk-selection screen carefully, choose the installation layout, and create your local user.
 6. After the first restart, open **Kyth Hub** and follow its short setup checklist.
 
-If you are installing alongside Windows, make a recovery drive and a current backup first. The installer can guide an installation, but it cannot make an unsafe disk choice safe. Stable and testing release records are also available on [GitHub](https://github.com/kyth-os/kyth/releases).
+If you are installing alongside Windows, make a recovery drive and a current backup first. The installer can guide an installation, but it cannot make an unsafe disk choice safe. Stable and testing release records are also available on [GitHub](https://github.com/mrtrickdotorg/kyth/releases).
 
 ## Is KythOS for you?
 
@@ -112,7 +112,7 @@ Take a closer look before switching full-time if your work depends on a particul
 
 ## Support, privacy, and project status
 
-Ask questions in [GitHub Discussions](https://github.com/kyth-os/kyth/discussions) and file reproducible problems in [GitHub Issues](https://github.com/kyth-os/kyth/issues). A support snapshot from Kyth Hub excludes stored passwords, browser sessions, SMB credentials, and cloud OAuth tokens.
+Ask questions in [GitHub Discussions](https://github.com/mrtrickdotorg/kyth/discussions) and file reproducible problems in [GitHub Issues](https://github.com/mrtrickdotorg/kyth/issues). A support snapshot from Kyth Hub excludes stored passwords, browser sessions, SMB credentials, and cloud OAuth tokens.
 
 KythOS enables Fedora’s anonymous DNF CountMe mechanism: Fedora receives an age bucket during a weekly repository request. KythOS does not create an account, send a per-machine identifier, or claim an install count from Fedora’s aggregate.
 

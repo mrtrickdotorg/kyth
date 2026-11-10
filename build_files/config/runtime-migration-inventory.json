@@ -4352,9 +4352,15 @@
       "current_implementation": "data",
       "cutover": "replace installed kyth-proton-cachyos-update entry point after parity gates",
       "exec_start": [
+        "/bin/sh -c 'grep -q \"-----BEGIN PGP PUBLIC KEY BLOCK-----\" /usr/share/kyth/updater-signing-keys.asc'",
         "/usr/bin/kyth-proton-cachyos-update"
       ],
       "function_inventory": [
+        {
+          "name": "ExecStart:/bin/sh -c 'grep -q \"-----BEGIN PGP PUBLIC KEY BLOCK-----\" /usr/share/kyth/updater-signing-keys.asc'",
+          "owner": "native::kyth-proton-cachyos-update",
+          "ownership": "native"
+        },
         {
           "name": "ExecStart:/usr/bin/kyth-proton-cachyos-update",
           "owner": "native::kyth-proton-cachyos-update",
@@ -9006,36 +9012,6 @@
     },
     {
       "current_implementation": "shell",
-      "cutover": "replace installed 67-selinux.sh entry point after parity gates",
-      "function_inventory": [
-        {
-          "name": "__main__",
-          "owner": "fixture::build_files/scripts/branding/67-selinux.sh",
-          "ownership": "build-only"
-        }
-      ],
-      "installed_implementation": "not-installed",
-      "migration_priority": 3,
-      "name": "67-selinux.sh",
-      "owner": "fixture::build_files/scripts/branding/67-selinux.sh",
-      "parity_tests": [
-        "tests/"
-      ],
-      "path": "build_files/scripts/branding/67-selinux.sh",
-      "priority": 0,
-      "reason": "build/test shell script, not installed runtime authority",
-      "resolved_target": "build_files/scripts/branding/67-selinux.sh",
-      "retirement": "retain source fixture until exact-image acceptance and rollback qualification",
-      "risk_tier": "build-time",
-      "rollback": "restore previous installed 67-selinux.sh entry point",
-      "runtime_active": false,
-      "runtime_authority": "build-only",
-      "runtime_scope": "build",
-      "status": "not-applicable",
-      "surface": "shell-script"
-    },
-    {
-      "current_implementation": "shell",
       "cutover": "replace installed 68-locale.sh entry point after parity gates",
       "function_inventory": [
         {
@@ -9988,6 +9964,41 @@
       "retirement": "retain source fixture until exact-image acceptance and rollback qualification",
       "risk_tier": "build-time",
       "rollback": "restore previous installed 99-updater-signing-key.sh entry point",
+      "runtime_active": false,
+      "runtime_authority": "build-only",
+      "runtime_scope": "build",
+      "status": "not-applicable",
+      "surface": "shell-script"
+    },
+    {
+      "current_implementation": "shell",
+      "cutover": "replace installed check-base-pin-drift.sh entry point after parity gates",
+      "function_inventory": [
+        {
+          "name": "fail_read",
+          "owner": "fixture::build_files/scripts/check-base-pin-drift.sh",
+          "ownership": "build-only"
+        },
+        {
+          "name": "annotate",
+          "owner": "fixture::build_files/scripts/check-base-pin-drift.sh",
+          "ownership": "build-only"
+        }
+      ],
+      "installed_implementation": "not-installed",
+      "migration_priority": 3,
+      "name": "check-base-pin-drift.sh",
+      "owner": "fixture::build_files/scripts/check-base-pin-drift.sh",
+      "parity_tests": [
+        "tests/"
+      ],
+      "path": "build_files/scripts/check-base-pin-drift.sh",
+      "priority": 0,
+      "reason": "build/test shell script, not installed runtime authority",
+      "resolved_target": "build_files/scripts/check-base-pin-drift.sh",
+      "retirement": "retain source fixture until exact-image acceptance and rollback qualification",
+      "risk_tier": "build-time",
+      "rollback": "restore previous installed check-base-pin-drift.sh entry point",
       "runtime_active": false,
       "runtime_authority": "build-only",
       "runtime_scope": "build",
@@ -11795,6 +11806,11 @@
       "function_inventory": [
         {
           "name": "usage",
+          "owner": "fixture::build_files/scripts/run-rust-migration-acceptance.sh",
+          "ownership": "build-only"
+        },
+        {
+          "name": "run_variant",
           "owner": "fixture::build_files/scripts/run-rust-migration-acceptance.sh",
           "ownership": "build-only"
         }
@@ -14481,6 +14497,51 @@
       "retirement": "retain source fixture until exact-image acceptance and rollback qualification",
       "risk_tier": "build-time",
       "rollback": "restore previous installed validate.sh entry point",
+      "runtime_active": false,
+      "runtime_authority": "build-only",
+      "runtime_scope": "build",
+      "status": "not-applicable",
+      "surface": "shell-script"
+    },
+    {
+      "current_implementation": "shell",
+      "cutover": "replace installed vm-acceptance-prep-windows.sh entry point after parity gates",
+      "function_inventory": [
+        {
+          "name": "usage",
+          "owner": "fixture::build_files/scripts/vm-acceptance-prep-windows.sh",
+          "ownership": "build-only"
+        },
+        {
+          "name": "prep_with_guestfish",
+          "owner": "fixture::build_files/scripts/vm-acceptance-prep-windows.sh",
+          "ownership": "build-only"
+        },
+        {
+          "name": "cleanup_nbd",
+          "owner": "fixture::build_files/scripts/vm-acceptance-prep-windows.sh",
+          "ownership": "build-only"
+        },
+        {
+          "name": "prep_with_qemu_nbd",
+          "owner": "fixture::build_files/scripts/vm-acceptance-prep-windows.sh",
+          "ownership": "build-only"
+        }
+      ],
+      "installed_implementation": "not-installed",
+      "migration_priority": 3,
+      "name": "vm-acceptance-prep-windows.sh",
+      "owner": "fixture::build_files/scripts/vm-acceptance-prep-windows.sh",
+      "parity_tests": [
+        "tests/"
+      ],
+      "path": "build_files/scripts/vm-acceptance-prep-windows.sh",
+      "priority": 0,
+      "reason": "build/test shell script, not installed runtime authority",
+      "resolved_target": "build_files/scripts/vm-acceptance-prep-windows.sh",
+      "retirement": "retain source fixture until exact-image acceptance and rollback qualification",
+      "risk_tier": "build-time",
+      "rollback": "restore previous installed vm-acceptance-prep-windows.sh entry point",
       "runtime_active": false,
       "runtime_authority": "build-only",
       "runtime_scope": "build",

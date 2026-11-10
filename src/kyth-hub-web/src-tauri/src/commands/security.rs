@@ -238,9 +238,14 @@ pub(crate) struct SecHostToolResponse {
     scan_failed_scopes: Vec<String>,
 }
 
-/// Async + one scan, same reasoning as `gaming_tools`.
+/// Async + one scan, same reasoning as `gaming_tools`. Fallible: a
+/// panicked scan task used to resolve to an empty vec, which the grid
+/// renders as "no tools, no failed scopes" and silently hides itself —
+/// the rejection lands on the grid's "couldn't check" state instead.
+/// (Per-scope scan failures inside a completed scan still travel in
+/// each entry's `scan_failed_scopes`, below.)
 #[tauri::command]
-pub(crate) async fn sec_host_tools() -> Vec<SecHostToolResponse> {
+pub(crate) async fn sec_host_tools() -> Result<Vec<SecHostToolResponse>, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let ids: Vec<&str> = security_container::SEC_HOST_TOOLS
             .iter()
@@ -272,10 +277,7 @@ pub(crate) async fn sec_host_tools() -> Vec<SecHostToolResponse> {
             .collect()
     })
     .await
-    .unwrap_or_else(|err| {
-        eprintln!("sec_host_tools: scan task failed: {err}");
-        Vec::new()
-    })
+    .map_err(|err| format!("Security tools check failed: {err}"))
 }
 
 fn validated_sec_tool(

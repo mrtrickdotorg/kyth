@@ -159,28 +159,57 @@ pub fn command_for_fixed_assignments(recipe: &str, args: &[(&str, &str)]) -> Opt
 }
 
 /// Run `just --list` with the justfile `ujust` uses and parse.
-/// Returns `Ok(vec)` even when `just` exits non-zero but produced stdout —
 ///
-/// same fallback as Qt: `text = f"just --list failed (exit {code})"` only
-/// when both code !=0 and stdout empty. Here we return empty vec on hard
-/// failure so the caller can show the fallback note.
-pub fn just_list() -> Vec<JustRecipe> {
+/// Fallible, preserving the Qt fallback: a non-zero exit that still
+/// produced a parseable listing returns that listing (`page_just.py`
+/// only showed its "just --list failed" note when both the exit was
+/// non-zero AND stdout was empty). A hard failure — the binary could not
+/// run, or it failed with nothing parseable — is an `Err`, never an
+/// empty vec: the old shape read in the Hub as "No just recipes found"
+/// for a `just` that never ran.
+pub fn just_list() -> Result<Vec<JustRecipe>, String> {
     let mut cmd = Command::new("/usr/bin/just");
     cmd.arg("--list");
     configure_command(&mut cmd);
-    match super::process::run_bounded_command(cmd, Duration::from_secs(10)) {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let parsed = parse_just_list(&stdout);
-            if !parsed.is_empty() {
-                return parsed;
-            }
-            // If stdout empty and exit !=0, treat as no recipes (caller shows fallback)
-            // — don't surface stderr as recipes.
-            Vec::new()
-        }
-        Err(_) => Vec::new(),
+    let out = super::process::run_bounded_command(cmd, Duration::from_secs(10))
+        .map_err(|err| format!("could not run /usr/bin/just --list: {err}"))?;
+    interpret_list_output(
+        out.status.success(),
+        out.status.code(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// Pure verdict for one `just --list` outcome, split out so the contract
+/// is unit-testable without running a real `just`: parseable stdout wins
+/// even on a non-zero exit (the Qt fallback); a successful run with no
+/// recipes is a legitimate empty `Ok`; a failed run with nothing
+/// parseable is an `Err` carrying the exit and stderr — never parse
+/// stderr as recipes, and never disguise the failure as an empty list.
+fn interpret_list_output(
+    success: bool,
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<JustRecipe>, String> {
+    let parsed = parse_just_list(stdout);
+    if !parsed.is_empty() {
+        return Ok(parsed);
     }
+    if success {
+        return Ok(Vec::new());
+    }
+    let stderr = stderr.trim();
+    let how = match code {
+        Some(code) => format!("just --list failed (exit {code})"),
+        None => "just --list was stopped before it finished".to_string(),
+    };
+    Err(if stderr.is_empty() {
+        how
+    } else {
+        format!("{how}: {stderr}")
+    })
 }
 
 #[cfg(test)]
@@ -231,6 +260,41 @@ mod tests {
     fn parse_empty() {
         assert!(parse_just_list("").is_empty());
         assert!(parse_just_list("Available recipes:\n").is_empty());
+    }
+
+    #[test]
+    fn failed_list_run_is_an_error_not_an_empty_listing() {
+        // `just` ran and failed with nothing parseable (e.g. no justfile):
+        // the caller must hear about the failure, not see "no recipes".
+        let err =
+            interpret_list_output(false, Some(1), "", "error: no justfile found").unwrap_err();
+        assert!(err.contains("exit 1"), "error carries the exit: {err}");
+        assert!(
+            err.contains("no justfile found"),
+            "error carries stderr: {err}"
+        );
+        // A killed run (no exit code) is an error too.
+        assert!(interpret_list_output(false, None, "", "").is_err());
+    }
+
+    #[test]
+    fn successful_empty_list_run_is_an_empty_ok() {
+        // The command succeeded and the justfile simply has no recipes:
+        // a legitimate empty result, distinct from the failure above.
+        let v = interpret_list_output(true, Some(0), "Available recipes:\n", "")
+            .expect("successful empty listing is Ok");
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn failed_run_with_parseable_stdout_keeps_the_qt_fallback() {
+        // Non-zero exit but a real listing on stdout: the listing wins,
+        // exactly like page_just.py behaved.
+        let out = "Available recipes:\n    build    # Build the full KythOS image.\n";
+        let v = interpret_list_output(false, Some(1), out, "warning: something")
+            .expect("parseable stdout survives a non-zero exit");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "build");
     }
 
     #[test]

@@ -1,0 +1,164 @@
+{
+  "description": "Shared SMB share-path verdict corpus. Each case is merged into base_payload and judged as a network_share_add request by (a) the Hub shell validator (kyth-hub-web commands/privilege.rs), and (b) the daemon pipeline: the privileged socket validator (kyth-shared privileged.rs) AND the root executor validator (kyth-shared network_share.rs) — the daemon verdict is the conjunction, since either layer can refuse the request. All sides must reach the recorded verdict for every case.",
+  "base_payload": {
+    "name": "media",
+    "server": "nas.local",
+    "username": "pat",
+    "password": "secret",
+    "domain": "",
+    "auto_mount": true,
+    "mount_now": false
+  },
+  "cases": [
+    {
+      "case": "baseline /mnt share",
+      "mount_point": "/mnt/media",
+      "share_path": "media",
+      "valid": true
+    },
+    {
+      "case": "media prefix",
+      "mount_point": "/media/nas",
+      "share_path": "media",
+      "valid": true
+    },
+    {
+      "case": "run/media prefix, deeper path",
+      "mount_point": "/run/media/alice/usb",
+      "share_path": "media",
+      "valid": true
+    },
+    {
+      "case": "space in mount point is in the shared charset",
+      "mount_point": "/mnt/my share",
+      "share_path": "media",
+      "valid": true
+    },
+    {
+      "case": "home prefix is not approved",
+      "mount_point": "/home/alice/share",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "home dir itself is not approved",
+      "mount_point": "/home/alice",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "parent-dir escape into home",
+      "mount_point": "/mnt/../home/alice/share",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "dot segment collapsing to the prefix root",
+      "mount_point": "/mnt/.",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "prefix root with trailing slash",
+      "mount_point": "/mnt/",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "bare prefix root",
+      "mount_point": "/run/media",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "unapproved prefix",
+      "mount_point": "/srv/share",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "disallowed character in mount point",
+      "mount_point": "/mnt/media$evil",
+      "share_path": "media",
+      "valid": false
+    },
+    {
+      "case": "empty segment collapses (daemon normalizes)",
+      "mount_point": "/mnt//media",
+      "share_path": "media",
+      "valid": true
+    },
+    {
+      "case": "dot segment below prefix collapses",
+      "mount_point": "/mnt/./media",
+      "share_path": "media",
+      "valid": true
+    },
+    {
+      "case": "trailing slash normalizes away",
+      "mount_point": "/mnt/media/",
+      "share_path": "media",
+      "valid": true
+    },
+    {
+      "case": "leading slash on share path is trimmed",
+      "mount_point": "/mnt/media",
+      "share_path": "/media",
+      "valid": true
+    },
+    {
+      "case": "share path of only slashes trims to empty",
+      "mount_point": "/mnt/media",
+      "share_path": "/",
+      "valid": false
+    },
+    {
+      "case": "empty share path",
+      "mount_point": "/mnt/media",
+      "share_path": "",
+      "valid": false
+    },
+    {
+      "case": "dotfile share path after trim",
+      "mount_point": "/mnt/media",
+      "share_path": "/.hidden",
+      "valid": false
+    },
+    {
+      "case": "backslash in share path (systemd line continuation)",
+      "mount_point": "/mnt/media",
+      "share_path": "media\\back",
+      "valid": false
+    },
+    {
+      "case": "quote in share path",
+      "mount_point": "/mnt/media",
+      "share_path": "media\"quote",
+      "valid": false
+    },
+    {
+      "case": "parent-dir segment in share path",
+      "mount_point": "/mnt/media",
+      "share_path": "../etc",
+      "valid": false
+    },
+    {
+      "case": "empty segment in share path",
+      "mount_point": "/mnt/media",
+      "share_path": "a//b",
+      "valid": false
+    },
+    {
+      "case": "percent in share path",
+      "mount_point": "/mnt/media",
+      "share_path": "%41",
+      "valid": false
+    },
+    {
+      "case": "share path over the executor byte cap",
+      "mount_point": "/mnt/media",
+      "share_path": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "valid": false
+    }
+  ]
+}

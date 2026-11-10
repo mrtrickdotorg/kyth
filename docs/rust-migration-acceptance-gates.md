@@ -18,7 +18,7 @@ The reproducible entry point is:
 ```text
 just rust-migration-acceptance \
   iso=/absolute/path/to/kyth-live-testing.iso \
-  image_ref=ghcr.io/kyth-os/kyth@sha256:<promoted-digest> \
+  image_ref=ghcr.io/mrtrickdotorg/kyth@sha256:<promoted-digest> \
   artifacts=/absolute/path/to/acceptance-evidence
 ```
 
@@ -64,8 +64,8 @@ gh workflow run rust-migration-acceptance.yml --ref testing \
   -f artifact_run_id=<iso-build-run-id> \
   -f artifact_name=<exact-iso-artifact-name> \
   -f source_sha=<source-commit> \
-  -f image_ref=ghcr.io/kyth-os/kyth@sha256:<promoted-digest> \
-  -f update_ref=ghcr.io/kyth-os/kyth@sha256:<previous-or-next-digest>
+  -f image_ref=ghcr.io/mrtrickdotorg/kyth@sha256:<promoted-digest> \
+  -f update_ref=ghcr.io/mrtrickdotorg/kyth@sha256:<previous-or-next-digest>
 ```
 
 `update_ref` is optional for a basic install/boot gate. Supplying a distinct

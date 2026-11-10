@@ -2059,9 +2059,24 @@ export async function launchSecHostTool(flatpakId: string): Promise<string> {
 // ---------------------------------------------------------------------
 
 export interface GamingTool { flatpak: string; name: string; desc: string; installed: boolean }
-export async function fetchGamingTools(): Promise<GamingTool[] | null> {
+/** The tools grid plus the flatpak scopes the installed-scan could not
+ * read — same contract as SecHostToolsResult: a failed scope is carried
+ * alongside the list, never folded into it, so the grid can say the scan
+ * was partial instead of presenting every tool in that scope as simply
+ * not installed. A rejected read (the scan task itself failed) is null. */
+export interface GamingToolsResult { tools: GamingTool[]; scanFailedScopes: string[] }
+// Mirrors GamingToolResponse: the backend repeats the shared scan's
+// failed scopes on every entry; the wrapper lifts them into one list.
+interface GamingToolRaw { flatpak: string; name: string; desc: string; installed: boolean; scan_failed_scopes: string[] }
+export async function fetchGamingTools(): Promise<GamingToolsResult | null> {
   if (!inTauriShell()) return null;
-  try { return await invoke<GamingTool[]>("gaming_tools"); } catch { return null; }
+  try {
+    const raw = await invoke<GamingToolRaw[]>("gaming_tools");
+    return {
+      tools: raw.map((tool) => ({ flatpak: tool.flatpak, name: tool.name, desc: tool.desc, installed: tool.installed })),
+      scanFailedScopes: [...new Set(raw.flatMap((tool) => tool.scan_failed_scopes ?? []))],
+    };
+  } catch { return null; }
 }
 
 async function pollGamingJob(job: string, maxIterations: number): Promise<string> {
@@ -2244,7 +2259,7 @@ export async function fetchAntiCheatTable(): Promise<AntiCheatEntry[] | null> {
   try { return await invoke<AntiCheatEntry[]>("anti_cheat_table"); } catch { return null; }
 }
 
-/** Feedback's send path — opens a prefilled kyth-os/kyth issue via
+/** Feedback's send path — opens a prefilled mrtrickdotorg/kyth issue via
  * xdg-open. Throws like the other mutating wrappers so useSectionAction
  * can surface the failure. */
 export async function invokeOpenFeedbackIssue(title: string, body: string): Promise<string> {

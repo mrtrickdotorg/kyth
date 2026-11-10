@@ -27,6 +27,11 @@ pub(crate) struct GamingToolResponse {
     name: String,
     desc: String,
     installed: bool,
+    /// Scopes whose flatpak scan failed during this read (a subset of
+    /// `"user"` / `"system"`); non-empty means `installed` may be
+    /// incomplete and the UI should say "couldn't check" rather than
+    /// trust the flags. Same contract as `SecHostToolResponse`.
+    scan_failed_scopes: Vec<String>,
 }
 #[derive(Serialize)]
 pub(crate) struct GamingActionLaunch {
@@ -38,14 +43,27 @@ pub(crate) struct GamingActionLaunch {
 /// Async + one scan: this used to be a sync command that ran a full
 /// `flatpak list` (two scopes, 10 s each) once PER TOOL, so a wedged flatpak
 /// helper froze the Gaming tab for tools x 20 s.
+///
+/// Fallible + scan-based, mirroring `sec_host_tools`: the scan-based read
+/// names the scopes it could not read instead of silently dropping them
+/// (which reported every tool in the failed scope "not installed" and
+/// invited a redundant reinstall), and a panicked scan task rejects
+/// instead of resolving to an empty vec the grid reads as an empty
+/// catalog. The failure is logged and carried to the UI in
+/// `scan_failed_scopes`.
 #[tauri::command]
-pub(crate) async fn gaming_tools() -> Vec<GamingToolResponse> {
+pub(crate) async fn gaming_tools() -> Result<Vec<GamingToolResponse>, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let ids: Vec<&str> = GAMING_TOOLS.iter().map(|tool| tool.flatpak).collect();
-        let flags = kyth_shared::system::software_catalog::installed_flags(
-            &ids,
-            kyth_shared::system::software_catalog::installed_flatpaks,
-        );
+        let scan = kyth_shared::system::software_catalog::installed_flatpaks_scan();
+        if !scan.failed_scopes.is_empty() {
+            eprintln!(
+                "gaming_tools: flatpak scan failed for scope(s): {}",
+                scan.failed_scopes.join(", ")
+            );
+        }
+        let scan_failed_scopes = scan.failed_scopes.clone();
+        let flags = kyth_shared::system::software_catalog::installed_flags(&ids, || scan.apps);
         GAMING_TOOLS
             .iter()
             .zip(flags)
@@ -54,14 +72,12 @@ pub(crate) async fn gaming_tools() -> Vec<GamingToolResponse> {
                 name: tool.name.to_string(),
                 desc: tool.desc.to_string(),
                 installed,
+                scan_failed_scopes: scan_failed_scopes.clone(),
             })
             .collect()
     })
     .await
-    .unwrap_or_else(|err| {
-        eprintln!("gaming_tools: scan task failed: {err}");
-        Vec::new()
-    })
+    .map_err(|err| format!("Gaming tools check failed: {err}"))
 }
 
 fn validated_gaming_tool(flatpak_id: &str) -> Result<&'static gaming_tools::GamingTool, String> {

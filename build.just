@@ -30,6 +30,13 @@ build-base base_image=default_base_image kernel_flavor="fedora" enable_nvidia="0
         exit 1
     fi
 
+    # Surface base-pin drift: CI floats to the registry's current digest
+    # for the pinned tag while this build uses the recorded pin, so a
+    # stale pin silently splits the local and CI bases. Warn-only — the
+    # check must never fail a local build (an offline builder keeps the
+    # pin and is told the state is unknown).
+    ./build_files/scripts/check-base-pin-drift.sh || true
+
     resolve_version() {
         local query="$1"
         if [[ -x /run/host/usr/bin/distrobox-host-exec ]]; then
@@ -150,7 +157,7 @@ switch-local tag="latest":
     sudo bootc switch --transport containers-storage localhost/kyth:{{ tag }}
     echo
     echo "Staged. Reboot to apply: sudo systemctl reboot"
-    echo "To go back to the tracked channel later: sudo bootc switch ghcr.io/kyth-os/kyth:testing"
+    echo "To go back to the tracked channel later: sudo bootc switch ghcr.io/mrtrickdotorg/kyth:testing"
 
 # Build a QCOW2 virtual machine image
 [group('Build Virtual Machine Image')]

@@ -29,7 +29,7 @@ function detailsBlock(bootc: BootcSnapshot | null, kernel: string | null, guardi
 
 // "This PC > Feedback" — writes the report, attaches the same system
 // details the Hub already shows, sanitizes it at the Rust boundary, and hands
-// it to the browser as a prefilled kyth-os/kyth issue (see main.rs's
+// it to the browser as a prefilled mrtrickdotorg/kyth issue (see main.rs's
 // open_feedback_issue, which fixes the host and repo so only sanitized text
 // travels).
 export function FeedbackSection({ section }: { section: HubSection }) {
@@ -116,7 +116,7 @@ export function FeedbackSection({ section }: { section: HubSection }) {
 
       <div style={{ marginTop: 20, borderTop: "1px solid var(--hairline)", paddingTop: 16 }}>
         <p className="card-copy" style={{ fontSize: 12, margin: "0 0 12px" }}>
-          This opens a prefilled issue on github.com/kyth-os/kyth in your browser — nothing is sent until you post it
+          This opens a prefilled issue on github.com/mrtrickdotorg/kyth in your browser — nothing is sent until you post it
           there.
         </p>
         <ActionButton

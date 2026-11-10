@@ -33,13 +33,22 @@ Every publish produces **two** artifact sets per channel:
 
 | Kind | GitHub release tag | R2 ISO name | Mutability |
 | --- | --- | --- | --- |
-| Immutable | `iso-{testing,latest}-{release_id}` (e.g. `iso-testing-20260918-abcdef01-42-1`) | `kyth-live-{tag}-{release_id}.iso` | Never overwritten or deleted |
+| Immutable | `iso-{testing,latest}-{release_id}` (e.g. `iso-testing-20260918-abcdef01-42-1`) | `kyth-live-{tag}-{release_id}.iso` | Never overwritten in place; on R2, retention keeps only the newest 5 build sets per channel |
 | Channel pointer | `iso-testing` / `iso-latest` | `kyth-live-testing.iso` / `kyth-live-latest.iso` | Overwritten in place on every publish |
 
 The channel pointer is what users download. The immutable set is the
-audit trail and the rollback source. Container images follow the same
-model: per-version `image-{VERSION}` releases plus the moving
-`:latest` / `:testing` tags.
+audit trail and the rollback source — with one boundary: after every
+publish, R2 retention (`build_files/scripts/r2_retention.py`) keeps
+only the **newest 5 immutable build sets per channel** and deletes
+older ones, so a rollback target more than five builds back may no
+longer exist on R2. (The immutable GitHub releases are not purged.)
+Container images follow the same split: the build job publishes only
+immutable version tags — `ghcr.io/mrtrickdotorg/kyth:<version>`, where
+`<version>` is `<channel>.<yyyymmdd>.<run>.<attempt>.<sha8>` — plus an
+`image-<version-with-dashes>` changelog release per version. The moving `:latest` /
+`:testing` tags are promoted afterwards by the supply-chain publish
+job, digest-exact, only after the image is signed and its changelog
+release exists.
 
 ## Channel Rollback
 
@@ -67,6 +76,8 @@ gh release list --limit 30 --json tagName \
 ```
 
 Pick `BAD` (current) and `PREV` (the last known-good immutable tag).
+On R2, retention keeps only the newest 5 build sets per channel, so
+`PREV` must be within that window for step 3 to find its objects.
 
 2. Fetch the previous immutable ISO and verify it before promoting:
 
@@ -96,14 +107,16 @@ done
 ```
 
 4. Repoint the channel GitHub release at the previous immutable build.
-The channel release is delete-and-recreate by design (see
-`build_files/scripts/publish-release.py`); point it at the previous
-source commit and link the previous immutable release in the notes:
+The channel release is refreshed in place by design:
+`build_files/scripts/publish-release.py` converges via view → edit and
+never deletes it, so the moving tag never 404s mid-rollback. The
+supported path is to re-run the publish step with the previous build's
+artifacts, which refreshes the target, notes, and channel sidecar
+assets together. The manual minimum is the same edit by hand:
 
 ```bash
 PREV_SHA="$(gh release view "${PREV}" --json targetCommitish -q .targetCommitish)"
-gh release delete "iso-${TAG}" --yes
-gh release create "iso-${TAG}" --target "${PREV_SHA}" \
+gh release edit "iso-${TAG}" --target "${PREV_SHA}" \
   --title "Kyth Live ISO - ${TAG} (rollback to ${PREV})" \
   --notes "Channel rolled back to immutable release ${PREV}. See that release for the changelog, checksum, and signatures."
 ```
@@ -120,12 +133,19 @@ curl -fsSL -o /tmp/chan.iso-CHECKSUM "https://pub-9a3cc72972ea44c4ae7504ee7cda1f
 `R2_PUBLIC_BASE_URL` in `build_files/scripts/release_identity.py` —
 update it there, not in copies.)
 
-Container image rollback follows the same repoint logic: copy the
-previous immutable digest back onto the channel tag (e.g.
-`crane copy "ghcr.io/kyth-os/kyth@${PREV_DIGEST}" "ghcr.io/kyth-os/kyth:${TAG}"`),
+Container image rollback follows the same repoint logic: point the
+channel tag back at the previous verified digest, exactly as the
+supply-chain publish job promotes it — digest-exact, not a copy
+(e.g. `oras tag "ghcr.io/mrtrickdotorg/kyth@${PREV_DIGEST}" "${TAG}"`) —
 then verify with `cosign verify` and the pinned digest before
 announcing. The previous digest for an ISO release is recorded in its
-release notes as `Source image digest`.
+release notes as `Source image digest`; for an image release it is the
+`Image:` line of the last good `image-*` release body. Installed
+systems do not need to wait for either repoint: switch directly to the
+previous immutable ref (`sudo bootc switch
+ghcr.io/mrtrickdotorg/kyth:<previous-version>`, or the
+`@sha256:<digest>` ref), and use the boot menu / `bootc rollback` when
+a deployment merely fails to boot.
 
 ## Verifying a Download
 

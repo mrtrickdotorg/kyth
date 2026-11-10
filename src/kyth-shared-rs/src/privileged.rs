@@ -984,6 +984,47 @@ mod tests {
     }
 
     #[test]
+    fn share_path_corpus_matches_hub_verdicts() {
+        // tests/fixtures/share_path_corpus.json is the single corpus the
+        // Hub shell test (kyth-hub-web commands/privilege.rs) asserts
+        // too. The daemon verdict for a case is the conjunction of both
+        // daemon layers — this socket validator and the root executor
+        // (network_share::validate_request) — because either can refuse
+        // the request; both sides must reach the recorded verdict for
+        // every case.
+        use serde_json::Value;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/share_path_corpus.json");
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("corpus readable"))
+                .expect("corpus parses");
+        let base = document["base_payload"].clone();
+        for case in document["cases"].as_array().expect("corpus cases") {
+            let mut payload = base.clone();
+            payload["mount_point"] = case["mount_point"].clone();
+            payload["share_path"] = case["share_path"].clone();
+            let request = json!({
+                "operation": "network_share_add",
+                "payload": payload,
+            });
+            let socket_ok = validate_request(&request, 1001, 1002).is_ok();
+            let mut executor_payload = payload.clone();
+            executor_payload["uid"] = json!(1001);
+            executor_payload["gid"] = json!(1002);
+            let executor_ok =
+                crate::network_share::validate_request(&executor_payload, true).is_ok();
+            assert_eq!(
+                socket_ok && executor_ok,
+                case["valid"].as_bool().expect("corpus verdict"),
+                "corpus case {:?}: mount_point={:?} share_path={:?} (socket_ok={socket_ok}, executor_ok={executor_ok})",
+                case["case"],
+                case["mount_point"],
+                case["share_path"],
+            );
+        }
+    }
+
+    #[test]
     fn operation_without_input_gets_null_stdin_not_a_dead_pipe() {
         // `cat` with no input spec must fail fast (EOF on /dev/null),
         // not hang until the operation timeout.

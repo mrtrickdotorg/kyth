@@ -4,8 +4,46 @@ from __future__ import annotations
 import os
 import re
 import shutil
+from typing import Callable
 
-from .process import command_stdout
+from .process import command_stdout, run_command
+
+
+class ControllerProbeError(RuntimeError):
+    """A primary detection probe (lsusb/lsmod) could not run or failed.
+
+    Raised instead of returning an all-empty detection: the probe
+    framework records the controllers section as FAILED for a raised
+    error, while an all-empty result would be cached as a successful
+    "no controllers connected" verdict — the failure-disguised-as-empty
+    defect the Rust port (kyth-shared-rs system/controllers.rs) fixed
+    with its checked runner. This mirrors that contract.
+    """
+
+
+def command_stdout_checked(command: list[str], timeout: int = 5) -> str:
+    """Run a detection probe and return its stdout, or explain the failure."""
+    result = run_command(command, timeout=timeout)
+    name = command[0] if command else "command"
+    if result is None:
+        raise ControllerProbeError(f"could not run {name}")
+    if result.returncode == 0:
+        return result.stdout or ""
+    stderr = (result.stderr or "").strip()
+    if result.returncode > 0:
+        how = f"{name} failed (exit {result.returncode})"
+    else:
+        how = f"{name} was stopped before it finished"
+    if stderr:
+        raise ControllerProbeError(f"{how}: {stderr}")
+    raise ControllerProbeError(how)
+
+
+def command_stdout_best_effort(command: list[str], timeout: int = 5) -> str:
+    """Stdout for auxiliary probes whose output is informational text
+    rather than a detection verdict (the dualsensectl status blurb): a
+    failure there means "no blurb", never a wrong verdict."""
+    return command_stdout(command, timeout=timeout)
 
 _GAMING_VIDS = {
     "045e": "Xbox", "054c": "PlayStation", "057e": "Nintendo",
@@ -17,10 +55,23 @@ _DUALSENSE_PIDS = {"0ce6", "0df2"}
 _DS4_PIDS = {"05c4", "09cc", "0ba0"}
 
 
-def detect_controllers() -> dict:
-    """Return connected controller and driver state without UI dependencies."""
-    usb_text = command_stdout(["lsusb"], timeout=6)
-    lsmod_text = command_stdout(["lsmod"], timeout=4)
+def detect_controllers(
+    runner: Callable[[list[str], int], str] | None = None,
+) -> dict:
+    """Return connected controller and driver state without UI dependencies.
+
+    Fallible: when a primary probe (lsusb/lsmod) cannot run or exits
+    non-zero, the detection did not happen and ControllerProbeError is
+    raised — never a dict whose empty fields impersonate "nothing
+    connected". Genuinely-absent things stay non-errors: a missing
+    /dev/input/by-id directory or efivars tree just yields empty/false
+    fields, and the dualsensectl status blurb is best-effort. The
+    runner is injectable so the contract is testable without real
+    system commands (mirrors the Rust detect_controllers_with).
+    """
+    run = runner if runner is not None else command_stdout_checked
+    usb_text = run(["lsusb"], 6)
+    lsmod_text = run(["lsmod"], 4)
     usb_controllers: list[tuple[str, str]] = []
     xone_dongle = dualsense_found = ds4_found = switch_pro_found = False
 
@@ -56,7 +107,7 @@ def detect_controllers() -> dict:
 
     dualsensectl_out = ""
     if dualsense_found and shutil.which("dualsensectl"):
-        dualsensectl_out = command_stdout(["dualsensectl", "status", "0"], timeout=3)
+        dualsensectl_out = command_stdout_best_effort(["dualsensectl", "status", "0"], timeout=3)
 
     secure_boot = False
     try:

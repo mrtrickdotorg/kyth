@@ -1,6 +1,6 @@
 [Unit]
 Description=Kyth allowlisted privileged action service
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 After=local-fs.target
 StartLimitIntervalSec=60
 StartLimitBurst=3

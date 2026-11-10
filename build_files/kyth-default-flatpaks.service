@@ -1,6 +1,6 @@
 [Unit]
 Description=Install default Flatpak applications (Steam first boot; rest on-demand from Hub)
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 # Wants= (not After=): this unit skips offline via the binary's own soft-fail
 # below, so it must not block on network-online.target — without wait-online
 # that target is instant anyway (see item 8), and with it this unit would

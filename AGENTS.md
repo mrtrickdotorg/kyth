@@ -119,7 +119,7 @@ Fedora Kinoite base
   plus a documented manual recovery path where hardware can't be automated.
 
 ```bash
-sudo bootc switch ghcr.io/kyth-os/kyth:testing
+sudo bootc switch ghcr.io/mrtrickdotorg/kyth:testing
 sudo bootc upgrade
 ```
 
@@ -143,7 +143,7 @@ docs/                   # architecture, security, hardware, validation docs
   (BORE, sched-ext, BBRv3, NTSYNC); Mesa-git via `xxmitsu/mesa-git` COPR.
 - SELinux enforcing (bootc/ostree relabels on every deployment).
 - Live ISOs on Cloudflare R2: `kyth-live-latest.iso` / `kyth-live-testing.iso`.
-- GitHub: https://github.com/kyth-os/kyth
+- GitHub: https://github.com/mrtrickdotorg/kyth
 
 ## Dev rules
 

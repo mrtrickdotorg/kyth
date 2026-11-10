@@ -1,9 +1,17 @@
 [Unit]
 Description=KythOS intelligent update watcher (oneshot)
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 After=network-online.target
 Wants=network-online.target
-ConditionACPower=true
+# Deliberately NOT gated on ConditionACPower: this oneshot is both the
+# update check and the staging run, and every exit path writes the update
+# snapshot the Hub reads. With an AC condition, a laptop used on battery
+# skipped the unit entirely, so no snapshot was ever written and the Hub
+# showed stale update state indefinitely. The check half (registry
+# manifest + bootc status) is cheap, so it now always runs. Tradeoff:
+# staging (bootc upgrade) can also start on battery — bounded by the
+# watcher's own skip gates (quiet hours, gaming, metered connection) and
+# the timer's 6h cadence, and preferable to never checking at all.
 
 [Service]
 Type=oneshot

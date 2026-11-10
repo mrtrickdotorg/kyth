@@ -11,8 +11,9 @@ not break the live ISO boot path.
 | `main` | Stable channel — maps to `:latest` image and `iso-latest` |
 | `testing` | Development — maps to `:testing` image and `iso-testing` |
 
-Open PRs against `testing`. After validation on real hardware, tested changes
-merge to `main`.
+KythOS does **not** use pull requests. Commit directly on `testing` and
+`git push origin testing` (see `AGENTS.md` — that rule overrides any
+generic PR workflow). Promotion to `main` is a human step after CI.
 
 ## Local Build
 
@@ -61,7 +62,7 @@ ENABLE_VIRTUALIZATION_HOST=1 just build
 ENABLE_KSM=1 just build
 ```
 
-## What Makes a Good PR
+## What Makes a Good Change
 
 - **Packages**: justify why it belongs in a base OS image, not a Flatpak
 - **COPRs**: link to the COPR, explain the update cadence, note if it's a
@@ -73,17 +74,17 @@ ENABLE_KSM=1 just build
   warnings before pushing, not after CI goes red.
 - **Python**: must pass `run-quality.sh` (ruff per `ruff.toml`, the
   coverage-instrumented suite, and the critical-coverage floor) plus
-  `python3 -m unittest discover -s tests`; CodeQL runs on every PR for
-  security issues. On PRs CI runs quality changed-only; on push to
-  `main`/`testing` it runs the full suite.
+  `python3 -m unittest discover -s tests`; CodeQL runs on push for
+  security issues, and CI runs the full suite on push to
+  `main`/`testing`.
 - **Dockerfiles**: must pass `hadolint --failure-threshold error`
 - **Tests**: major behavior changes must add or update automated tests. If a
   change cannot be tested automatically, explain why and include the manual
   validation performed.
 - **Breaking changes to the installer or upgrade path**: describe the impact in
-  the PR body; include a note if users need to reinstall vs. `bootc upgrade`
-- **Contribution authority**: by opening a PR, you assert that you have the
-  right to contribute the work under the project license. Use
+  the commit message; include a note if users need to reinstall vs. `bootc upgrade`
+- **Contribution authority**: by contributing a change, you assert that you
+  have the right to contribute the work under the project license. Use
   `Signed-off-by` / DCO-style commits when requested by the maintainer.
 
 ## Review Expectations
@@ -93,13 +94,13 @@ security boundaries, maintainability, and whether the change belongs in the base
 image. Workflow, installer, privileged-helper, release, and credential-handling
 changes require extra scrutiny.
 
-Before merge, maintainers should confirm that relevant validation passed, major
-new behavior has tests or a documented test rationale, and the PR explains any
-manual hardware or live ISO validation.
+Before promotion to `main`, maintainers should confirm that relevant validation
+passed, major new behavior has tests or a documented test rationale, and the
+commit explains any manual hardware or live ISO validation.
 
 ## CI Checks
 
-All PRs run the **Validation** workflow (5 jobs):
+Every push to `main`/`testing` runs the **Validation** workflow (5 jobs):
 
 - **validation** — actionlint, zizmor (auditor, medium+), hadolint, and the
   full `validate.sh` suite (shellcheck at `--severity=warning`, Python
@@ -107,7 +108,7 @@ All PRs run the **Validation** workflow (5 jobs):
   budgets, gaming hash gate, full unit tests)
 - **quality (coverage and lint)** — `run-quality.sh`: ruff, blind-except
   audit, coverage-instrumented suite plus the critical-coverage floor;
-  changed-only on PRs, full on push. Uploads the coverage report.
+  full on push. Uploads the coverage report.
 - **hub-shell / installer-shell** — frontend + Tauri shell builds
 - **rust** — clippy (advisory while the warning burn-down is in progress)
   plus `cargo test --locked`
@@ -118,9 +119,8 @@ are pinned — validators in `validation.yml` via
 workflows. **CodeQL** runs static analysis on Python in parallel and does
 not block image builds.
 
-The build, supply-chain, CVE-scan, and live-ISO workflows run on merge to
-`main`/`testing` (or on their dispatch chain), not on PRs, to avoid burning
-CI minutes on draft work.
+The build, supply-chain, CVE-scan, and live-ISO workflows run on push to
+`main`/`testing` (or on their dispatch chain).
 
 ## Pre-push Gate
 
@@ -133,7 +133,7 @@ With hooks installed (`just install-git-hooks`), every push runs:
 
 Set `KYTH_ALLOW_HEAVY_PRE_PUSH=1` to also run the full validation suite
 and the Hub headless smoke test. `KYTH_SKIP_PRE_PUSH_VALIDATION=1`
-bypasses the gate (emergencies only — CI still gates merge).
+bypasses the gate (emergencies only — CI still gates promotion).
 
 ## Reporting Bugs
 

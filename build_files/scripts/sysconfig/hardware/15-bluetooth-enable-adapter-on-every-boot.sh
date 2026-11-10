@@ -53,7 +53,7 @@ install -d -m 0755 /usr/libexec
 write_config /usr/lib/systemd/system/kyth-bluetooth-enable.service <<'BTENABLEUNITEOF'
 [Unit]
 Description=Enable Bluetooth adapters at boot (unless user-blocked)
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 After=bluetooth.service systemd-rfkill.service
 Wants=bluetooth.service
 

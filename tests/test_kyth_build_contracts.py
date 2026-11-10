@@ -215,7 +215,7 @@ class BuildAssemblyContracts(unittest.TestCase):
     def test_migration_owner_build_contract(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
-        self.assertRegex(dockerfile, r"(?m)^ARG IMAGE_OWNER=kyth-os$")
+        self.assertRegex(dockerfile, r"(?m)^ARG IMAGE_OWNER=mrtrickdotorg$")
         self.assertIn('"https://github.com/${IMAGE_OWNER}/kyth"', dockerfile)
         self.assertIn("case \"${IMAGE_OWNER}\" in", dockerfile)
         self.assertIn('mrtrickdotorg)', dockerfile)
@@ -667,10 +667,18 @@ class BuildAssemblyContracts(unittest.TestCase):
         # A trailing `; if ...; fi` once masked build.sh's exit code: the
         # layer committed a half-built payload (cosign gate failed, so
         # /boot/efi and iso.yaml were never written) that died later in
-        # Titanoboa. build.sh must fail the RUN when IT fails.
+        # Titanoboa. build.sh must fail the RUN when IT fails, so it is the
+        # RUN's final command: the Calamares config copy that used to be
+        # chained after it was removed with the dormant Calamares path, and
+        # nothing may be chained or appended after build.sh again.
         containerfile = (ROOT / "installer" / "Containerfile").read_text(encoding="utf-8")
-        self.assertIn("bash /src/installer/build.sh &&", containerfile)
+        self.assertTrue(
+            containerfile.rstrip().endswith("bash /src/installer/build.sh"),
+            "installer payload RUN must end with build.sh so its exit code "
+            "fails the layer",
+        )
         self.assertNotIn("bash /src/installer/build.sh;", containerfile)
+        self.assertNotIn("bash /src/installer/build.sh &&", containerfile)
 
     def test_cosign_gate_retries_transients_but_stays_hard(self):
         # Shared-runner network flakes (TUF root refresh, registry reads)

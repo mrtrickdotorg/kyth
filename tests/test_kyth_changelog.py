@@ -351,6 +351,39 @@ class PreviousImageReleaseTests(unittest.TestCase):
         )
         self.assertEqual(digest, cachy)
 
+    def test_selects_baseline_from_canonical_org_body(self):
+        # Post-move release bodies record the image as
+        # ghcr.io/mrtrickdotorg/kyth; the pre-move-only pattern matched
+        # none of them and silently dropped every baseline.
+        older = "sha256:" + "a" * 64
+        newer = "sha256:" + "b" * 64
+        releases = [
+            {"tag_name": "image-testing-20261013-2755-1-9681d007", "draft": False, "prerelease": True,
+             "body": f"Image: `ghcr.io/mrtrickdotorg/kyth@{newer}`"},
+            {"tag_name": "image-testing-20261013-2754-1-9681d007", "draft": False, "prerelease": True,
+             "body": f"Image: `ghcr.io/mrtrickdotorg/kyth@{older}`"},
+        ]
+        digest = changelog.previous_image_release_digest(
+            releases, "testing", "testing.20261013.2754.2.9681d007"
+        )
+        self.assertEqual(digest, older)
+
+    def test_mixed_org_bodies_pick_the_newest_older_release(self):
+        # The baseline right after the org move has a kyth-os body while
+        # later ones use mrtrickdotorg; both owners parse, newest wins.
+        legacy = "sha256:" + "a" * 64
+        canonical = "sha256:" + "b" * 64
+        releases = [
+            {"tag_name": "image-testing-20261013-2754-1-9681d007", "draft": False, "prerelease": True,
+             "body": f"Image: `ghcr.io/kyth-os/kyth@{legacy}`"},
+            {"tag_name": "image-testing-20261013-2755-1-9681d007", "draft": False, "prerelease": True,
+             "body": f"Image: `ghcr.io/mrtrickdotorg/kyth@{canonical}`"},
+        ]
+        digest = changelog.previous_image_release_digest(
+            releases, "testing", "testing.20261013.2755.2.9681d007"
+        )
+        self.assertEqual(digest, canonical)
+
     def test_ignores_drafts_wrong_channels_and_invalid_digests(self):
         releases = [
             {"tag_name": "image-testing-20261012-2736-1-27a537a0", "draft": True, "prerelease": True,

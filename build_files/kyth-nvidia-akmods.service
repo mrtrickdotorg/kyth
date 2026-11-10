@@ -1,6 +1,6 @@
 [Unit]
 Description=KythOS deferred NVIDIA akmods kernel-module build
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 # P11: the slow `akmods --force` module build (5-15 min) was blocking the
 # boot-time hardware-policy run. The fast policy (kernel args, service
 # enables) now applies in kyth-hw-setup.service, which leaves

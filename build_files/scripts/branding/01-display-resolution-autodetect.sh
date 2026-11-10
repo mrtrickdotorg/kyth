@@ -27,9 +27,9 @@ VERSION="45"
 VERSION_ID="45"
 ANSI_COLOR="0;34"
 LOGO=kyth
-HOME_URL="https://github.com/kyth-os/kyth"
-SUPPORT_URL="https://github.com/kyth-os/kyth/discussions"
-BUG_REPORT_URL="https://github.com/kyth-os/kyth/issues"
+HOME_URL="https://github.com/mrtrickdotorg/kyth"
+SUPPORT_URL="https://github.com/mrtrickdotorg/kyth/discussions"
+BUG_REPORT_URL="https://github.com/mrtrickdotorg/kyth/issues"
 EOF
 }
 

@@ -30,6 +30,7 @@ import {
   type SteamPlayStatus,
   type LauncherEntry,
   type GamingTool,
+  type GamingToolsResult,
   type GamingPerfStatus,
   type ScxStatus,
 } from "../services/liveData";
@@ -43,24 +44,25 @@ const gamingBtnStyle = { padding: "6px 12px", borderRadius: 999, border: "1px so
 // Install/launch/uninstall grid for the curated Flatpak gaming tools.
 // Mirrors page_gaming_tools_grid.py's GAMING_TOOLS tiles.
 function GamingToolGrid({ busy, run, runCancel }: { busy: string | null; run: SectionRun; runCancel: SectionRun }) {
-  const [tools, setTools] = useState<GamingTool[] | null>(null);
+  const [result, setResult] = useState<GamingToolsResult | null>(null);
   const [toolsLoaded, setToolsLoaded] = useState(false);
+  const tools: GamingTool[] | null = result?.tools ?? null;
 
   useEffect(() => {
     let cancelled = false;
-    fetchGamingTools().then((value) => { if (!cancelled) { setTools(value); setToolsLoaded(true); } });
+    fetchGamingTools().then((value) => { if (!cancelled) { setResult(value); setToolsLoaded(true); } });
     return () => { cancelled = true; };
   }, []);
 
   async function load(): Promise<void> {
     const value = await fetchGamingTools();
-    setTools(value);
+    setResult(value);
     setToolsLoaded(true);
   }
 
   async function refresh(): Promise<void> {
     const fresh = await fetchGamingTools();
-    if (fresh) setTools(fresh);
+    if (fresh) setResult(fresh);
   }
 
   if (!tools) {
@@ -80,6 +82,7 @@ function GamingToolGrid({ busy, run, runCancel }: { busy: string | null; run: Se
       <p className="card-copy" style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.6 }}>Gaming tools</p>
       {tools.length === 0 && <p className="card-copy" style={{ fontSize: 12, marginTop: 4 }}>The tool catalog did not load — use Refresh below to retry.</p>}
       <p className="card-copy" style={{ fontSize: 12, marginTop: 4 }}>Install, launch, or remove launchers and capture tools — status stays live as you go.</p>
+      {result && result.scanFailedScopes.length > 0 && <p className="card-copy" style={{ fontSize: 12, marginTop: 4 }}>Some app sources couldn&apos;t be scanned ({result.scanFailedScopes.join(", ")}), so a tool shown as “not installed” may actually be installed.</p>}
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
         {tools.map((tool) => (
           <div key={tool.flatpak} style={{ padding: "10px 12px", border: "1px solid var(--hairline)", borderRadius: 10 }}>

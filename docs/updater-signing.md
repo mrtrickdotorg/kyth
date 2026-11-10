@@ -22,9 +22,12 @@ digest)` tuple. An updater installs a version only when:
 
 1. the manifest's OpenPGP signature verifies against the KythOS signing
    primary key baked into the image, **and**
-2. the manifest approves the exact version and artifact being installed,
+2. the manifest is not a replay: its `issued` timestamp is at least the
+   newest `issued` that updater has ever accepted (see *Replay
+   protection*), **and**
+3. the manifest approves the exact version and artifact being installed,
    **and**
-3. the downloaded artifact hashes to the digest the signed manifest
+4. the downloaded artifact hashes to the digest the signed manifest
    pinned — *in addition to* the existing upstream checksum verification,
    which still runs unchanged.
 
@@ -70,6 +73,13 @@ signing certificate `kyth-updater-keys.asc`.
 
 - `schema` — only `1` is understood by current builds. An unknown schema
   is refused, never half-interpreted.
+- `issued` — **required**: an RFC 3339 UTC timestamp
+  (`2026-10-19T00:00:00Z`) set by the generator when the manifest is
+  produced. It is the manifest's publication sequence: it must strictly
+  increase across publications, and clients refuse a manifest whose
+  `issued` is older than the newest they have already accepted (see
+  *Replay protection*). A manifest with a missing or unparseable
+  `issued` is refused.
 - `updates[]` — exactly one entry must match the `(component, version,
   artifact)` being installed. Zero matches means "not approved";
   duplicates mean the manifest is ambiguous. Both refuse the install.
@@ -112,6 +122,65 @@ subkeys exist (see *Rotation*). Dropping a subkey from the published
 certificate retires it, because signatures are only checked against keys
 the published, anchor-matching certificate actually carries.
 
+## Replay protection
+
+A valid signature proves a manifest is genuine, not that it is
+current. An old manifest stays validly signed forever, and it approves
+old (component, version, digest) tuples whose checksums still verify —
+so anything that can serve a client a stale copy of the manifest set
+(a compromised or poisoned mirror/cache of the release bucket, a
+replayed response) could otherwise roll clients back to a vulnerable
+rclone or GE-Proton release without breaking any signature.
+
+The bound is a **floor** on the manifest's signed `issued` timestamp:
+
+- Each updater keeps a small state file recording the `issued` of the
+  newest manifest it has ever accepted, as unix seconds:
+  `/var/lib/kyth/proton-cachyos/updater-manifest-floor` for GE-Proton
+  (inside its unit's `StateDirectory`) and
+  `/var/lib/kyth/rclone-update/updater-manifest-floor` for rclone. The
+  path can be overridden with `KYTH_UPDATER_FLOOR_PATH`.
+- A verified manifest issued *older* than the floor is refused as a
+  replay. One issued *equal* to the floor is the same manifest
+  re-checked — accepted, and nothing is rewritten. A *newer* one is
+  accepted and the floor is advanced (atomically: temp file, fsync,
+  rename) **before** the manifest is allowed to approve anything, so
+  once a system has seen a newer signed manifest, older ones are dead
+  even if the newer one did not approve the version being resolved.
+- First run (no floor file): the verified manifest is accepted and
+  sets the floor.
+- No state is shared between the two updaters, and none is needed:
+  each updater only ever approves its own component, so a per-updater
+  floor gives each component the full guarantee.
+- The comparison never involves the client's wall clock — client
+  clocks are untrusted. The only clock in the design is the
+  generator's, at publication time, and ordering is all it is trusted
+  for. (A wall-clock *freshness* window was deliberately not used: it
+  would refuse legitimate manifests on machines with skewed clocks
+  while adding nothing over the floor.)
+- The generator keeps the sequence honest: before writing a new
+  manifest it reads the currently published one (best effort) and, if
+  its own clock is not ahead of the published `issued`, bumps the new
+  `issued` to one second past it and prints a warning. A skewed
+  generator clock therefore cannot produce a manifest every updated
+  client would refuse.
+
+**Rollbacks still work.** The floor binds the *manifest*, not the
+approved versions: rolling back means generating and signing a fresh
+manifest (new `issued`) whose entry points at the last good version,
+exactly as the release flow below describes. That manifest is newer
+than the floor and is accepted; the old manifest it replaces can never
+be replayed again.
+
+**Corrupt floor state fails closed.** The floor file is written
+atomically, so corruption should not happen; if the file exists but
+does not contain a single unix timestamp, the updater refuses rather
+than silently dropping replay protection, and the error names the
+recovery: delete the floor file and re-run — the next validly signed
+manifest is accepted and records a fresh floor. Deleting the file is
+an operator's deliberate re-baseline (it requires root, like the state
+itself), never something the updater does on its own.
+
 ## Trust anchor and the placeholder state
 
 The trust anchor is `/usr/share/kyth/updater-signing-keys.asc` on
@@ -135,7 +204,8 @@ unit and manual `ujust update-proton-cachyos` runs remain available.
 
 Verification inputs can be overridden by environment for testing and
 recovery: `KYTH_UPDATER_KEYRING_PATH`, `KYTH_UPDATER_MANIFEST_URL`,
-`KYTH_UPDATER_MANIFEST_SIGNATURE_URL`, `KYTH_UPDATER_KEYS_URL`.
+`KYTH_UPDATER_MANIFEST_SIGNATURE_URL`, `KYTH_UPDATER_KEYS_URL`,
+`KYTH_UPDATER_FLOOR_PATH`.
 
 ## Where the gate hooks in
 
@@ -182,7 +252,9 @@ agent ever handles this key material.
    It resolves the current rclone and GE-Proton releases and their
    digests and writes `kyth-updater-manifest.json`. It never signs
    anything. (`GITHUB_TOKEN` in the environment avoids GitHub API rate
-   limits.)
+   limits.) Its `issued` is kept strictly ahead of the currently
+   published manifest's (see *Replay protection*), so generate on a
+   machine whose clock is roughly right.
 2. On the key owner's hardware, review the manifest, then sign it
    offline with the signing subkey:
    `gpg --armor --detach-sign --output kyth-updater-manifest.json.asc kyth-updater-manifest.json`
@@ -194,7 +266,9 @@ agent ever handles this key material.
 
 To roll back a signed-but-bad update, generate and sign a manifest whose
 entry points back at the last good version and publish it the same way —
-no emergency key handling.
+no emergency key handling. The rollback manifest is freshly issued, so
+it passes every client's replay floor; the bad manifest it replaces can
+never be replayed afterwards.
 
 ## Rotation
 
@@ -231,6 +305,10 @@ update needed:
 | Certificate self-signatures broken | Refuse |
 | Signature invalid or over different bytes | Refuse |
 | Manifest schema unknown | Refuse |
+| Manifest `issued` missing or unparseable | Refuse |
+| Manifest issued older than the updater's recorded floor | Refuse (replayed or rolled-back manifest) |
+| Floor state corrupt | Refuse; error names the recovery (delete the floor file to re-baseline) |
+| Floor state cannot be recorded | Refuse (accepting without recording would drop replay protection) |
 | No entry approves the resolved version/artifact | Refuse |
 | Entry lacks the needed digest, or digest malformed | Refuse |
 | Artifact digest ≠ manifest-pinned digest | Refuse (after upstream checksum still passes) |

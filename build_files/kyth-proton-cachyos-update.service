@@ -1,6 +1,6 @@
 [Unit]
 Description=Update Proton-CachyOS compatibility layer
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 After=network-online.target
 
 [Service]

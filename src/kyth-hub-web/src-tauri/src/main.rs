@@ -1471,10 +1471,14 @@ async fn pci_devices_by_class(class: String) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn controllers_detect() -> ControllersDetectResponse {
+async fn controllers_detect() -> Result<ControllersDetectResponse, String> {
+    // Fallible like loaded_kernel_modules: a failed probe (broken lsusb /
+    // lsmod, or a panicked probe task) used to read as an all-empty
+    // detection — "no controllers, no drivers" — for a read that never
+    // happened. The frontend maps a rejection to its "detection failed"
+    // state instead.
     tauri::async_runtime::spawn_blocking(|| {
-        let d = kyth_shared::system::controllers::detect_controllers();
-        ControllersDetectResponse {
+        kyth_shared::system::controllers::detect_controllers().map(|d| ControllersDetectResponse {
             usb_controllers: d.usb_controllers,
             input_nodes: d.input_nodes,
             xone_dongle: d.xone_dongle,
@@ -1482,18 +1486,10 @@ async fn controllers_detect() -> ControllersDetectResponse {
             xpadneo_loaded: d.xpadneo_loaded,
             hid_ps_loaded: d.hid_ps_loaded,
             dualsense_found: d.dualsense_found,
-        }
+        })
     })
     .await
-    .unwrap_or(ControllersDetectResponse {
-        usb_controllers: Vec::new(),
-        input_nodes: Vec::new(),
-        xone_dongle: false,
-        xone_loaded: false,
-        xpadneo_loaded: false,
-        hid_ps_loaded: false,
-        dualsense_found: false,
-    })
+    .map_err(|error| format!("Could not detect controllers: {error}"))?
 }
 #[derive(serde::Serialize)]
 struct ControllersDetectResponse {
@@ -2141,7 +2137,7 @@ async fn desktop_stack_checks(
         .map_err(|error| format!("Could not run the desktop stack checks: {error}"))
 }
 
-/// Opens a prefilled `kyth-os/kyth` issue in the user's browser — the
+/// Opens a prefilled `mrtrickdotorg/kyth` issue in the user's browser — the
 /// Feedback section's actual send path. Host and repo are fixed here
 /// rather than passed in; only the title and body travel from the
 /// frontend, and both are percent-encoded before they reach `xdg-open`,
@@ -2152,7 +2148,7 @@ fn open_feedback_issue(title: String, body: String) -> Result<String, String> {
     // future caller bypasses the retired Python Feedback page's scrub step.
     let body = kyth_shared::diagnostics_scrub::scrub_logs(&body);
     let url = kyth_shared::diagnostic_report::github_issue_url(
-        "https://github.com/kyth-os/kyth",
+        "https://github.com/mrtrickdotorg/kyth",
         &title,
         &body,
         None,

@@ -160,6 +160,26 @@ fn share_text<'a>(
     Ok(value)
 }
 
+/// Mirror of the daemon's mount-point normalization (kyth-shared
+/// `privileged::normalize_mount_point`): `.` and empty segments
+/// collapse, `..` is rejected rather than popped — popping silently
+/// rewrote `/mnt/../home/user/share` into a different prefix.
+fn normalize_share_mount_point(value: &str) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for part in value.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err("invalid mount_point".to_string()),
+            part => parts.push(part),
+        }
+    }
+    Ok(if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    })
+}
+
 fn validate_network_share(payload: &PrivilegedPayload, adding: bool) -> Result<(), String> {
     let name = share_text(payload, "name", false, 64)?;
     if !name
@@ -169,6 +189,14 @@ fn validate_network_share(payload: &PrivilegedPayload, adding: bool) -> Result<(
         return Err("invalid share name".to_string());
     }
     let mount_point = share_text(payload, "mount_point", false, 4096)?;
+    // Judge the path the daemon judges: both daemon layers normalize
+    // first (`.`/empty segments collapse, `..` fails closed) and only
+    // then apply the prefix allowlist. Checking the raw string let
+    // shapes like `/mnt/.` pass here — it starts with an approved
+    // prefix — while the daemon refused the normalized `/mnt`. The
+    // daemon's rules are authoritative; this precheck mirrors them so
+    // the Hub never approves a share the daemon then refuses.
+    let mount_point = normalize_share_mount_point(mount_point)?;
     // L1: /home/ removed from approved prefixes. Mounting over an existing
     // user directory (e.g. /home/user/Documents) hides the user's real
     // files — a local DoS/confusion primitive.
@@ -176,8 +204,6 @@ fn validate_network_share(payload: &PrivilegedPayload, adding: bool) -> Result<(
     if !approved_mount
         .iter()
         .any(|prefix| mount_point.starts_with(prefix))
-        || mount_point.contains("//")
-        || mount_point.split('/').any(|part| part == "..")
         || !mount_point.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b' ' | b'-')
         })
@@ -195,10 +221,21 @@ fn validate_network_share(payload: &PrivilegedPayload, adding: bool) -> Result<(
         return Err("invalid share server".to_string());
     }
     let share_path = share_text(payload, "share_path", false, 4096)?;
-    if share_path.starts_with('.')
-        || share_path.contains("//")
-        || share_path.contains('%')
-        || share_path.split('/').any(|part| part == "..")
+    // Mirror the root executor's validate_share_path (network_share.rs),
+    // the final authority: it trims leading slashes before judging, so a
+    // path of only slashes is empty there and `/.hidden` is a dotfile;
+    // it also rejects `\` (a systemd line-continuation in the unit files
+    // the executor writes) and `"` outright, and its length cap counts
+    // bytes, not chars (share_text above counts chars).
+    let trimmed_share_path = share_path.trim_start_matches('/');
+    if share_path.len() > 4096
+        || trimmed_share_path.is_empty()
+        || trimmed_share_path.starts_with('.')
+        || trimmed_share_path.contains("//")
+        || trimmed_share_path.contains('%')
+        || trimmed_share_path.contains('\\')
+        || trimmed_share_path.contains('"')
+        || trimmed_share_path.split('/').any(|part| part == "..")
     {
         return Err("invalid share_path".to_string());
     }
@@ -642,6 +679,35 @@ mod tests {
         assert!(
             validated_request("network_share_add", &payload(json!({"name":"bad/name"}))).is_err()
         );
+    }
+
+    #[test]
+    fn network_share_corpus_matches_daemon_verdicts() {
+        // tests/fixtures/share_path_corpus.json is the single corpus the
+        // daemon-side test (kyth-shared privileged.rs) asserts too: the
+        // Hub precheck and the daemon pipeline must reach the recorded
+        // verdict for every case, so the Hub can never approve a share
+        // the daemon then refuses.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/share_path_corpus.json");
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("corpus readable"))
+                .expect("corpus parses");
+        let base = document["base_payload"].clone();
+        for case in document["cases"].as_array().expect("corpus cases") {
+            let mut value = base.clone();
+            value["mount_point"] = case["mount_point"].clone();
+            value["share_path"] = case["share_path"].clone();
+            let accepted = validated_request("network_share_add", &payload(value)).is_ok();
+            assert_eq!(
+                accepted,
+                case["valid"].as_bool().expect("corpus verdict"),
+                "corpus case {:?}: mount_point={:?} share_path={:?}",
+                case["case"],
+                case["mount_point"],
+                case["share_path"],
+            );
+        }
     }
 
     #[test]

@@ -105,6 +105,12 @@ fn remote_ls_updates_argv(scope: &str) -> Vec<String> {
 /// Return the pending Flatpak count. An explicit Updates-page check bypasses
 /// the shared probe cache so a fresh registry result is not paired with stale
 /// package-manager data.
+///
+/// The count is -1 when no installation scope could be read at all
+/// (unknown), with the failure in the detail string; a successful read of
+/// every scope yields the real count, and a partial read yields the count
+/// from the scopes that answered plus a "could not be checked for every
+/// installation" detail.
 pub fn flatpak_updates_count(use_cached: bool) -> (i32, String) {
     if use_cached {
         return cached_flatpak_count();
@@ -166,8 +172,14 @@ fn flatpak_scope_result(total: i32, successful_scope: bool, errors: &[String]) -
         };
         (total.max(0), detail)
     } else {
+        // No scope could be read at all: the count is UNKNOWN, encoded
+        // -1 like the pending-updates summary's "unknown" convention —
+        // never 0, which callers render as "no app updates pending" for
+        // a check that never ran. Every consumer of the count either
+        // clamps with `.max(0)` (availability view, update completion)
+        // or maps the negative to "unknown" (the summary).
         (
-            0,
+            -1,
             errors
                 .first()
                 .map(|detail| crate::system::process::redact_sensitive_text(detail))
@@ -391,6 +403,21 @@ mod tests {
             detail,
             "Flatpak update status could not be checked for every installation."
         );
+    }
+
+    #[test]
+    fn total_flatpak_scope_failure_is_unknown_not_zero() {
+        // Both installations unreadable: the count must say "unknown"
+        // (-1), never 0 — 0 is the successful "no updates pending"
+        // answer and would disguise the failed check as a clean one.
+        let (count, detail) =
+            flatpak_scope_result(0, false, &["could not connect to flatpak".to_string()]);
+        assert_eq!(count, -1);
+        assert_eq!(detail, "could not connect to flatpak");
+        // No error text at all still reports unknown with a fallback note.
+        let (count, detail) = flatpak_scope_result(0, false, &[]);
+        assert_eq!(count, -1);
+        assert_eq!(detail, "Flatpak update check unavailable.");
     }
 
     #[test]

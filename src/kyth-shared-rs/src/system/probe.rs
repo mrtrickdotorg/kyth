@@ -564,8 +564,14 @@ pub fn collect_snapshot_streaming(
             handles.push(scope.spawn(|| {
                 vec![(
                     "controllers-detect".to_string(),
-                    serde_json::to_value(crate::system::controllers::detect_controllers())
-                        .unwrap_or(Value::Null),
+                    // A failed probe (broken lsusb/lsmod) must not be
+                    // cached as an all-empty detection the Hub would read
+                    // as "no controllers connected": a null section is
+                    // this cache's "couldn't collect" state.
+                    match crate::system::controllers::detect_controllers() {
+                        Ok(detected) => serde_json::to_value(detected).unwrap_or(Value::Null),
+                        Err(_) => Value::Null,
+                    },
                 )]
             }));
         }

@@ -179,9 +179,12 @@ Before the native cutover, the original plan required:
 - The native Rust daemon owns the Unix socket and all packaged installer
   operations. It does not proxy to the Python implementation; Python remains
   available only for source-level parity fixtures.
-- Calamares remains an optional, separately scoped build path until a release
-  owner decides whether to retire it; it is not part of the 15-item Rust
-  backend migration ledger.
+- Calamares is retired (2026-11-09). The optional, separately scoped build
+  path was never enabled — no build ever passed `CALAMARES=1`, and the
+  calamares package was never installed in the image — so its configs, the
+  Containerfile gate, and the installer-hash input were removed. The native
+  daemon/WebUI flow is the only installer; it was never part of the 15-item
+  Rust backend migration ledger.
 - The logical SSE contract is preserved over the Unix-socket HTTP framing so
   reconnect, event IDs, cancellation, and terminal state remain compatible.
 
@@ -434,7 +437,9 @@ this ledger and remains a release gate.
 - **Done:** Switch the live image to the native launcher and Rust daemon.
 - **Done:** Remove the Python backend package and Chromium/Python UI launcher
   from the supported image after code-level parity coverage.
-- Reassess whether Calamares remains an optional fallback or can be retired.
+- **Done:** Retire Calamares. The reassessment found the optional fallback
+  was dormant (never enabled by any build, binary never installed), and it
+  was removed on 2026-11-09.
 
 ## Historical implementation starting point (complete)
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=KythOS automatic sched-ext profile switcher
-Documentation=https://github.com/kyth-os/kyth
+Documentation=https://github.com/mrtrickdotorg/kyth
 After=graphical-session.target
 PartOf=graphical-session.target
 # No Wants=/After= on the system scx_loader.service: this is a user unit and
