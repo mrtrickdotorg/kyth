@@ -169,8 +169,7 @@ prep_with_qemu_nbd() {
 	qemu-nbd --connect="${NBD_DEVICE}" "${DISK}"
 	# Wait for the partition devices to settle.
 	local part1="${NBD_DEVICE}p1" part2="${NBD_DEVICE}p2"
-	local attempt
-	for attempt in $(seq 1 20); do
+	for _ in $(seq 1 20); do
 		[[ -b "${NBD_DEVICE}" ]] && break
 		sleep 0.5
 	done
@@ -184,7 +183,7 @@ ${part1} : start=${ESP_START_SECTOR}, size=${ESP_SECTORS}, type=${ESP_GUID}, nam
 ${part2} : start=${NTFS_START_SECTOR}, type=${NTFS_GUID}, name="Windows"
 EOF
 	partprobe "${NBD_DEVICE}" 2>/dev/null || true
-	for attempt in $(seq 1 20); do
+	for _ in $(seq 1 20); do
 		[[ -b "${part2}" ]] && break
 		sleep 0.5
 	done

@@ -35,7 +35,7 @@ publish_release = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = publish_release
 SPEC.loader.exec_module(publish_release)
 
-ISO_BASENAME = "kyth-live-testing.iso"
+ISO_BASENAME = "kyth-live-testing-20261109-11743b23-1015-1.iso"
 CHANNEL_BASENAME = "kyth-live-testing.iso"
 IMMUTABLE_TAG = "iso-testing-20261012-abcdef0-948-1"
 CHANNEL_TAG = "iso-testing"
@@ -47,16 +47,26 @@ def _completed(returncode: int = 0) -> subprocess.CompletedProcess:
 
 
 def write_artifacts(source_dir: Path, basenames: tuple[str, ...]) -> None:
-    """Write a production-shaped artifact set: ISO, sha256sum-format
-    -CHECKSUM (as build-live-iso generates it), and the four other
-    sidecars, all non-empty."""
-    for basename in dict.fromkeys(basenames):
-        iso = source_dir / basename
-        iso.write_bytes(ISO_BYTES)
-        digest = hashlib.sha256(ISO_BYTES).hexdigest()
-        Path(f"{iso}-CHECKSUM").write_text(f"{digest}  {basename}\n", encoding="utf-8")
+    """Write a production-shaped artifact set. The first basename is the
+    versioned ISO: the ISO file itself, its sha256sum-format -CHECKSUM
+    (as build-live-iso generates it), and the four other sidecars. Any
+    further basename is a channel pointer: its -CHECKSUM records the
+    versioned ISO's digest under the channel filename (the build job
+    writes it that way) and it has the four sidecars — but NO ISO file:
+    the channel ISO is absent by design, which a former preflight got
+    wrong and failed every publish over."""
+    iso_basename, *channel_basenames = basenames
+    digest = hashlib.sha256(ISO_BYTES).hexdigest()
+    iso = source_dir / iso_basename
+    iso.write_bytes(ISO_BYTES)
+    Path(f"{iso}-CHECKSUM").write_text(f"{digest}  {iso_basename}\n", encoding="utf-8")
+    for suffix in (".sig", ".bundle", ".intoto.jsonl", ".json"):
+        Path(f"{iso}{suffix}").write_text("test\n", encoding="utf-8")
+    for basename in dict.fromkeys(channel_basenames):
+        channel = source_dir / basename
+        Path(f"{channel}-CHECKSUM").write_text(f"{digest}  {basename}\n", encoding="utf-8")
         for suffix in (".sig", ".bundle", ".intoto.jsonl", ".json"):
-            Path(f"{iso}{suffix}").write_text("test\n", encoding="utf-8")
+            Path(f"{channel}{suffix}").write_text("test\n", encoding="utf-8")
 
 
 class RecordingRunner:
@@ -196,6 +206,23 @@ class IsoPublishPreflightTests(unittest.TestCase):
 
         runner = RecordingRunner(immutable_exists=False)
         self.assert_fails_before_any_gh_call(runner, setup=corrupt_checksum)
+
+    def test_missing_channel_sidecar_fails_before_any_gh_call(self):
+        def remove_channel_bundle(tmp_path: Path) -> None:
+            Path(tmp_path / f"{CHANNEL_BASENAME}.bundle").unlink()
+
+        runner = RecordingRunner(immutable_exists=False)
+        self.assert_fails_before_any_gh_call(runner, setup=remove_channel_bundle)
+
+    def test_channel_checksum_mismatch_fails_before_any_gh_call(self):
+        def corrupt_channel_checksum(tmp_path: Path) -> None:
+            wrong = hashlib.sha256(b"not the iso").hexdigest()
+            Path(tmp_path / f"{CHANNEL_BASENAME}-CHECKSUM").write_text(
+                f"{wrong}  {CHANNEL_BASENAME}\n", encoding="utf-8"
+            )
+
+        runner = RecordingRunner(immutable_exists=False)
+        self.assert_fails_before_any_gh_call(runner, setup=corrupt_channel_checksum)
 
     def test_empty_changelog_fails_before_any_gh_call(self):
         runner = RecordingRunner(immutable_exists=False)

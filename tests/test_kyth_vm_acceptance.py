@@ -1,8 +1,13 @@
 """Static contract tests for unattended live/install/update/rollback gating."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import os
 import pathlib
 import json
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1464,6 +1469,1621 @@ class RunInstalledLifecycleTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     vm_acceptance.run_installed_lifecycle()
                 mock_power.assert_called_once_with("poweroff")
+
+
+class _FakeDaemonResponse:
+    def __init__(self, status: int, payload: bytes):
+        self.status = status
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _daemon_connection_factory(outcomes):
+    """A _UnixHTTPConnection stand-in whose request() consumes one
+    outcome per connection: an exception instance is raised, anything
+    else becomes the response returned by getresponse()."""
+    created = []
+
+    class FakeConnection:
+        def __init__(self, socket_path, timeout):
+            self.socket_path = socket_path
+            self.timeout = timeout
+            self.closed = False
+            self.request_args = None
+            self._response = None
+            created.append(self)
+
+        def request(self, method, path, body=None, headers=None):
+            self.request_args = (method, path, body, headers)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            self._response = outcome
+
+        def getresponse(self):
+            return self._response
+
+        def close(self):
+            self.closed = True
+
+    return FakeConnection, created
+
+
+class DaemonConnectionTests(unittest.TestCase):
+    def test_unix_connection_connects_to_the_socket_path_with_timeout(self):
+        fake_sock = mock.Mock()
+        with mock.patch.object(socket, "socket", return_value=fake_sock) as factory:
+            connection = vm_acceptance._UnixHTTPConnection(
+                pathlib.Path("/run/kyth-installer/api.sock"), 7
+            )
+            connection.connect()
+        factory.assert_called_once_with(socket.AF_UNIX, socket.SOCK_STREAM)
+        fake_sock.settimeout.assert_called_once_with(7)
+        fake_sock.connect.assert_called_once_with("/run/kyth-installer/api.sock")
+        self.assertIs(connection.sock, fake_sock)
+
+    def test_daemon_request_returns_status_and_decoded_body(self):
+        factory, created = _daemon_connection_factory(
+            [_FakeDaemonResponse(200, b'{"ok": true}')]
+        )
+        with mock.patch.object(vm_acceptance, "_UnixHTTPConnection", factory):
+            status, body = vm_acceptance._daemon_request(
+                "POST", "/api/start", "tok-1", {"disk": "/dev/vda"}
+            )
+        self.assertEqual((status, body), (200, '{"ok": true}'))
+        self.assertEqual(len(created), 1)
+        connection = created[0]
+        self.assertEqual(connection.socket_path, vm_acceptance.INSTALLER_SOCKET)
+        self.assertEqual(connection.timeout, 120)
+        method, path, payload, headers = connection.request_args
+        self.assertEqual((method, path), ("POST", "/api/start"))
+        self.assertEqual(payload, '{"disk": "/dev/vda"}')
+        self.assertEqual(headers["X-Kyth-Session-Token"], "tok-1")
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertTrue(connection.closed)
+
+    def test_daemon_request_without_body_sends_no_payload(self):
+        factory, created = _daemon_connection_factory(
+            [_FakeDaemonResponse(200, b"[]")]
+        )
+        with mock.patch.object(vm_acceptance, "_UnixHTTPConnection", factory):
+            status, body = vm_acceptance._daemon_request(
+                "GET", "/api/disks", "tok-1", timeout=5
+            )
+        self.assertEqual((status, body), (200, "[]"))
+        self.assertIsNone(created[0].request_args[2])
+        self.assertEqual(created[0].timeout, 5)
+
+    def test_daemon_request_replaces_undecodable_bytes(self):
+        factory, _created = _daemon_connection_factory(
+            [_FakeDaemonResponse(200, b'{"a": "\xff"}')]
+        )
+        with mock.patch.object(vm_acceptance, "_UnixHTTPConnection", factory):
+            _status, body = vm_acceptance._daemon_request("GET", "/api/x", "tok")
+        self.assertEqual(body, '{"a": "\ufffd"}')
+
+    def test_daemon_request_retries_after_a_transport_error(self):
+        factory, created = _daemon_connection_factory(
+            [OSError("daemon not up yet"), _FakeDaemonResponse(200, b"done")]
+        )
+        with mock.patch.object(vm_acceptance, "_UnixHTTPConnection", factory), \
+             mock.patch("kyth_shared.vm_acceptance.time.sleep") as sleep:
+            status, body = vm_acceptance._daemon_request("GET", "/api/disks", "tok")
+        self.assertEqual((status, body), (200, "done"))
+        self.assertEqual(len(created), 2)
+        self.assertTrue(all(connection.closed for connection in created))
+        sleep.assert_called_once_with(1)
+
+    def test_daemon_request_gives_up_after_ten_transport_errors(self):
+        factory, created = _daemon_connection_factory(
+            [OSError("refused")] * 10
+        )
+        with mock.patch.object(vm_acceptance, "_UnixHTTPConnection", factory), \
+             mock.patch("kyth_shared.vm_acceptance.time.sleep") as sleep:
+            with self.assertRaises(RuntimeError) as caught:
+                vm_acceptance._daemon_request("GET", "/api/disks", "tok")
+        self.assertIn("installer daemon socket is unavailable", str(caught.exception))
+        self.assertIn("refused", str(caught.exception))
+        self.assertEqual(len(created), 10)
+        self.assertTrue(all(connection.closed for connection in created))
+        self.assertEqual(sleep.call_count, 10)
+
+
+class _FakeStreamSocket:
+    """Socket stand-in for _daemon_stream_terminal_state: readline()
+    replays the script (bytes are returned, exception instances are
+    raised, an exhausted script reads as EOF)."""
+
+    def __init__(self, script=(), connect_error=None):
+        self._script = list(script)
+        self._connect_error = connect_error
+        self.sent = bytearray()
+        self.closed = False
+        self.timeout = None
+        self.address = None
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def connect(self, address):
+        if self._connect_error is not None:
+            raise self._connect_error
+        self.address = address
+
+    def sendall(self, data):
+        self.sent += data
+
+    def makefile(self, mode):
+        return self
+
+    def readline(self, size=-1):
+        if not self._script:
+            return b""
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def close(self):
+        self.closed = True
+
+
+_STREAM_HEADERS = (
+    b"HTTP/1.1 200 OK\r\n",
+    b"Content-Type: text/event-stream\r\n",
+    b"\r\n",
+)
+
+
+class DaemonStreamTests(unittest.TestCase):
+    def test_stream_returns_the_done_event_payload(self):
+        sock = _FakeStreamSocket([
+            *_STREAM_HEADERS,
+            b"event: message\r\n",
+            b"data:\r\n",
+            b"data: not-json\r\n",
+            b'data: {"type": "progress", "percent": 10}\r\n',
+            b'data: {"type": "done", "id": 3}\r\n',
+        ])
+        with mock.patch.object(socket, "socket", return_value=sock):
+            result = vm_acceptance._daemon_stream_terminal_state("tok-9")
+        self.assertEqual(result, '{"type": "done", "id": 3}')
+        request = bytes(sock.sent).decode("utf-8")
+        self.assertTrue(request.startswith("GET /api/stream HTTP/1.1\r\n"))
+        self.assertIn("X-Kyth-Session-Token: tok-9\r\n", request)
+        self.assertEqual(sock.timeout, 30)
+        self.assertEqual(sock.address, str(vm_acceptance.INSTALLER_SOCKET))
+        self.assertTrue(sock.closed)
+
+    def test_stream_error_event_raises_with_the_daemon_message(self):
+        sock = _FakeStreamSocket([
+            *_STREAM_HEADERS,
+            b'data: {"type": "error", "message": "disk exploded"}\r\n',
+        ])
+        with mock.patch.object(socket, "socket", return_value=sock):
+            with self.assertRaises(RuntimeError) as caught:
+                vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertEqual(str(caught.exception), "installer job failed: disk exploded")
+        self.assertTrue(sock.closed)
+
+    def test_stream_error_event_without_a_message_uses_a_default(self):
+        for payload in (
+            b'data: {"type": "error"}\r\n',
+            b'data: {"type": "error", "message": ""}\r\n',
+            b'data: {"type": "error", "message": 42}\r\n',
+        ):
+            sock = _FakeStreamSocket([*_STREAM_HEADERS, payload])
+            with mock.patch.object(socket, "socket", return_value=sock):
+                with self.assertRaises(RuntimeError) as caught:
+                    vm_acceptance._daemon_stream_terminal_state("tok")
+            self.assertEqual(
+                str(caught.exception),
+                "installer job failed: installer reported an error",
+            )
+
+    def test_stream_rejects_a_non_200_status_line(self):
+        sock = _FakeStreamSocket([b"HTTP/1.1 403 Forbidden\r\n", b"\r\n"])
+        with mock.patch.object(socket, "socket", return_value=sock):
+            with self.assertRaises(RuntimeError) as caught:
+                vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertEqual(
+            str(caught.exception), "installer event stream answered HTTP 403"
+        )
+
+    def test_stream_rejects_an_unparseable_status_line(self):
+        sock = _FakeStreamSocket([b"garbage\r\n", b"\r\n"])
+        with mock.patch.object(socket, "socket", return_value=sock):
+            with self.assertRaises(RuntimeError) as caught:
+                vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertEqual(
+            str(caught.exception), "installer event stream answered HTTP 0"
+        )
+
+    def test_stream_returns_the_last_state_when_the_stream_ends(self):
+        sock = _FakeStreamSocket([
+            *_STREAM_HEADERS,
+            b'data: {"type": "progress", "percent": 55}\r\n',
+        ])
+        with mock.patch.object(socket, "socket", return_value=sock):
+            result = vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertEqual(result, '{"type": "progress", "percent": 55}')
+
+    def test_stream_survives_a_timeout_inside_the_budget(self):
+        sock = _FakeStreamSocket([
+            *_STREAM_HEADERS,
+            TimeoutError("slow job"),
+            b'data: {"type": "done"}\r\n',
+        ])
+        with mock.patch.object(socket, "socket", return_value=sock), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance.time.monotonic",
+                 side_effect=[1000.0, 1001.0],
+             ):
+            result = vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertEqual(result, '{"type": "done"}')
+
+    def test_stream_raises_once_the_budget_is_blown(self):
+        sock = _FakeStreamSocket([
+            *_STREAM_HEADERS,
+            b'data: {"type": "progress"}\r\n',
+            TimeoutError("slow job"),
+        ])
+        with mock.patch.object(socket, "socket", return_value=sock), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance.time.monotonic",
+                 side_effect=[1000.0, 5000.0],
+             ):
+            with self.assertRaises(RuntimeError) as caught:
+                vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertIn("did not finish within 1500s", str(caught.exception))
+        self.assertIn('{"type": "progress"}', str(caught.exception))
+
+    def test_stream_retries_a_failed_connect(self):
+        refused = _FakeStreamSocket(connect_error=OSError("refused"))
+        ready = _FakeStreamSocket([
+            *_STREAM_HEADERS,
+            b'data: {"type": "done"}\r\n',
+        ])
+        supply = iter([refused, ready])
+        with mock.patch.object(socket, "socket", side_effect=lambda *a: next(supply)), \
+             mock.patch("kyth_shared.vm_acceptance.time.sleep") as sleep:
+            result = vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertEqual(result, '{"type": "done"}')
+        self.assertTrue(refused.closed)
+        sleep.assert_called_once_with(1)
+
+    def test_stream_gives_up_after_ten_failed_connects(self):
+        created = []
+
+        def factory(*args):
+            sock = _FakeStreamSocket(connect_error=OSError("refused"))
+            created.append(sock)
+            return sock
+
+        with mock.patch.object(socket, "socket", side_effect=factory), \
+             mock.patch("kyth_shared.vm_acceptance.time.sleep"):
+            with self.assertRaises(RuntimeError) as caught:
+                vm_acceptance._daemon_stream_terminal_state("tok")
+        self.assertIn("installer daemon socket is unavailable", str(caught.exception))
+        self.assertEqual(len(created), 10)
+        self.assertTrue(all(sock.closed for sock in created))
+
+
+class PrepareInstallerDaemonTests(unittest.TestCase):
+    TOKEN = "ab" * 32
+
+    def _paths(self, tmp: str):
+        base = pathlib.Path(tmp)
+        run_dir = base / "run"
+        run_dir.mkdir()
+        socket_path = run_dir / "api.sock"
+        socket_path.write_bytes(b"")
+        return {
+            "INSTALLER_LOCK_FILE": base / "installer.lock",
+            "INSTALLER_RUN_DIR": run_dir,
+            "INSTALLER_TOKEN_FILE": run_dir / "session-token",
+            "INSTALLER_SOCKET": socket_path,
+        }
+
+    def _enter(self, paths, *, run_behavior=None, run_text_behavior=None):
+        stack = contextlib.ExitStack()
+        for name, value in paths.items():
+            stack.enter_context(mock.patch.object(vm_acceptance, name, value))
+        run = stack.enter_context(
+            mock.patch(
+                "kyth_shared.vm_acceptance.run",
+                side_effect=run_behavior or (lambda command, **kw: _completed(0)),
+            )
+        )
+        run_text = stack.enter_context(
+            mock.patch(
+                "kyth_shared.vm_acceptance.run_text",
+                side_effect=run_text_behavior or self._default_run_text,
+            )
+        )
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.time.sleep"))
+        return stack, run, run_text
+
+    def _default_run_text(self, command, **kwargs):
+        if command[0] == "openssl":
+            return _completed(0, self.TOKEN + "\n")
+        return _completed(0)
+
+    def test_prepare_creates_a_root_only_token_and_returns_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            stack, run, _run_text = self._enter(paths)
+            with stack:
+                token, lock_handle = vm_acceptance._prepare_installer_daemon()
+            try:
+                self.assertEqual(token, self.TOKEN)
+                token_file = paths["INSTALLER_TOKEN_FILE"]
+                self.assertEqual(token_file.read_text(encoding="utf-8"), self.TOKEN)
+                self.assertEqual(token_file.stat().st_mode & 0o777, 0o600)
+            finally:
+                lock_handle.close()
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands[0][:2], ["install", "-d"])
+            self.assertIn("0750", commands[0])
+            self.assertIn(str(paths["INSTALLER_RUN_DIR"]), commands[0])
+            self.assertEqual(
+                commands[1], ["systemctl", "restart", "kyth-installerd.service"]
+            )
+
+    def test_prepare_fails_when_the_lock_cannot_be_opened(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            paths["INSTALLER_LOCK_FILE"] = pathlib.Path(tmp) / "no-dir" / "lock"
+            stack, _run, _run_text = self._enter(paths)
+            with stack:
+                with self.assertRaises(RuntimeError) as caught:
+                    vm_acceptance._prepare_installer_daemon()
+            self.assertIn("could not open installer session lock", str(caught.exception))
+
+    def test_prepare_fails_when_another_session_holds_the_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            holder = paths["INSTALLER_LOCK_FILE"].open("a+")
+            try:
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                stack, _run, _run_text = self._enter(paths)
+                with stack:
+                    with self.assertRaises(RuntimeError) as caught:
+                        vm_acceptance._prepare_installer_daemon()
+                self.assertIn(
+                    "another installer session is already in progress",
+                    str(caught.exception),
+                )
+            finally:
+                holder.close()
+
+    def test_prepare_fails_when_the_runtime_directory_cannot_be_created(self):
+        def run_behavior(command, **kwargs):
+            if command[0] == "install":
+                return _completed(1)
+            return _completed(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            stack, _run, _run_text = self._enter(paths, run_behavior=run_behavior)
+            with stack:
+                with self.assertRaises(RuntimeError) as caught:
+                    vm_acceptance._prepare_installer_daemon()
+            self.assertIn(
+                "could not create the installer runtime directory",
+                str(caught.exception),
+            )
+
+    def test_prepare_fails_when_openssl_cannot_produce_a_token(self):
+        def none_result(command, **kwargs):
+            return None
+
+        def failed_result(command, **kwargs):
+            if command[0] == "openssl":
+                return _completed(1)
+            return _completed(0)
+
+        def malformed_result(command, **kwargs):
+            if command[0] == "openssl":
+                return _completed(0, "not-a-hex-token\n")
+            return _completed(0)
+
+        for behavior in (none_result, failed_result, malformed_result):
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = self._paths(tmp)
+                stack, _run, _run_text = self._enter(
+                    paths, run_text_behavior=behavior
+                )
+                with stack:
+                    with self.assertRaises(RuntimeError) as caught:
+                        vm_acceptance._prepare_installer_daemon()
+                self.assertIn("session token", str(caught.exception))
+
+    def test_prepare_fails_when_the_daemon_restart_fails(self):
+        def run_behavior(command, **kwargs):
+            if command[:2] == ["systemctl", "restart"]:
+                return _completed(1)
+            return _completed(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            stack, _run, _run_text = self._enter(paths, run_behavior=run_behavior)
+            with stack:
+                with self.assertRaises(RuntimeError) as caught:
+                    vm_acceptance._prepare_installer_daemon()
+            self.assertIn("could not restart the installer daemon", str(caught.exception))
+
+    def test_prepare_waits_for_the_daemon_to_become_active(self):
+        polls = []
+
+        def run_text_behavior(command, **kwargs):
+            if command[0] == "openssl":
+                return _completed(0, self.TOKEN + "\n")
+            polls.append(command)
+            return _completed(0 if len(polls) > 1 else 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            stack, _run, _run_text = self._enter(
+                paths, run_text_behavior=run_text_behavior
+            )
+            with stack:
+                token, lock_handle = vm_acceptance._prepare_installer_daemon()
+            lock_handle.close()
+            self.assertEqual(token, self.TOKEN)
+            self.assertEqual(len(polls), 2)
+
+    def test_prepare_fails_when_the_daemon_never_becomes_ready(self):
+        polls = []
+
+        def run_text_behavior(command, **kwargs):
+            if command[0] == "openssl":
+                return _completed(0, self.TOKEN + "\n")
+            polls.append(command)
+            return _completed(1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(tmp)
+            stack, _run, _run_text = self._enter(
+                paths, run_text_behavior=run_text_behavior
+            )
+            with stack:
+                with self.assertRaises(RuntimeError) as caught:
+                    vm_acceptance._prepare_installer_daemon()
+            self.assertIn("did not become ready", str(caught.exception))
+            self.assertEqual(len(polls), 30)
+
+
+class _EventuallyBlockTarget(_FakeTarget):
+    """Acceptance disk that appears after a few block-device probes."""
+
+    def __init__(self, misses: int):
+        self._misses = misses
+
+    def is_block_device(self) -> bool:
+        if self._misses:
+            self._misses -= 1
+            return False
+        return True
+
+
+class _UnresolvableTarget:
+    def is_block_device(self) -> bool:
+        return True
+
+    def resolve(self, strict: bool = True):
+        raise OSError("by-id symlink is gone")
+
+
+class _NonBlockTarget:
+    def is_block_device(self) -> bool:
+        return False
+
+    def resolve(self, strict: bool = True) -> "_NonBlockTarget":
+        return self
+
+
+class DaemonFlowFailureTests(unittest.TestCase):
+    PARTITIONS_PATH = "/api/partitions?disk=%2Fdev%2Fvda"
+
+    def _ok_responses(self, report: dict) -> dict:
+        return {
+            "/api/disks": (200, json.dumps([
+                {"name": "/dev/sda", "current": True},
+                {"name": "/dev/vda", "current": False},
+            ])),
+            self.PARTITIONS_PATH: (200, json.dumps([
+                {"name": "/dev/vda1", "size_bytes": 512 * 1024 * 1024,
+                 "fstype": "vfat", "ntfs_resize_candidate": False},
+                {"name": "/dev/vda2",
+                 "size_bytes": 127 * 1024 * 1024 * 1024,
+                 "fstype": "ntfs", "ntfs_resize_candidate": True},
+            ])),
+            "/api/start": (200, '{"started": true, "job_id": 1, "first_event_id": 1}'),
+            "/api/report": (200, json.dumps(report)),
+        }
+
+    def _request_fake(self, responses: dict):
+        def fake(method, path, token, body=None):
+            if path in responses:
+                return responses[path]
+            raise AssertionError(f"unexpected daemon path {path}")
+
+        return fake
+
+    def _enter_flow(self, fake_request, *, windows=False, ntfs_uuids=None,
+                    target=None, source_ref="ghcr.io/mrtrickdotorg/kyth@sha256:abc"):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.wait_for_desktop", return_value=True))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.run_smoke_check"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.TARGET_BY_ID", target or _FakeTarget()))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._installer_source_ref",
+            return_value=source_ref))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._installer_target_ref",
+            return_value="ghcr.io/mrtrickdotorg/kyth:testing"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._prepare_installer_daemon",
+            return_value=("token-123", object())))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._daemon_request", side_effect=fake_request))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._daemon_stream_terminal_state",
+            return_value='{"type": "done"}'))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.windows_mode", return_value=windows))
+        if ntfs_uuids is not None:
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance._ntfs_uuids", side_effect=ntfs_uuids))
+        emit = stack.enter_context(mock.patch("kyth_shared.vm_acceptance.emit"))
+        power = stack.enter_context(mock.patch("kyth_shared.vm_acceptance.power"))
+        fail = stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)))
+        return stack, emit, power, fail
+
+    def _assert_fails_with(self, responses, fragment, **flow_kwargs):
+        fake = self._request_fake(responses)
+        stack, _emit, _power, fail = self._enter_flow(fake, **flow_kwargs)
+        with stack:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertIn(fragment, fail.call_args.args[0])
+
+    def test_disk_inventory_http_error_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses["/api/disks"] = (503, '{"message": "busy"}')
+        self._assert_fails_with(responses, "installer disk inventory answered HTTP 503: busy")
+
+    def test_disk_inventory_invalid_json_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses["/api/disks"] = (200, "not json")
+        self._assert_fails_with(responses, "installer disk inventory was not valid JSON")
+
+    def test_disk_missing_from_inventory_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses["/api/disks"] = (200, json.dumps([
+            {"name": "/dev/sda", "current": True},
+        ]))
+        self._assert_fails_with(responses, "missing from the installer inventory")
+
+    def test_start_http_error_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses["/api/start"] = (500, '{"error": "disk gone"}')
+        self._assert_fails_with(responses, "installer start answered HTTP 500: disk gone")
+
+    def test_report_http_error_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses["/api/report"] = (503, '{"message": "busy"}')
+        self._assert_fails_with(responses, "installer report answered HTTP 503: busy")
+
+    def test_report_invalid_json_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses["/api/report"] = (200, "nope")
+        self._assert_fails_with(responses, "installer report was not valid JSON")
+
+    def test_report_with_only_a_warning_check_completes(self):
+        report = _complete_report()
+        report["checks"].append(
+            {"name": "boot_entries", "status": "warning", "detail": ""}
+        )
+        fake = self._request_fake(self._ok_responses(report))
+        stack, emit, power, fail = self._enter_flow(fake)
+        with stack:
+            vm_acceptance.install_via_installer_daemon()
+        fail.assert_not_called()
+        emitted = [(call.args[0], call.args[1]) for call in emit.call_args_list]
+        self.assertIn(
+            ("INSTALL_COMPLETE", "ghcr.io/mrtrickdotorg/kyth:testing"), emitted
+        )
+        power.assert_called_once_with("reboot")
+
+    def test_desktop_never_ready_fails(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.wait_for_desktop", return_value=False
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)
+        ) as fail:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertEqual(
+            fail.call_args.args[0], "live Plasma desktop did not become ready"
+        )
+
+    def test_target_appearing_after_a_wait_still_installs(self):
+        fake = self._request_fake(self._ok_responses(_complete_report()))
+        stack, emit, power, fail = self._enter_flow(
+            fake, target=_EventuallyBlockTarget(2)
+        )
+        with stack, mock.patch("kyth_shared.vm_acceptance.time.sleep") as sleep:
+            vm_acceptance.install_via_installer_daemon()
+        self.assertEqual(sleep.call_count, 2)
+        fail.assert_not_called()
+        power.assert_called_once_with("reboot")
+
+    def test_unresolvable_target_fails(self):
+        fake = self._request_fake(self._ok_responses(_complete_report()))
+        stack, _emit, _power, fail = self._enter_flow(
+            fake, target=_UnresolvableTarget()
+        )
+        with stack:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertEqual(
+            fail.call_args.args[0], "dedicated acceptance disk not found"
+        )
+
+    def test_non_block_target_fails(self):
+        fake = self._request_fake(self._ok_responses(_complete_report()))
+        stack, _emit, _power, fail = self._enter_flow(
+            fake, target=_NonBlockTarget()
+        )
+        with stack, mock.patch("kyth_shared.vm_acceptance.time.sleep"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertEqual(
+            fail.call_args.args[0],
+            "acceptance disk symlink did not resolve to a block device",
+        )
+
+    def test_invalid_source_ref_fails(self):
+        fake = self._request_fake(self._ok_responses(_complete_report()))
+        stack, _emit, _power, fail = self._enter_flow(fake, source_ref="bad ref!")
+        with stack:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertEqual(
+            fail.call_args.args[0],
+            "installer source image reference contains unsupported characters",
+        )
+
+    def test_windows_partition_inventory_http_error_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses[self.PARTITIONS_PATH] = (500, '{"message": "udev busy"}')
+        self._assert_fails_with(
+            responses,
+            "installer partition inventory answered HTTP 500: udev busy",
+            windows=True,
+        )
+
+    def test_windows_partition_inventory_invalid_json_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses[self.PARTITIONS_PATH] = (200, "not json")
+        self._assert_fails_with(
+            responses,
+            "installer partition inventory was not valid JSON",
+            windows=True,
+        )
+
+    def test_windows_without_a_resize_candidate_fails(self):
+        responses = self._ok_responses(_complete_report())
+        responses[self.PARTITIONS_PATH] = (200, json.dumps([
+            {"name": "/dev/vda2", "size_bytes": 127 * 1024 * 1024 * 1024,
+             "fstype": "ntfs", "ntfs_resize_candidate": False},
+        ]))
+        self._assert_fails_with(
+            responses, "no NTFS shrink candidate", windows=True
+        )
+
+    def test_windows_partition_without_a_uuid_fails(self):
+        for sightings in ([[]], [[("/dev/vda2", "")]]):
+            self._assert_fails_with(
+                self._ok_responses(_complete_report()),
+                "has no readable volume UUID",
+                windows=True,
+                ntfs_uuids=sightings,
+            )
+
+    def test_windows_partition_lost_during_install_fails(self):
+        sightings = [
+            [("/dev/vda2", "5A8C4E2F12345678")],
+            [],
+        ]
+        self._assert_fails_with(
+            self._ok_responses(_complete_report()),
+            "missing or lost its volume identity",
+            windows=True,
+            ntfs_uuids=sightings,
+        )
+
+
+class RawInstallFailureTests(unittest.TestCase):
+    def _enter(self, *, run_behavior=None, target=None, update_ref=""):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.wait_for_desktop", return_value=True))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.run_smoke_check"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.TARGET_BY_ID", target or _FakeTarget()))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._installer_source_ref",
+            return_value="ghcr.io/kyth-os/kyth@sha256:abc123"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._installer_target_ref",
+            return_value="ghcr.io/example/kyth:testing"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.read_update_ref", return_value=update_ref))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.emit"))
+        fail = stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)))
+        return stack, fail
+
+    def test_desktop_never_ready_fails(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.wait_for_desktop", return_value=False
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)
+        ) as fail:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_from_live_iso()
+        self.assertEqual(
+            fail.call_args.args[0], "live Plasma desktop did not become ready"
+        )
+
+    def test_unresolvable_target_fails(self):
+        stack, fail = self._enter(target=_UnresolvableTarget())
+        with stack:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_from_live_iso()
+        self.assertEqual(
+            fail.call_args.args[0], "dedicated acceptance disk not found"
+        )
+
+    def test_non_block_target_fails(self):
+        stack, fail = self._enter(target=_NonBlockTarget())
+        with stack, mock.patch("kyth_shared.vm_acceptance.time.sleep"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_from_live_iso()
+        self.assertEqual(
+            fail.call_args.args[0],
+            "acceptance disk symlink did not resolve to a block device",
+        )
+
+    def test_bootc_spawn_failure_fails(self):
+        stack, fail = self._enter()
+        with tempfile.TemporaryDirectory() as tmp:
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.LOG_FILE", pathlib.Path(tmp) / "log"))
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.run",
+                side_effect=OSError("bootc missing")))
+            with stack:
+                with self.assertRaises(SystemExit):
+                    vm_acceptance.install_from_live_iso()
+        self.assertEqual(fail.call_args.args[0], "bootc install to-disk failed")
+
+    def test_bootc_nonzero_exit_fails(self):
+        stack, fail = self._enter()
+        with tempfile.TemporaryDirectory() as tmp:
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.LOG_FILE", pathlib.Path(tmp) / "log"))
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.run", return_value=_completed(1)))
+            with stack:
+                with self.assertRaises(SystemExit):
+                    vm_acceptance.install_from_live_iso()
+        self.assertEqual(fail.call_args.args[0], "bootc install to-disk failed")
+
+    def test_invalid_update_ref_fails_after_install(self):
+        stack, fail = self._enter(update_ref="bad; poweroff")
+        with tempfile.TemporaryDirectory() as tmp:
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.LOG_FILE", pathlib.Path(tmp) / "log"))
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.run", return_value=_completed(0)))
+            with stack:
+                with self.assertRaises(SystemExit):
+                    vm_acceptance.install_from_live_iso()
+        self.assertEqual(
+            fail.call_args.args[0],
+            "update image reference contains unsupported characters",
+        )
+
+
+class GraphicalSessionTests(unittest.TestCase):
+    def test_no_active_session_returns_none(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=_completed(1, "")
+        ):
+            self.assertIsNone(vm_acceptance._active_graphical_session())
+        with mock.patch("kyth_shared.vm_acceptance.run_text", return_value=None):
+            self.assertIsNone(vm_acceptance._active_graphical_session())
+
+    def test_session_without_an_owner_name_returns_none(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            side_effect=[_completed(0, "c1\n"), _completed(0, "\n")],
+        ):
+            self.assertIsNone(vm_acceptance._active_graphical_session())
+
+    def test_unknown_session_user_returns_none(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            side_effect=[_completed(0, "c1\n"), _completed(0, "ghost\n")],
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.pwd.getpwnam", side_effect=KeyError("ghost")
+        ):
+            self.assertIsNone(vm_acceptance._active_graphical_session())
+
+    def test_wayland_x11_and_xauthority_reach_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            runtime = base / "run-user"
+            runtime.mkdir()
+            (runtime / "wayland-0").write_bytes(b"")
+            x11_dir = base / "x11-unix"
+            x11_dir.mkdir()
+            (x11_dir / "X0").write_bytes(b"")
+            home = base / "home"
+            home.mkdir()
+            (home / ".Xauthority").write_bytes(b"cookie")
+            account = mock.Mock(pw_uid=4321, pw_dir=str(home))
+
+            def path_factory(value):
+                text = str(value)
+                if text.startswith("/run/user/"):
+                    return runtime
+                if text == "/tmp/.X11-unix":
+                    return x11_dir
+                return pathlib.Path(value)
+
+            with mock.patch(
+                "kyth_shared.vm_acceptance.run_text",
+                side_effect=[_completed(0, "c1\n"), _completed(0, "tester\n")],
+            ), mock.patch(
+                "kyth_shared.vm_acceptance.pwd.getpwnam", return_value=account
+            ), mock.patch(
+                "kyth_shared.vm_acceptance.Path", side_effect=path_factory
+            ):
+                result = vm_acceptance._active_graphical_session()
+        username, environment = result
+        self.assertEqual(username, "tester")
+        self.assertEqual(environment["WAYLAND_DISPLAY"], "wayland-0")
+        self.assertEqual(environment["DISPLAY"], ":0")
+        self.assertEqual(environment["XAUTHORITY"], str(home / ".Xauthority"))
+        self.assertEqual(environment["XDG_SESSION_TYPE"], "wayland")
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], str(runtime))
+
+
+class _ExplodingPath:
+    """Path stand-in whose write_text always fails (read-only /etc)."""
+
+    def __init__(self, *args):
+        pass
+
+    def write_text(self, *args, **kwargs):
+        raise OSError("read-only file system")
+
+
+class EnsureGraphicalSessionTests(unittest.TestCase):
+    def _enter(self, *, sessions, account_result, run_behavior=None):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._active_graphical_session",
+            side_effect=sessions))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=account_result))
+        run = stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.run",
+            side_effect=run_behavior or (lambda command, **kw: _completed(0))))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.time.sleep"))
+        return stack, run
+
+    def test_existing_display_session_is_returned_immediately(self):
+        session = ("tester", {"WAYLAND_DISPLAY": "wayland-0", "HOME": "/home/tester"})
+        stack, run = self._enter(sessions=[session], account_result=_completed(0))
+        with stack:
+            result = vm_acceptance._ensure_acceptance_graphical_session()
+        self.assertEqual(result, session)
+        run.assert_not_called()
+
+    def test_bootstrap_creates_the_account_and_autologin_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "90-kyth-vm-acceptance.conf"
+            ready = ("kyth-acceptance", {"DISPLAY": ":0"})
+            stack, run = self._enter(
+                sessions=[("tester", {"HOME": "/x"}), ready],
+                account_result=_completed(1),
+            )
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.Path", return_value=config))
+            with stack:
+                result = vm_acceptance._ensure_acceptance_graphical_session()
+            self.assertEqual(result, ready)
+            contents = config.read_text(encoding="utf-8")
+            self.assertIn("User=kyth-acceptance", contents)
+            self.assertIn("Session=plasma.desktop", contents)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands[0][:1], ["useradd"])
+            self.assertIn("kyth-acceptance", commands[0])
+            self.assertEqual(
+                commands[1],
+                ["systemctl", "restart", "display-manager.service", "--no-block"],
+            )
+
+    def test_bootstrap_skips_useradd_when_the_account_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "90-kyth-vm-acceptance.conf"
+            ready = ("kyth-acceptance", {"WAYLAND_DISPLAY": "wayland-0"})
+            stack, run = self._enter(
+                sessions=[None, ready],
+                account_result=_completed(0, "1001\n"),
+            )
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.Path", return_value=config))
+            with stack:
+                result = vm_acceptance._ensure_acceptance_graphical_session()
+            self.assertEqual(result, ready)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0][:2], ["systemctl", "restart"])
+
+    def test_bootstrap_treats_a_missing_id_result_as_no_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "90-kyth-vm-acceptance.conf"
+            ready = ("kyth-acceptance", {"DISPLAY": ":0"})
+            stack, run = self._enter(
+                sessions=[None, ready],
+                account_result=None,
+            )
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.Path", return_value=config))
+            with stack:
+                result = vm_acceptance._ensure_acceptance_graphical_session()
+            self.assertEqual(result, ready)
+            self.assertEqual(run.call_args_list[0].args[0][:1], ["useradd"])
+
+    def test_bootstrap_gives_up_when_useradd_fails(self):
+        stack, _run = self._enter(
+            sessions=[None],
+            account_result=_completed(1),
+            run_behavior=lambda command, **kw: _completed(1),
+        )
+        with stack:
+            self.assertIsNone(vm_acceptance._ensure_acceptance_graphical_session())
+
+    def test_bootstrap_gives_up_when_the_config_cannot_be_written(self):
+        stack, _run = self._enter(
+            sessions=[None],
+            account_result=_completed(0, "1001\n"),
+        )
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.Path", _ExplodingPath))
+        with stack:
+            self.assertIsNone(vm_acceptance._ensure_acceptance_graphical_session())
+
+    def test_bootstrap_gives_up_when_the_login_manager_restart_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "90-kyth-vm-acceptance.conf"
+            stack, _run = self._enter(
+                sessions=[None],
+                account_result=_completed(0, "1001\n"),
+                run_behavior=lambda command, **kw: _completed(1),
+            )
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.Path", return_value=config))
+            with stack:
+                self.assertIsNone(
+                    vm_acceptance._ensure_acceptance_graphical_session()
+                )
+
+    def test_bootstrap_gives_up_when_no_session_appears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "90-kyth-vm-acceptance.conf"
+            stack, _run = self._enter(
+                sessions=[None] * 61,
+                account_result=_completed(0, "1001\n"),
+            )
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.Path", return_value=config))
+            with stack:
+                self.assertIsNone(
+                    vm_acceptance._ensure_acceptance_graphical_session()
+                )
+
+
+class HubHelperBranchTests(unittest.TestCase):
+    def test_hub_pages_fails_when_the_manifest_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "kyth_shared.vm_acceptance.HUB_ROUTE_MANIFEST",
+                pathlib.Path(tmp) / "absent.json",
+            ), mock.patch("kyth_shared.vm_acceptance.power"):
+                with self.assertRaises(SystemExit):
+                    vm_acceptance._hub_pages()
+
+    def test_hub_pages_fails_on_duplicate_page_keys(self):
+        manifest = {
+            "destinations": [
+                {"key": "Updates", "route": "/updates", "sections": []},
+                {"key": "Updates", "route": "/updates-2", "sections": []},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "hubRoutes.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with mock.patch(
+                "kyth_shared.vm_acceptance.HUB_ROUTE_MANIFEST", path
+            ), mock.patch("kyth_shared.vm_acceptance.power"):
+                with self.assertRaises(SystemExit):
+                    vm_acceptance._hub_pages()
+
+    def test_hub_pages_fails_on_a_malformed_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "hubRoutes.json"
+            path.write_text("{}", encoding="utf-8")
+            with mock.patch(
+                "kyth_shared.vm_acceptance.HUB_ROUTE_MANIFEST", path
+            ), mock.patch("kyth_shared.vm_acceptance.power"):
+                with self.assertRaises(SystemExit):
+                    vm_acceptance._hub_pages()
+
+    def test_hub_start_without_degraded_filters_empty_environment_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp) / "hub.log"
+            process = mock.Mock()
+            with mock.patch(
+                "kyth_shared.vm_acceptance.subprocess.Popen", return_value=process
+            ) as popen:
+                started = vm_acceptance._hub_start(
+                    "tester",
+                    {"HOME": "/tmp", "DISPLAY": ""},
+                    "Welcome",
+                    evidence,
+                )
+            self.assertIs(started, process)
+            command = popen.call_args.args[0]
+            self.assertIn("HOME=/tmp", command)
+            self.assertNotIn("DISPLAY=", command)
+            self.assertFalse(
+                any("KYTH_HUB_ACCEPTANCE_DEGRADED" in part for part in command)
+            )
+
+    def test_hub_stop_escalates_to_sigkill_when_sigterm_is_ignored(self):
+        process = mock.Mock()
+        process.pid = 4321
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(["kyth-hub-shell"], 8),
+            None,
+        ]
+        with mock.patch("kyth_shared.vm_acceptance.os.killpg") as killpg:
+            vm_acceptance._hub_stop(process)
+        self.assertEqual(
+            [call.args for call in killpg.call_args_list],
+            [(4321, signal.SIGTERM), (4321, signal.SIGKILL)],
+        )
+
+    def test_hub_launch_check_rejects_mismatched_or_missing_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp) / "hub.log"
+            with mock.patch(
+                "kyth_shared.vm_acceptance._hub_start", return_value=mock.Mock()
+            ), mock.patch("kyth_shared.vm_acceptance._hub_stop"), mock.patch(
+                "kyth_shared.vm_acceptance._wait_hub_event",
+                return_value={"page": "Updates", "route": "/wrong", "source": "initial"},
+            ):
+                self.assertFalse(
+                    vm_acceptance._hub_launch_check(
+                        "tester", {}, "Updates", "/updates", evidence
+                    )
+                )
+            with mock.patch(
+                "kyth_shared.vm_acceptance._hub_start", return_value=mock.Mock()
+            ), mock.patch("kyth_shared.vm_acceptance._hub_stop"), mock.patch(
+                "kyth_shared.vm_acceptance._wait_hub_event", return_value=None
+            ):
+                self.assertFalse(
+                    vm_acceptance._hub_launch_check(
+                        "tester", {}, "Updates", "/updates", evidence
+                    )
+                )
+            with mock.patch(
+                "kyth_shared.vm_acceptance._hub_start", return_value=mock.Mock()
+            ), mock.patch("kyth_shared.vm_acceptance._hub_stop"), mock.patch(
+                "kyth_shared.vm_acceptance._wait_hub_event",
+                return_value={
+                    "page": "Updates", "route": "/updates", "source": "single-instance",
+                },
+            ):
+                self.assertFalse(
+                    vm_acceptance._hub_launch_check(
+                        "tester", {}, "Updates", "/updates", evidence
+                    )
+                )
+
+    def test_hub_event_scans_past_newer_events_and_other_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp) / "hub.log"
+            evidence.write_text(
+                'KYTH_HUB_ACCEPTANCE:deep-link:{"page":"Welcome"}\n'
+                'KYTH_HUB_ACCEPTANCE:dashboard:{"state":"degraded"}\n'
+                "an unrelated log line\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                vm_acceptance._hub_event(evidence, "deep-link"),
+                {"page": "Welcome"},
+            )
+            self.assertIsNone(vm_acceptance._hub_event(evidence, "updates-probe"))
+
+    def test_wait_hub_event_times_out_to_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp) / "missing.log"
+            with mock.patch(
+                "kyth_shared.vm_acceptance.time.monotonic",
+                side_effect=[0.0, 100.0],
+            ):
+                self.assertIsNone(
+                    vm_acceptance._wait_hub_event(evidence, "deep-link", timeout=45)
+                )
+            # One empty poll inside the deadline, then the deadline passes.
+            with mock.patch(
+                "kyth_shared.vm_acceptance.time.monotonic",
+                side_effect=[0.0, 0.0, 100.0],
+            ), mock.patch("kyth_shared.vm_acceptance.time.sleep"):
+                self.assertIsNone(
+                    vm_acceptance._wait_hub_event(evidence, "deep-link", timeout=45)
+                )
+
+    def test_logged_runs_the_command_and_fails_on_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_file = pathlib.Path(tmp) / "log"
+            with mock.patch(
+                "kyth_shared.vm_acceptance.LOG_FILE", log_file
+            ), mock.patch(
+                "kyth_shared.vm_acceptance.run", return_value=_completed(0)
+            ) as run:
+                vm_acceptance._logged(["bootc", "rollback"], "rollback failed")
+            self.assertEqual(run.call_args.args[0], ["bootc", "rollback"])
+            with mock.patch(
+                "kyth_shared.vm_acceptance.LOG_FILE", log_file
+            ), mock.patch(
+                "kyth_shared.vm_acceptance.run", return_value=_completed(3)
+            ), mock.patch("kyth_shared.vm_acceptance.power"):
+                with self.assertRaises(SystemExit):
+                    vm_acceptance._logged(["bootc", "rollback"], "rollback failed")
+
+
+class HubAcceptanceFailureTests(unittest.TestCase):
+    def _enter(self, *, events, launch_check=True):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.emit"))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.power"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._ensure_acceptance_graphical_session",
+            return_value=("tester", {"HOME": "/tmp", "DISPLAY": ":0"})))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._hub_pages",
+            return_value=(("Welcome", "/"),)))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._hub_launch_check",
+            return_value=launch_check))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._hub_start",
+            side_effect=[mock.Mock() for _ in range(4)]))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._wait_hub_event", side_effect=events))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance._hub_stop"))
+        return stack
+
+    def _run_with_binary(self, stack):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = pathlib.Path(tmp) / "kyth-hub-shell"
+            binary.write_bytes(b"hub")
+            binary.chmod(0o755)
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.HUB_BINARY", binary))
+            with stack:
+                with self.assertRaises(SystemExit):
+                    vm_acceptance.run_hub_acceptance()
+
+    def test_missing_hub_binary_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "kyth_shared.vm_acceptance.HUB_BINARY",
+                pathlib.Path(tmp) / "absent",
+            ), mock.patch("kyth_shared.vm_acceptance.power"), mock.patch(
+                "kyth_shared.vm_acceptance.emit"
+            ):
+                with self.assertRaises(SystemExit):
+                    vm_acceptance.run_hub_acceptance()
+
+    def test_missing_session_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = pathlib.Path(tmp) / "kyth-hub-shell"
+            binary.write_bytes(b"hub")
+            binary.chmod(0o755)
+            with mock.patch(
+                "kyth_shared.vm_acceptance.HUB_BINARY", binary
+            ), mock.patch(
+                "kyth_shared.vm_acceptance._ensure_acceptance_graphical_session",
+                return_value=None,
+            ), mock.patch("kyth_shared.vm_acceptance.power"), mock.patch(
+                "kyth_shared.vm_acceptance.emit"
+            ):
+                with self.assertRaises(SystemExit):
+                    vm_acceptance.run_hub_acceptance()
+
+    def test_deep_link_failure_fails(self):
+        self._run_with_binary(self._enter(events=[], launch_check=False))
+
+    def test_first_launch_without_an_event_fails(self):
+        self._run_with_binary(self._enter(events=[None]))
+
+    def test_second_launch_with_the_wrong_page_fails(self):
+        events = [
+            {"page": "Welcome", "source": "initial"},
+            {"page": "Welcome", "source": "single-instance"},
+        ]
+        self._run_with_binary(self._enter(events=events))
+
+    def test_dashboard_not_degraded_fails(self):
+        events = [
+            {"page": "Welcome", "source": "initial"},
+            {"page": "Updates", "source": "single-instance"},
+            {"state": "ok", "label": "All good"},
+        ]
+        self._run_with_binary(self._enter(events=events))
+
+    def test_updates_probe_with_an_unusable_state_fails(self):
+        events = [
+            {"page": "Welcome", "source": "initial"},
+            {"page": "Updates", "source": "single-instance"},
+            {"state": "degraded", "label": "Status unavailable"},
+            {"state": "bogus"},
+            {"state": "expected"},
+        ]
+        self._run_with_binary(self._enter(events=events))
+
+    def test_privilege_probe_without_the_expected_state_fails(self):
+        events = [
+            {"page": "Welcome", "source": "initial"},
+            {"page": "Updates", "source": "single-instance"},
+            {"state": "degraded", "label": "Status unavailable"},
+            {"state": "ok"},
+            {"state": "unexpected"},
+        ]
+        self._run_with_binary(self._enter(events=events))
+
+
+class InstalledLifecycleVariantTests(unittest.TestCase):
+    def _enter_fresh(self, *, digest="sha256:aaa"):
+        stack = contextlib.ExitStack()
+        state_dir_holder = {}
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.read_update_ref", return_value=""))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.wait_for_desktop", return_value=True))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._selinux_enforcing"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance._first_boot_check"))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.run_smoke_check"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.run_hub_acceptance"))
+        stack.enter_context(mock.patch(
+            "kyth_shared.vm_acceptance.booted_digest", return_value=digest))
+        power = stack.enter_context(mock.patch("kyth_shared.vm_acceptance.power"))
+        stack.enter_context(mock.patch("kyth_shared.vm_acceptance.emit"))
+        return stack, power, state_dir_holder
+
+    def test_fresh_state_runs_the_variant_truth_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = pathlib.Path(tmp) / "state-dir"
+            stack, power, _holder = self._enter_fresh()
+            secure = stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.secure_boot_mode", return_value=True))
+            windows = stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.windows_mode", return_value=True))
+            network = stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.network_check_enabled",
+                return_value=True))
+            secure_check = stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance._secure_boot_check"))
+            windows_check = stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance._windows_ntfs_check"))
+            network_check = stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance._network_check"))
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.STATE_DIR", state_dir))
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.STATE_FILE", state_dir / "state"))
+            with stack:
+                vm_acceptance.run_installed_lifecycle()
+            secure_check.assert_called_once_with()
+            windows_check.assert_called_once_with()
+            network_check.assert_called_once_with()
+            power.assert_called_once_with("poweroff")
+
+    def test_fresh_state_fails_without_a_booted_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = pathlib.Path(tmp) / "state-dir"
+            stack, _power, _holder = self._enter_fresh(digest="")
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.network_check_enabled",
+                return_value=False))
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.STATE_DIR", state_dir))
+            stack.enter_context(mock.patch(
+                "kyth_shared.vm_acceptance.STATE_FILE", state_dir / "state"))
+            with stack:
+                with self.assertRaises(SystemExit):
+                    vm_acceptance.run_installed_lifecycle()
+
+
+class SmallBranchTests(unittest.TestCase):
+    def test_network_check_enabled_reads_fw_cfg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            flag = pathlib.Path(tmp) / "network-check"
+            flag.write_bytes(b"1")
+            with mock.patch(
+                "kyth_shared.vm_acceptance.NETWORK_CHECK_FILE", flag
+            ):
+                self.assertTrue(vm_acceptance.network_check_enabled())
+            flag.write_bytes(b"0")
+            with mock.patch(
+                "kyth_shared.vm_acceptance.NETWORK_CHECK_FILE", flag
+            ):
+                self.assertFalse(vm_acceptance.network_check_enabled())
+
+    def test_first_boot_check_fails_when_systemctl_failed_listing_breaks(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=_completed(1, "")
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._first_boot_check()
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=None
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._first_boot_check()
+
+    def test_selinux_check_fails_when_getenforce_is_unavailable(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=None
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._selinux_enforcing()
+
+    def test_network_check_fails_when_the_registry_host_does_not_resolve(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance._installer_target_ref",
+            return_value="ghcr.io/example/kyth:testing",
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=_completed(1, "")
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._network_check()
+
+    def test_network_check_fails_on_a_garbage_http_code(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance._installer_target_ref",
+            return_value="ghcr.io/example/kyth:testing",
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            side_effect=[
+                _completed(0, "140.82.121.34 ghcr.io\n"),
+                _completed(0, "garbage"),
+            ],
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._network_check()
+
+    def test_secure_boot_check_fails_when_mokutil_breaks(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=None
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._secure_boot_check()
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            return_value=_completed(1, ""),
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._secure_boot_check()
+
+    def test_secure_boot_check_fails_on_undeterminable_output(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            return_value=_completed(0, "mokutil: something unexpected\n"),
+        ), mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(SystemExit):
+                vm_acceptance._secure_boot_check()
+
+    def test_ntfs_uuids_handles_failures_and_a_device_argument(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=None
+        ):
+            self.assertEqual(vm_acceptance._ntfs_uuids(), [])
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=_completed(1, "")
+        ):
+            self.assertEqual(vm_acceptance._ntfs_uuids(), [])
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            return_value=_completed(0, "/dev/vda2 ntfs 5A8C4E2F12345678\n"),
+        ) as run_text:
+            self.assertEqual(
+                vm_acceptance._ntfs_uuids("/dev/vda"),
+                [("/dev/vda2", "5A8C4E2F12345678")],
+            )
+        run_text.assert_called_once_with(
+            ["lsblk", "-npro", "NAME,FSTYPE,UUID", "/dev/vda"], timeout=30
+        )
+
+    def test_windows_ntfs_check_skips_uuid_less_volumes(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance._ntfs_uuids",
+            return_value=[("/dev/vda1", ""), ("/dev/vda2", "UUID2")],
+        ), mock.patch("kyth_shared.vm_acceptance.emit") as emit:
+            vm_acceptance._windows_ntfs_check()
+        emit.assert_called_once_with(
+            "WINDOWS_NTFS_OK", "device=/dev/vda2 uuid=UUID2"
+        )
+
+    def test_report_failures_tolerates_malformed_check_entries(self):
+        report = _complete_report()
+        report["checks"].append("junk-entry")
+        report["checks"].append({"name": 42, "status": "fail"})
+        self.assertEqual(
+            vm_acceptance._report_failures(report),
+            ["installer check 42 failed"],
+        )
+        report = _complete_report()
+        report["checks"].append({"status": "fail"})
+        self.assertEqual(
+            vm_acceptance._report_failures(report),
+            ["installer check unknown failed"],
+        )
+
+    def test_daemon_error_message_falls_back_to_the_raw_body(self):
+        self.assertEqual(
+            vm_acceptance._daemon_error_message('{"message": 42}'),
+            '{"message": 42}',
+        )
+        self.assertEqual(
+            vm_acceptance._daemon_error_message('{"other": true}'),
+            '{"other": true}',
+        )
+        self.assertEqual(vm_acceptance._daemon_error_message("[1, 2]"), "[1, 2]")
+        self.assertEqual(
+            vm_acceptance._daemon_error_message("x" * 600), "x" * 512
+        )
+
+    def test_installer_target_ref_defaults_on_an_empty_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "kyth-installer.env"
+            env_file.write_text("KYTH_TARGET_IMAGE=\n")
+            with mock.patch(
+                "kyth_shared.vm_acceptance.INSTALLER_ENV_FILE", env_file
+            ):
+                self.assertEqual(
+                    vm_acceptance._installer_target_ref(),
+                    "ghcr.io/mrtrickdotorg/kyth:testing",
+                )
+            env_file.write_text("KYTH_TARGET_IMAGE=''\n")
+            with mock.patch(
+                "kyth_shared.vm_acceptance.INSTALLER_ENV_FILE", env_file
+            ):
+                self.assertEqual(
+                    vm_acceptance._installer_target_ref(),
+                    "ghcr.io/mrtrickdotorg/kyth:testing",
+                )
+
+    def test_booted_digest_returns_empty_for_a_list_payload(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            return_value=_completed(0, "[1, 2]"),
+        ):
+            self.assertEqual(vm_acceptance.booted_digest(), "")
+
+    def test_deployment_count_returns_zero_for_a_non_list_deployments(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text",
+            return_value=_completed(0, '{"deployments": 5}'),
+        ):
+            self.assertEqual(vm_acceptance.deployment_count(), 0)
+
+    def test_acceptance_disk_selection_skips_malformed_records(self):
+        inventory = [
+            "junk",
+            42,
+            {"name": "/dev/vda"},
+            {"name": "/dev/vdb", "current": False},
+        ]
+        self.assertEqual(
+            vm_acceptance._acceptance_disk_from_inventory(
+                inventory, pathlib.Path("/dev/vda")
+            ),
+            "/dev/vda",
+        )
+
+    def test_windows_target_skips_malformed_candidates(self):
+        gib = 1024 * 1024 * 1024
+        partitions = [
+            "junk",
+            {"name": "/dev/vda9", "size_bytes": 127 * gib,
+             "ntfs_resize_candidate": False},
+            {"name": 42, "size_bytes": 127 * gib,
+             "ntfs_resize_candidate": True},
+            {"name": "/dev/vda8", "size_bytes": "big",
+             "ntfs_resize_candidate": True},
+            {"name": "/dev/vda7", "size_bytes": 64 * gib,
+             "ntfs_resize_candidate": True},
+            {"name": "/dev/vda2", "size_bytes": 127 * gib,
+             "ntfs_resize_candidate": True},
+        ]
+        self.assertEqual(
+            vm_acceptance._windows_resize_target_from_partitions(partitions),
+            ("/dev/vda2", 63),
+        )
+
+    def test_installer_source_ref_returns_empty_when_fail_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "kyth_shared.vm_acceptance.INSTALLER_ENV_FILE",
+                pathlib.Path(tmp) / "absent",
+            ), mock.patch("kyth_shared.vm_acceptance.fail") as fail:
+                self.assertEqual(vm_acceptance._installer_source_ref(), "")
+            fail.assert_called_once_with(
+                "pinned installer source is missing from live image"
+            )
+
+    def test_hub_pages_returns_empty_when_fail_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "kyth_shared.vm_acceptance.HUB_ROUTE_MANIFEST",
+                pathlib.Path(tmp) / "absent.json",
+            ), mock.patch("kyth_shared.vm_acceptance.fail") as fail:
+                self.assertEqual(vm_acceptance._hub_pages(), ())
+            self.assertIn(
+                "Hub route manifest could not be read",
+                fail.call_args.args[0],
+            )
+
+    def test_initial_digest_returns_empty_when_fail_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "kyth_shared.vm_acceptance.STATE_DIR", pathlib.Path(tmp)
+            ), mock.patch("kyth_shared.vm_acceptance.fail") as fail:
+                self.assertEqual(vm_acceptance._initial_digest(), "")
+            fail.assert_called_once_with(
+                "initial deployment digest is missing"
+            )
+
+    def test_module_entrypoint_reports_the_disabled_state(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(ROOT / "build_files" / "kyth_shared")
+        result = subprocess.run(
+            [sys.executable, "-m", "kyth_shared.vm_acceptance", "enabled"],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        self.assertEqual(result.returncode, 1)
 
 
 if __name__ == "__main__":

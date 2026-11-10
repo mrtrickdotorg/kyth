@@ -68,22 +68,34 @@ def preflight(args: argparse.Namespace) -> tuple[int, str]:
         print(f"error: ISO changelog {args.iso_changelog} is empty", file=sys.stderr)
         return 1, ""
 
-    basenames = list(dict.fromkeys((args.iso_basename, args.channel_basename)))
-    artifacts = [path for basename in basenames for path in artifact_paths(args.source_dir, basename)]
-    for path in dict.fromkeys(artifacts):
+    # The versioned (immutable) basename carries the ISO itself plus its
+    # five sidecars. The channel basename never exists as an ISO file:
+    # the channel is a pointer — the R2 upload step copies the versioned
+    # ISO under the channel key — so only its five sidecars are staged
+    # (the build job writes the channel -CHECKSUM, the metadata step
+    # copies .sig/.bundle/.intoto.jsonl, the metadata generator writes
+    # .json). Requiring the channel ISO file here failed every publish:
+    # it is absent by design.
+    required = list(artifact_paths(args.source_dir, args.iso_basename))
+    if args.channel_basename != args.iso_basename:
+        required += artifact_paths(args.source_dir, args.channel_basename)[1:]
+    for path in dict.fromkeys(required):
         if not path.is_file() or path.stat().st_size == 0:
             print(f"error: expected release artifact missing or empty: {path}", file=sys.stderr)
             return 1, ""
 
-    for basename in basenames:
-        iso_path = args.source_dir / basename
-        checksum_path = Path(f"{iso_path}-CHECKSUM")
+    # Both CHECKSUM files record the versioned ISO's digest (the build
+    # job writes the channel one under the channel filename), so both
+    # verify against the one ISO file that exists.
+    iso_path = args.source_dir / args.iso_basename
+    actual = sha256_hexdigest(iso_path)
+    for basename in dict.fromkeys((args.iso_basename, args.channel_basename)):
+        checksum_path = Path(f"{args.source_dir / basename}-CHECKSUM")
         try:
             recorded = checksum_path.read_text(encoding="utf-8").split()
         except (OSError, ValueError) as exc:
             print(f"error: cannot read checksum file {checksum_path}: {exc}", file=sys.stderr)
             return 1, ""
-        actual = sha256_hexdigest(iso_path)
         if not recorded or recorded[0].lower() != actual:
             print(
                 f"error: checksum mismatch for {iso_path}: {checksum_path} records "
