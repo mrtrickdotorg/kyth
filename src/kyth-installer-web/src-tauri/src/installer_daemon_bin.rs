@@ -12,6 +12,7 @@ mod installer_guard;
 mod installer_job;
 mod installer_job_executor;
 mod installer_journal;
+mod installer_luks;
 mod installer_manual;
 mod installer_mount;
 mod installer_orchestration;

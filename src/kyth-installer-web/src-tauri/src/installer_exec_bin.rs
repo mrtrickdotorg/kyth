@@ -14,6 +14,8 @@ mod installer_disk;
 mod installer_guard;
 #[allow(dead_code)]
 mod installer_journal;
+#[allow(dead_code)]
+mod installer_luks;
 mod installer_manual;
 mod installer_orchestration;
 #[allow(dead_code)]
@@ -84,6 +86,7 @@ fn operation_args_valid(args: &[String]) -> bool {
                 | "alongside-home"
                 | "manual-mounts"
                 | "create-user"
+                | "luks-provision"
         )
 }
 
@@ -285,6 +288,19 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         let input = serde_json::from_slice::<installer_accounts::CreateUserInput>(&input)
             .map_err(|error| format!("invalid create-user JSON: {error}"))?;
         installer_accounts::apply(input)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args[1] == "luks-provision" {
+        // Format + open in one invocation so the passphrase crosses the
+        // stdin boundary exactly once. Nothing is printed on success or
+        // failure beyond the error text: cryptsetup diagnostics are
+        // consumed inside provision_luks, never echoed here, and the
+        // passphrase must not reach this process's stdout/stderr (the
+        // daemon captures the helper's output without logging it, but the
+        // secret gets no second home regardless).
+        let input = serde_json::from_slice::<installer_luks::LuksProvisionInput>(&input)
+            .map_err(|error| format!("invalid luks-provision JSON: {error}"))?;
+        installer_luks::provision_luks(input)?;
         return Ok(ExitCode::SUCCESS);
     }
     if args[1] == "fstab-append" {
@@ -524,6 +540,10 @@ mod tests {
         assert!(operation_args_valid(&[
             "--operation".into(),
             "create-user".into()
+        ]));
+        assert!(operation_args_valid(&[
+            "--operation".into(),
+            "luks-provision".into()
         ]));
     }
 

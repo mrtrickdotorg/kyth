@@ -65,7 +65,7 @@ class InstallerBootcCommandCoverageTests(unittest.TestCase):
                 encryption="luks",
             )
 
-    def test_filesystem_install_rejects_encryption(self):
+    def test_filesystem_install_rejects_tpm2_encryption(self):
         with self.assertRaisesRegex(RuntimeError, "encryption unsupported"):
             bootc_cmd._build_bootc_install_cmd(
                 "to-filesystem", "source", "target", "/mnt/root",
@@ -77,6 +77,27 @@ class InstallerBootcCommandCoverageTests(unittest.TestCase):
                 "to-filesystem", "source", "target", "/mnt/root"
             )
         self.assertNotIn("--block-setup", command)
+
+    def test_filesystem_install_accepts_passphrase_without_block_setup(self):
+        # Passphrase LUKS is provisioned by the installer before bootc
+        # runs; the filesystem install writes into the opened mapper and
+        # must not ask bootc for any block-setup.
+        with patch.object(bootc_cmd, "SKIP_FETCH_CHECK", False):
+            command = bootc_cmd._build_bootc_install_cmd(
+                "to-filesystem", "source", "target", "/mnt/root",
+                encryption="passphrase",
+            )
+        self.assertNotIn("--block-setup", command)
+        self.assertIn("--acknowledge-destructive", command)
+
+    def test_disk_install_rejects_passphrase(self):
+        # to-disk + passphrase would otherwise fall through to
+        # --block-setup direct: plaintext wearing an encrypted label.
+        with self.assertRaisesRegex(RuntimeError, "provisioned by the installer"):
+            bootc_cmd._build_bootc_install_cmd(
+                "to-disk", "source", "target", "/dev/sda",
+                encryption="passphrase",
+            )
 
     @patch("kyth_installer.install._as_root", side_effect=lambda argv: ["root", *argv])
     @patch.object(bootc_cmd, "get_rx_bytes", return_value=42)

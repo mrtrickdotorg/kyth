@@ -18,7 +18,10 @@ export component InstallerWindow inherits Window {
     in-out property <string> install-mode: "wipe";
     in-out property <string> kernel: "fedora";
     in-out property <string> encryption: "none";
+    in-out property <string> luks-passphrase: "";
     in-out property <bool> tpm-recovery-ack: false;
+    in-out property <string> recovery-key: "";
+    in-out property <bool> recovery-key-ack: false;
     in-out property <string> resize-gib: "64";
     in-out property <string> timezone: "UTC";
     in-out property <string> locale: "en_US.UTF-8";
@@ -60,7 +63,7 @@ export component InstallerWindow inherits Window {
     in-out property <bool> acknowledged-irreversible: false;
     in-out property <bool> confirm-erase: false;
     in-out property <bool> confirm-current: false;
-    in-out property <bool> start-enabled: selected-disk != "" && username != "" && password != "" && acknowledged-irreversible && confirm-erase && (encryption != "tpm2" || tpm-recovery-ack) && (install-mode != "manual" || manual-committed) && (install-mode != "wipe" || confirm-current) && (install-mode != "alongside" || target-partition != "") && (install-mode != "resize_ntfs" || target-partition != "") && (install-mode != "free_space" || free-region-end != free-region-start);
+    in-out property <bool> start-enabled: selected-disk != "" && username != "" && password != "" && acknowledged-irreversible && confirm-erase && (encryption != "tpm2" || tpm-recovery-ack) && (encryption != "passphrase" || (luks-passphrase != "" && install-mode == "wipe")) && (install-mode != "manual" || manual-committed) && (install-mode != "wipe" || confirm-current) && (install-mode != "alongside" || target-partition != "") && (install-mode != "resize_ntfs" || target-partition != "") && (install-mode != "free_space" || free-region-end != free-region-start);
     in-out property <bool> busy: false;
     in-out property <float> progress: 0;
     in-out property <string> event-log: "Waiting for installer events…";
@@ -208,12 +211,19 @@ export component InstallerWindow inherits Window {
                                 Text { text: "Encryption"; color: #9fb1d1; font-size: 12px; vertical-alignment: center; }
                                 Button { text: "None"; clicked => { encryption = "none"; select-encryption("none"); } }
                                 Button { text: "TPM2"; clicked => { encryption = "tpm2"; select-encryption("tpm2"); } }
-                                Text { text: "TPM2 needs a to-disk install and a recovery key plan."; color: #7f90af; font-size: 11px; vertical-alignment: center; wrap: word-wrap; }
+                                Button { text: "Passphrase"; clicked => { encryption = "passphrase"; select-encryption("passphrase"); } }
+                                Text { text: "TPM2 needs a to-disk install and a recovery key plan. Passphrase provisions an encrypted full-disk install you unlock by typing at boot."; color: #7f90af; font-size: 11px; vertical-alignment: center; wrap: word-wrap; }
                             }
                             HorizontalLayout {
                                 visible: encryption == "tpm2";
                                 spacing: 8px;
-                                CheckBox { text: "I escrowed a TPM recovery key and accept that a board swap, TPM reset, or PCR change destroys access without it."; checked <=> tpm-recovery-ack; }
+                                CheckBox { text: "I understand TPM unlock is bound to this machine. A one-time recovery key will be generated during the install and shown exactly once at the end; it is never stored, and if the TPM is reset or the board is replaced it is the only way to unlock the disk. I will record the recovery key when it is shown."; checked <=> tpm-recovery-ack; }
+                            }
+                            HorizontalLayout {
+                                visible: encryption == "passphrase";
+                                spacing: 8px;
+                                Text { text: "Disk passphrase"; color: #9fb1d1; font-size: 12px; vertical-alignment: center; }
+                                LineEdit { text <=> luks-passphrase; input-type: InputType.password; placeholder-text: "Typed at every boot to unlock the disk"; }
                             }
                             HorizontalLayout {
                                 spacing: 8px;
@@ -295,6 +305,19 @@ export component InstallerWindow inherits Window {
                             Text { text: event-log; color: #d8e2f5; font-size: 12px; wrap: word-wrap; }
                         }
                     }
+                    Rectangle {
+                        visible: recovery-key != "";
+                        background: #17243d;
+                        border-radius: 14px;
+                        VerticalLayout {
+                            padding: 18px;
+                            spacing: 8px;
+                            Text { text: "Disk recovery key — shown only once"; color: #f5f7ff; font-size: 15px; font-weight: 600; }
+                            Text { text: "KythOS does not store this key anywhere. Your disk unlocks automatically with this machine's TPM; if the TPM is reset or the board is replaced, this key is the only way to unlock the disk. Write it down and keep it somewhere safe."; color: #d8e2f5; font-size: 12px; wrap: word-wrap; }
+                            Text { text: recovery-key; color: #55d6bd; font-size: 14px; font-weight: 600; wrap: word-wrap; }
+                            CheckBox { text: "I have written down the recovery key."; checked <=> recovery-key-ack; }
+                        }
+                    }
                     Rectangle { vertical-stretch: 1; }
                     HorizontalLayout {
                         Button { text: "‹  Back"; enabled: back-enabled; clicked => { previous-step(); } }
@@ -303,7 +326,7 @@ export component InstallerWindow inherits Window {
                         Button { text: "Start install"; enabled: start-enabled && !busy; clicked => { start-install(); } }
                         Button { text: "Cancel"; enabled: busy; clicked => { cancel-install(); } }
                         Button { text: "Rescue probe"; clicked => { rescue-probe(); } }
-                        Button { text: "Reboot"; enabled: selected-step == "Done"; clicked => { reboot(); } }
+                        Button { text: "Reboot"; enabled: selected-step == "Done" && (recovery-key == "" || recovery-key-ack); clicked => { reboot(); } }
                         Rectangle { horizontal-stretch: 1; }
                         Text { text: "Review every destructive step before applying"; color: #60718f; font-size: 12px; vertical-alignment: center; }
                     }

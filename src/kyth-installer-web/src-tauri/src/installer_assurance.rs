@@ -32,9 +32,15 @@ pub(crate) struct AssuranceInput {
     pub keymap: String,
     pub timezone: String,
     pub username: String,
-    /// Encryption mode requested for the install (`"tpm2"` or `"none"`).
-    /// When `"tpm2"`, assurance requires a TPM-bound LUKS keyslot on the
-    /// target disk (M8) and fails the install otherwise.
+    /// Encryption mode requested for the install (`"tpm2"`,
+    /// `"passphrase"`, or `"none"`). When `"tpm2"`, assurance requires a
+    /// TPM-bound LUKS keyslot and an enrolled recovery key
+    /// (`systemd-tpm2` + `systemd-recovery` tokens) on the target disk
+    /// (M8) and fails the install otherwise. When `"passphrase"`,
+    /// assurance requires a populated LUKS2 keyslot on the target disk
+    /// and a deployment crypttab mapping `cryptroot` to that volume's
+    /// UUID with no `tpm2-device` option (the installer-provisioned
+    /// passphrase shape) and fails the install otherwise.
     ///
     /// NOTE: the native executor call site must populate these two fields;
     /// an empty `encryption` skips the check (never silently passes it).
@@ -342,23 +348,23 @@ fn tpm_token_present(luks_dump: &str) -> bool {
     luks_dump.contains("systemd-tpm2")
 }
 
-/// After a `tpm2` install, require a TPM-bound LUKS keyslot (M8): locate
-/// crypto_LUKS partitions on the target disk, dump each, and fail the
-/// install unless at least one carries the systemd-tpm2 token.
+/// Pure check over `cryptsetup luksDump` output: a recovery-key enrollment
+/// (systemd-cryptenroll --recovery-key) records a `systemd-recovery` token.
+fn recovery_token_present(luks_dump: &str) -> bool {
+    luks_dump.contains("systemd-recovery")
+}
+
+/// After a `tpm2` install, require a TPM-bound LUKS keyslot AND an
+/// enrolled recovery key (M8): locate crypto_LUKS partitions on the
+/// target disk, dump each, and fail the install unless at least one
+/// carries both the systemd-tpm2 and systemd-recovery tokens. The TPM
+/// token alone leaves a TPM reset or board swap unrecoverable; the
+/// recovery token alone cannot unlock the disk at boot.
 fn verify_tpm_encryption(target_disk: &str) -> Result<String, String> {
     let disk = crate::installer_plan::normalize_device_path(target_disk)
         .ok_or_else(|| "TPM encryption check needs a valid installed target disk".to_string())?;
     let listing = command_output("/usr/sbin/lsblk", &["-npro", "NAME,FSTYPE", &disk])?;
-    let mut luks_devices = Vec::new();
-    for line in listing.lines() {
-        let mut fields = line.split_whitespace();
-        match (fields.next(), fields.next()) {
-            (Some(name), Some(fstype)) if fstype.eq_ignore_ascii_case("crypto_LUKS") => {
-                luks_devices.push(name.to_string());
-            }
-            _ => {}
-        }
-    }
+    let luks_devices = crate::installer_luks::luks_devices(&listing);
     if luks_devices.is_empty() {
         return Err(format!(
             "TPM2 encryption was requested but no LUKS partition was found on {disk}"
@@ -366,11 +372,89 @@ fn verify_tpm_encryption(target_disk: &str) -> Result<String, String> {
     }
     for device in &luks_devices {
         let dump = command_output("/usr/sbin/cryptsetup", &["luksDump", device])?;
-        if tpm_token_present(&dump) {
-            return Ok(format!("TPM-bound keyslot verified on {device}"));
+        if tpm_token_present(&dump) && recovery_token_present(&dump) {
+            return Ok(format!(
+                "TPM-bound keyslot and recovery key verified on {device}"
+            ));
         }
     }
-    Err("TPM2 encryption was requested but no TPM-bound keyslot (systemd-tpm2 token) was found; the disk cannot be unlocked automatically".to_string())
+    Err("TPM2 encryption was requested but no LUKS device carries both a TPM-bound keyslot (systemd-tpm2 token) and an enrolled recovery key (systemd-recovery token); the disk cannot be unlocked automatically or recovered".to_string())
+}
+
+/// Pure check over `cryptsetup luksDump` output: at least one keyslot is
+/// populated with LUKS2 key material. Keyslot entries are the lines
+/// shaped `<slot>: luks2` (token and digest entries name other kinds, so
+/// they cannot satisfy this).
+fn password_keyslot_present(luks_dump: &str) -> bool {
+    luks_dump.lines().any(|line| {
+        let mut fields = line.trim().splitn(2, ':');
+        let (Some(slot), Some(kind)) = (fields.next(), fields.next()) else {
+            return false;
+        };
+        !slot.is_empty() && slot.bytes().all(|byte| byte.is_ascii_digit()) && kind.trim() == "luks2"
+    })
+}
+
+/// Pure check over deployment crypttab contents: a `cryptroot` entry maps
+/// the given LUKS UUID, and its options do NOT carry `tpm2-device` — the
+/// installer-provisioned passphrase shape. A TPM2-bound entry under the
+/// same name would mean the written configuration does not match the
+/// mode the user picked (and the passphrase alone could not unlock it).
+fn crypttab_is_passphrase_mode(contents: &str, luks_uuid: &str) -> bool {
+    let expected_source = format!("UUID={luks_uuid}");
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 2 && fields[0] == "cryptroot" && fields[1] == expected_source {
+            let options = fields.get(3).copied().unwrap_or_default();
+            return !options
+                .split(',')
+                .any(|option| option.trim().starts_with("tpm2-device"));
+        }
+    }
+    false
+}
+
+/// After a `passphrase` install, require the encrypted shape the storage
+/// phase provisioned: a LUKS partition on the target disk with a
+/// populated keyslot, plus the deployment crypttab entry that lets
+/// systemd-cryptsetup unlock it by passphrase at boot. Any mismatch
+/// fails the install — the system would otherwise boot to a disk it
+/// cannot unlock (or, worse, an unencrypted root that merely claims to
+/// be encrypted).
+fn verify_passphrase_encryption(target_disk: &str, etc: &Path) -> Result<String, String> {
+    let disk = crate::installer_plan::normalize_device_path(target_disk).ok_or_else(|| {
+        "passphrase encryption check needs a valid installed target disk".to_string()
+    })?;
+    let listing = command_output("/usr/sbin/lsblk", &["-npro", "NAME,FSTYPE", &disk])?;
+    let luks_devices = crate::installer_luks::luks_devices(&listing);
+    let device = luks_devices.first().ok_or_else(|| {
+        format!("passphrase encryption was requested but no LUKS partition was found on {disk}")
+    })?;
+    let dump = command_output("/usr/sbin/cryptsetup", &["luksDump", device])?;
+    if !password_keyslot_present(&dump) {
+        return Err(format!(
+            "passphrase encryption was requested but {device} has no populated LUKS2 keyslot; the passphrase cannot unlock the disk"
+        ));
+    }
+    let uuid = crate::installer_probe::lookup_uuid(crate::installer_probe::UuidInput {
+        device: device.clone(),
+    })?;
+    let crypttab_path = etc.join("crypttab");
+    regular_file(&crypttab_path, "crypttab")?;
+    let contents = fs::read_to_string(&crypttab_path)
+        .map_err(|error| format!("could not read installed crypttab: {error}"))?;
+    if !crypttab_is_passphrase_mode(&contents, &uuid) {
+        return Err(format!(
+            "passphrase encryption was requested but the installed crypttab does not map cryptroot to the LUKS volume UUID {uuid} in passphrase mode"
+        ));
+    }
+    Ok(format!(
+        "passphrase LUKS verified on {device} (cryptroot, UUID {uuid})"
+    ))
 }
 
 /// Extract the `SELINUX=` mode from config contents, following the parse
@@ -502,10 +586,17 @@ pub(crate) fn validate(input: AssuranceInput) -> Result<Vec<AssuranceCheck>, Str
     // enforcing. Fail the install if its SELinux config says otherwise.
     let selinux_detail = verify_selinux_enforcing(&etc)?;
 
-    // M8: a `tpm2` install must leave a TPM-bound LUKS keyslot behind;
-    // without it the disk cannot unlock at boot. Fail the install.
-    let encryption_detail = if input.encryption.trim().eq_ignore_ascii_case("tpm2") {
+    // M8: a `tpm2` install must leave a TPM-bound LUKS keyslot AND an
+    // enrolled recovery key behind; without the keyslot the disk cannot
+    // unlock at boot, and without the recovery key a TPM reset or board
+    // swap is unrecoverable. A `passphrase` install must leave the
+    // installer-provisioned shape behind: populated keyslot plus the
+    // passphrase-mode crypttab entry. Fail the install otherwise.
+    let encryption_mode = input.encryption.trim().to_ascii_lowercase();
+    let encryption_detail = if encryption_mode == "tpm2" {
         verify_tpm_encryption(&input.target_disk)?
+    } else if encryption_mode == "passphrase" {
+        verify_passphrase_encryption(&input.target_disk, &etc)?
     } else {
         "encryption not requested".to_string()
     };
@@ -707,6 +798,61 @@ mod tests {
         assert!(tpm_token_present(with_tpm));
         let without_tpm = "LUKS header information\n\nKeyslots:\n  0: luks2\n";
         assert!(!tpm_token_present(without_tpm));
+    }
+
+    #[test]
+    fn recovery_token_detection_reads_luks_dump() {
+        let with_recovery = "LUKS header information\n\nTokens:\n  0: systemd-tpm2\n     Keyslot:  1\n  1: systemd-recovery\n     Keyslot:  2\n\nKeyslots:\n  1: luks2\n  2: luks2\n";
+        assert!(recovery_token_present(with_recovery));
+        let without_recovery = "LUKS header information\n\nTokens:\n  0: systemd-tpm2\n     Keyslot:  1\n\nKeyslots:\n  1: luks2\n";
+        assert!(!recovery_token_present(without_recovery));
+    }
+
+    #[test]
+    fn tpm2_assurance_needs_both_tokens_on_the_same_dump() {
+        // verify_tpm_encryption requires tpm_token_present &&
+        // recovery_token_present over one device dump; pin the predicate
+        // combination it applies so neither token alone can pass.
+        let tpm_only = "Tokens:\n  0: systemd-tpm2\n     Keyslot:  1\n";
+        assert!(tpm_token_present(tpm_only));
+        assert!(!recovery_token_present(tpm_only));
+        let recovery_only = "Tokens:\n  0: systemd-recovery\n     Keyslot:  0\n";
+        assert!(!tpm_token_present(recovery_only));
+        assert!(recovery_token_present(recovery_only));
+        let both = "Tokens:\n  0: systemd-tpm2\n     Keyslot:  1\n  1: systemd-recovery\n     Keyslot:  2\n";
+        assert!(tpm_token_present(both) && recovery_token_present(both));
+    }
+
+    #[test]
+    fn password_keyslot_detection_reads_luks_dump() {
+        let populated = "LUKS header information\n\nTokens:\n  0: systemd-tpm2\n     Keyslot:  1\n\nKeyslots:\n  0: luks2\n";
+        assert!(password_keyslot_present(populated));
+        // A token entry alone is not a populated keyslot: the Tokens
+        // section names token kinds, never `luks2`.
+        let tokens_only =
+            "LUKS header information\n\nTokens:\n  0: systemd-tpm2\n     Keyslot:  1\n";
+        assert!(!password_keyslot_present(tokens_only));
+        let header_only = "LUKS header information\n\nKeyslots:\n";
+        assert!(!password_keyslot_present(header_only));
+        assert!(!password_keyslot_present(""));
+    }
+
+    #[test]
+    fn crypttab_passphrase_mode_reads_the_cryptroot_entry() {
+        let uuid = "1234abcd-1234-1234-1234-1234abcdef01";
+        let written = format!("# KythOS\ncryptroot UUID={uuid} none luks\n");
+        assert!(crypttab_is_passphrase_mode(&written, uuid));
+        // A TPM2-bound entry under the same name is a different mode and
+        // must not satisfy the passphrase check.
+        let tpm_bound = format!("cryptroot UUID={uuid} none luks,tpm2-device=auto\n");
+        assert!(!crypttab_is_passphrase_mode(&tpm_bound, uuid));
+        // A different volume's UUID, a missing entry, and a commented-out
+        // entry all fail.
+        let other = format!("cryptroot UUID=00000000-0000-0000-0000-000000000000 none luks\n");
+        assert!(!crypttab_is_passphrase_mode(&other, uuid));
+        assert!(!crypttab_is_passphrase_mode("", uuid));
+        let commented = format!("#cryptroot UUID={uuid} none luks\n");
+        assert!(!crypttab_is_passphrase_mode(&commented, uuid));
     }
 
     #[test]

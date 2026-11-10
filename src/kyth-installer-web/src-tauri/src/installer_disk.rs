@@ -251,6 +251,39 @@ fn required_device(raw: &str, label: &str) -> Result<String, String> {
     Ok(device)
 }
 
+/// A `/dev/mapper/<name>` device-mapper path with a single safe name
+/// component. `installer_plan::normalize_device_path` deliberately
+/// rejects multi-component basenames, but the installer's own LUKS
+/// mapping (`/dev/mapper/cryptroot`) is a legitimate format/mount target
+/// for the plans that provision passphrase installs; this is the narrow
+/// allowance for exactly that shape.
+fn mapper_device_path(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    let name = value.strip_prefix("/dev/mapper/")?;
+    if name.is_empty()
+        || name.contains('/')
+        || value.len() > MAX_PATH_BYTES
+        || value.contains("..")
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'+' | b':' | b'-')
+        })
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// A device path a plan may act on: a plain `/dev` node, or a
+/// device-mapper node via [`mapper_device_path`]. Mapper targets get
+/// their own ancestry validation at the call sites that need it
+/// (`build_mkfs`); everywhere else the plan shapes are identical.
+fn accepted_device(raw: &str, label: &str) -> Result<String, String> {
+    if let Some(mapper) = mapper_device_path(raw) {
+        return Ok(mapper);
+    }
+    required_device(raw, label)
+}
+
 fn safe_absolute_path(raw: &str, label: &str) -> Result<String, String> {
     let value = raw.trim();
     if value.is_empty()
@@ -519,7 +552,7 @@ fn build_mkfs(
     expected_disk: String,
     probes: &impl DiskProbes,
 ) -> Result<DiskPlan, String> {
-    let device = required_device(&device, "filesystem device")?;
+    let device = accepted_device(&device, "filesystem device")?;
     let expected_disk = required_device(&expected_disk, "expected disk")?;
     let snapshot = probes.lsblk_snapshot(
         None,
@@ -537,13 +570,21 @@ fn build_mkfs(
                 .to_string(),
         );
     }
+    if device.starts_with("/dev/mapper/") {
+        // A device-mapper node has no partition probe (no PARTN, no
+        // parttype GUID), so the partition-shaped validator below cannot
+        // see it. The only mapper target the installer formats is its own
+        // LUKS mapping; validate that exact shape by ancestry instead.
+        crate::installer_storage::validate_mapper_format_target(&snapshot, &disk, &device)?;
+        return build_mkfs_plan(device, fs, label);
+    }
     let sector_size = probes.logical_sector_size(&disk)?;
     crate::installer_storage::validate_format_target(&snapshot, &disk, &device, sector_size)?;
     build_mkfs_plan(device, fs, label)
 }
 
 fn build_mkfs_plan(device: String, fs: String, label: String) -> Result<DiskPlan, String> {
-    let device = required_device(&device, "filesystem device")?;
+    let device = accepted_device(&device, "filesystem device")?;
     let fs = normalized_name(&fs);
     let label = safe_label(label)?;
     let (binary, mut args): (&str, Vec<String>) = match fs.as_str() {
@@ -841,7 +882,7 @@ fn build_plan_with_probes(
             let device = if bind {
                 safe_absolute_path(&device, "mount source")?
             } else {
-                required_device(&device, "filesystem device")?
+                accepted_device(&device, "filesystem device")?
             };
             let mountpoint = safe_mountpoint(&mountpoint)?;
             let options = safe_mount_options(&options)?;
@@ -1060,6 +1101,81 @@ pub(crate) mod tests {
         })
         .expect_err("a partition on another disk must fail closed");
         assert!(error.contains("selected disk"), "{error}");
+    }
+
+    #[test]
+    fn formats_the_installers_own_luks_mapping_by_ancestry() {
+        // The passphrase flow formats /dev/mapper/cryptroot: a crypt node
+        // over the LUKS partition the installer just provisioned. The
+        // partition-shaped guard cannot see it (no PARTN), so build_mkfs
+        // validates the ancestry shape instead and projects mkfs.btrfs.
+        const MAPPER_SNAPSHOT: &str = r#"{
+            "blockdevices": [{
+                "name": "/dev/sda", "type": "disk", "size": 68719476736, "ro": false,
+                "children": [
+                    {
+                        "name": "/dev/sda1", "pkname": "/dev/sda", "type": "part", "partn": 1,
+                        "size": 536870912, "start": 2048, "ro": false, "fstype": "vfat",
+                        "parttype": "c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "mountpoints": [null]
+                    },
+                    {
+                        "name": "/dev/sda2", "pkname": "/dev/sda", "type": "part", "partn": 2,
+                        "size": 67645734912, "start": 1052672, "ro": false, "fstype": "crypto_LUKS",
+                        "mountpoints": [null],
+                        "children": [{
+                            "name": "/dev/mapper/cryptroot", "pkname": "/dev/sda2", "type": "crypt",
+                            "size": 67641466880, "ro": false, "mountpoints": [null]
+                        }]
+                    }
+                ]
+            }]
+        }"#;
+        let probes = FixtureDiskProbes {
+            snapshot: MAPPER_SNAPSHOT,
+            sector_size: 512,
+        };
+        let format = |expected_disk: &str| DiskOperationInput::FormatFilesystem {
+            device: "/dev/mapper/cryptroot".into(),
+            fs: "btrfs".into(),
+            label: "KythOS".into(),
+            expected_disk: expected_disk.into(),
+        };
+        let plan = build_plan_with_probes(format("/dev/sda"), &probes)
+            .expect("the installer's own LUKS mapping should be formattable");
+        assert_eq!(
+            plan.argv,
+            [
+                "/usr/sbin/mkfs.btrfs",
+                "-f",
+                "-L",
+                "KythOS",
+                "/dev/mapper/cryptroot"
+            ]
+        );
+        // The same mapping under another disk's plan fails closed.
+        let error = build_plan_with_probes(format("/dev/sdb"), &probes)
+            .expect_err("a mapping on another disk must fail closed");
+        assert!(error.contains("selected disk"), "{error}");
+        // Mounting the mapping projects the plain mount argv.
+        let mount = build_plan(DiskOperationInput::MountFilesystem {
+            device: "/dev/mapper/cryptroot".into(),
+            mountpoint: "/run/kyth-installer/btrfs-root".into(),
+            options: vec![],
+            bind: false,
+        })
+        .expect("mount plan should validate");
+        assert_eq!(
+            mount.argv,
+            [
+                "/usr/sbin/mount",
+                "/dev/mapper/cryptroot",
+                "/run/kyth-installer/btrfs-root"
+            ]
+        );
+        // Mapper paths with nested components never normalize.
+        assert!(mapper_device_path("/dev/mapper/../cryptroot").is_none());
+        assert!(mapper_device_path("/dev/mapper/a/b").is_none());
+        assert!(mapper_device_path("/dev/sda2").is_none());
     }
 
     #[test]

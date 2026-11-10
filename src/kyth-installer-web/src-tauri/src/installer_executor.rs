@@ -83,6 +83,7 @@ mod tests {
                 root_subvolume: false,
                 wipe: true,
                 encryption: "none".to_string(),
+                root_kargs: Vec::new(),
                 tpm_recovery_ack: false,
             },
             configuration: ConfigurationInput {
@@ -130,6 +131,7 @@ mod tests {
                 root_subvolume: false,
                 wipe: true,
                 encryption: "none".into(),
+                root_kargs: Vec::new(),
                 tpm_recovery_ack: false,
             },
             configuration: ConfigurationInput {

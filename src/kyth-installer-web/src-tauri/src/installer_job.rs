@@ -73,6 +73,16 @@ pub(crate) trait PhaseExecutor: Send + Sync + 'static {
     fn success_mok_state(&self) -> Option<String> {
         None
     }
+
+    /// Return the one-time LUKS recovery key generated for a successful
+    /// TPM2 install. Take-once: the supervisor calls this exactly once,
+    /// while appending the terminal Done event, and implementations must
+    /// not hand the same key out twice. The key is never persisted — it
+    /// rides only this terminal event, in the daemon's in-memory event
+    /// history, to the session-authenticated local client.
+    fn success_recovery_key(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -89,6 +99,13 @@ pub(crate) enum JobEventKind {
         /// Frontends gate the reboot button on this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requires_reboot_confirmation: Option<bool>,
+        /// One-time LUKS recovery key for TPM2 installs, shown to the
+        /// user exactly once at completion and never stored. It is
+        /// delivered only on this terminal event over the
+        /// session-authenticated local stream; it never enters the
+        /// on-disk transaction, `/api/report`, or the installer log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery_key: Option<String>,
     },
     Error {
         message: String,
@@ -477,6 +494,9 @@ fn run_worker<E: PhaseExecutor>(shared: Arc<Shared<E>>, job_id: u64) {
     // can gate reboot on enrollment acknowledgement.
     let requires_reboot_confirmation =
         matches!(mok_state.as_deref(), Some("staged") | Some("pending"));
+    // Take-once: the recovery key moves into exactly this one terminal
+    // event; the executor cannot hand it out again afterwards.
+    let recovery_key = shared.executor.success_recovery_key();
     state.runtime.lifecycle = Lifecycle::Done;
     state.runtime.phase = Phase::Complete;
     state.runtime.cancel_requested = false;
@@ -488,6 +508,7 @@ fn run_worker<E: PhaseExecutor>(shared: Arc<Shared<E>>, job_id: u64) {
         JobEventKind::Done {
             mok_state,
             requires_reboot_confirmation: requires_reboot_confirmation.then_some(true),
+            recovery_key,
         },
     ));
     shared.changed.notify_all();
@@ -555,6 +576,7 @@ mod tests {
         cleanup_complete: AtomicBool,
         instances: AtomicUsize,
         mok_state: Mutex<Option<String>>,
+        recovery_key: Mutex<Option<String>>,
     }
 
     impl FakeExecutor {
@@ -573,6 +595,10 @@ mod tests {
 
         fn set_mok_state(&self, state: &str) {
             *self.mok_state.lock().unwrap() = Some(state.to_string());
+        }
+
+        fn set_recovery_key(&self, key: &str) {
+            *self.recovery_key.lock().unwrap() = Some(key.to_string());
         }
 
         fn wait_until_entered(&self) {
@@ -608,6 +634,10 @@ mod tests {
             }
             Ok(())
         }
+
+        fn success_recovery_key(&self) -> Option<String> {
+            self.recovery_key.lock().unwrap().take()
+        }
     }
 
     fn supervisor() -> (JobSupervisor<ArcExecutor>, Arc<FakeExecutor>) {
@@ -629,6 +659,10 @@ mod tests {
 
         fn success_mok_state(&self) -> Option<String> {
             self.0.mok_state.lock().unwrap().clone()
+        }
+
+        fn success_recovery_key(&self) -> Option<String> {
+            self.0.success_recovery_key()
         }
     }
 
@@ -680,6 +714,7 @@ mod tests {
             JobEventKind::Done {
                 mok_state: None,
                 requires_reboot_confirmation: None,
+                recovery_key: None,
             }
         );
     }
@@ -698,12 +733,49 @@ mod tests {
             JobEventKind::Done {
                 mok_state: Some("staged".to_string()),
                 requires_reboot_confirmation: Some(true),
+                recovery_key: None,
             }
         );
         let encoded = serde_json::to_value(event).unwrap();
         assert_eq!(encoded["type"], "done");
         assert_eq!(encoded["mok_state"], "staged");
         assert_eq!(encoded["requires_reboot_confirmation"], true);
+        // No recovery key was generated, so the field must be absent from
+        // the wire shape entirely (skip_serializing_if), not null.
+        assert!(encoded.get("recovery_key").is_none());
+    }
+
+    #[test]
+    fn successful_terminal_event_carries_recovery_key_exactly_once() {
+        let (supervisor, executor) = supervisor();
+        executor.set_recovery_key(
+            "abc2def3-ghi4jkl5-mno6pqr7-stu2vwx3-yzab4cde-5fgh6ijk-7lmn2opq-3rst4uvw",
+        );
+        supervisor.start().unwrap();
+        executor.release();
+        terminal(&supervisor);
+
+        let event = supervisor.replay(0).unwrap().events.pop().unwrap();
+        assert_eq!(
+            event.kind,
+            JobEventKind::Done {
+                mok_state: None,
+                requires_reboot_confirmation: None,
+                recovery_key: Some(
+                    "abc2def3-ghi4jkl5-mno6pqr7-stu2vwx3-yzab4cde-5fgh6ijk-7lmn2opq-3rst4uvw"
+                        .to_string()
+                ),
+            }
+        );
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "done");
+        assert_eq!(
+            encoded["recovery_key"],
+            "abc2def3-ghi4jkl5-mno6pqr7-stu2vwx3-yzab4cde-5fgh6ijk-7lmn2opq-3rst4uvw"
+        );
+        // Take-once: the supervisor consumed the key into the terminal
+        // event, so the executor cannot hand it out a second time.
+        assert_eq!(executor.success_recovery_key(), None);
     }
 
     #[test]

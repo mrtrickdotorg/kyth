@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 const EFI_PART_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
-const MIN_KYTHOS_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+pub(crate) const MIN_KYTHOS_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const NTFS_MIN_BYTES: u64 = (64 + 32) * 1024 * 1024 * 1024;
 const BIOS_BOOT_GUID: &str = "21686148-6449-6e6f-744e-656564454649";
 const GPT_RESERVE_BYTES: u64 = 1024 * 1024;
@@ -453,6 +453,80 @@ pub(crate) fn validate_format_target(
         );
     }
     Ok(probe)
+}
+
+/// Validate a device-mapper node as an mkfs target.
+///
+/// The partition-shaped validators cannot see a mapper device (it has no
+/// PARTN and no parttype GUID), but formatting one is not a free-for-all:
+/// the only mapper node the installer ever formats is its own LUKS
+/// mapping, provisioned minutes earlier in the same install. Require
+/// exactly that shape, from the same fresh snapshot the caller already
+/// resolved the parent disk from: type `crypt`, no mounts on the node or
+/// below it, and a direct parent that is a `crypto_LUKS` partition of
+/// the selected disk.
+pub(crate) fn validate_mapper_format_target(
+    input: &str,
+    disk: &str,
+    mapper: &str,
+) -> Result<(), String> {
+    let disk = normalize_device_path(disk)
+        .ok_or_else(|| "mapper format validation has an invalid disk".to_string())?;
+    let mapper = normalize_device_path(mapper)
+        .filter(|value| value.starts_with("/dev/mapper/"))
+        .ok_or_else(|| "mapper format target is not a device-mapper path".to_string())?;
+    let snapshot = parse_snapshot(input)?;
+    fn find<'a>(devices: &'a [LsblkDevice], name: &str) -> Option<&'a LsblkDevice> {
+        for device in devices {
+            if device
+                .name
+                .as_deref()
+                .and_then(normalize_device_path)
+                .as_deref()
+                == Some(name)
+            {
+                return Some(device);
+            }
+            if let Some(found) = find(&device.children, name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let device = find(&snapshot.blockdevices, &mapper)
+        .ok_or_else(|| "mapper format target was not present in storage probe".to_string())?;
+    if device.device_type.as_deref() != Some("crypt") {
+        return Err("mapper format target is not a device-mapper crypt device.".to_string());
+    }
+    if !mountpoints(device).is_empty() || !descendant_mountpoints(device).is_empty() {
+        return Err("The mapper device is mounted; refusing to format it.".to_string());
+    }
+    let parent_name = device
+        .pkname
+        .as_deref()
+        .and_then(normalize_device_path)
+        .ok_or_else(|| "mapper format target has no parent device in storage probe".to_string())?;
+    let parent = find(&snapshot.blockdevices, &parent_name).ok_or_else(|| {
+        "mapper format target's parent was not present in storage probe".to_string()
+    })?;
+    if parent.device_type.as_deref() != Some("part")
+        || !parent
+            .fstype
+            .as_deref()
+            .is_some_and(|fstype| fstype.eq_ignore_ascii_case("crypto_LUKS"))
+    {
+        return Err(
+            "mapper format target does not sit on a LUKS partition; refusing to format it."
+                .to_string(),
+        );
+    }
+    if parent_disk_in_snapshot(input, &mapper)? != Some(disk) {
+        return Err(
+            "mapper format target is not on the install plan's selected disk; refusing to format it."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// The ESP selected from a fresh snapshot, including a safe live-session
@@ -1513,6 +1587,46 @@ mod tests {
             "/dev/sda1"
         );
         assert!(new_partition_from_snapshots(before, after, 8192 * 512, 34359738368, 512).is_err());
+    }
+
+    #[test]
+    fn mapper_format_target_accepts_only_unmounted_luks_mappings() {
+        let snapshot = r#"{"blockdevices":[{"name":"/dev/sda","type":"disk","children":[
+            {"name":"/dev/sda1","type":"part","partn":1,"fstype":"vfat","parttype":"c12a7328-f81f-11d2-ba4b-00a0c93ec93b","mountpoints":[null]},
+            {"name":"/dev/sda2","type":"part","partn":2,"fstype":"crypto_LUKS","pkname":"/dev/sda","mountpoints":[null],"children":[
+                {"name":"/dev/mapper/cryptroot","type":"crypt","pkname":"/dev/sda2","mountpoints":[null]}
+            ]}
+        ]}]}"#;
+        assert!(
+            validate_mapper_format_target(snapshot, "/dev/sda", "/dev/mapper/cryptroot").is_ok()
+        );
+
+        // A mounted mapping is never a format target.
+        let mounted = snapshot.replace(
+            r#""name":"/dev/mapper/cryptroot","type":"crypt","pkname":"/dev/sda2","mountpoints":[null]"#,
+            r#""name":"/dev/mapper/cryptroot","type":"crypt","pkname":"/dev/sda2","mountpoints":["/mnt"]"#,
+        );
+        assert!(
+            validate_mapper_format_target(&mounted, "/dev/sda", "/dev/mapper/cryptroot")
+                .unwrap_err()
+                .contains("mounted")
+        );
+
+        // The same mapping on another disk fails the ancestry check.
+        assert!(
+            validate_mapper_format_target(snapshot, "/dev/sdb", "/dev/mapper/cryptroot").is_err()
+        );
+
+        // A mapper node that is not a crypt device over a LUKS partition
+        // (here: an LVM logical volume) is refused.
+        let lvm = snapshot
+            .replace(r#""type":"crypt""#, r#""type":"lvm""#)
+            .replace("crypto_LUKS", "LVM2_member");
+        assert!(validate_mapper_format_target(&lvm, "/dev/sda", "/dev/mapper/cryptroot").is_err());
+
+        // Partition paths and missing nodes are refused.
+        assert!(validate_mapper_format_target(snapshot, "/dev/sda", "/dev/sda2").is_err());
+        assert!(validate_mapper_format_target(snapshot, "/dev/sda", "/dev/mapper/absent").is_err());
     }
 
     #[test]

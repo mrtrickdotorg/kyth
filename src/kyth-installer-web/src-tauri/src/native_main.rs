@@ -56,6 +56,7 @@ struct InstallState {
     username: String,
     password: String,
     mok_password: String,
+    luks_passphrase: String,
     kernel: String,
     encryption: String,
     tpm_recovery_ack: bool,
@@ -86,6 +87,7 @@ impl Default for InstallState {
             username: String::new(),
             password: String::new(),
             mok_password: String::new(),
+            luks_passphrase: String::new(),
             kernel: "fedora".into(),
             encryption: "none".into(),
             tpm_recovery_ack: false,
@@ -115,6 +117,7 @@ impl InstallState {
             "username": self.username,
             "password": self.password,
             "mok_password": self.mok_password,
+            "luks_passphrase": self.luks_passphrase,
             "kernel": self.kernel,
             "encryption": self.encryption,
             "tpm_recovery_ack": self.tpm_recovery_ack,
@@ -131,6 +134,8 @@ impl InstallState {
             && self.acknowledged_irreversible
             && self.confirm_erase
             && (self.encryption != "tpm2" || self.tpm_recovery_ack)
+            && (self.encryption != "passphrase"
+                || (!self.luks_passphrase.is_empty() && self.install_mode == "wipe"))
             && (self.install_mode != "manual" || self.manual_committed)
             && (self.install_mode != "wipe" || self.confirm_current)
             && (self.install_mode != "alongside" || !self.target_partition.is_empty())
@@ -508,6 +513,16 @@ fn stream_install_events(weak: Weak<InstallerWindow>, config: ConnectionArgs) {
                                             window.set_transaction_text(SharedString::from(
                                                 "Installation complete",
                                             ));
+                                            // H7: a TPM2 install's one-time
+                                            // recovery key rides only this
+                                            // terminal event; surface it for
+                                            // the Done step's record-and-ack
+                                            // panel (absent for other modes).
+                                            if let Some(key) =
+                                                event.get("recovery_key").and_then(Value::as_str)
+                                            {
+                                                window.set_recovery_key(SharedString::from(key));
+                                            }
                                             window.set_event_log(SharedString::from("Installation complete. Remove the installation media before rebooting."));
                                             window.set_busy(false);
                                             window.set_selected_step(SharedString::from("Done"));
@@ -995,6 +1010,7 @@ fn request_from_window(window: &InstallerWindow, state: &Arc<Mutex<InstallState>
     request.username = window.get_username().to_string();
     request.password = window.get_password().to_string();
     request.mok_password = window.get_mok_password().to_string();
+    request.luks_passphrase = window.get_luks_passphrase().to_string();
     request.encryption = window.get_encryption().to_string();
     request.tpm_recovery_ack = window.get_tpm_recovery_ack();
     request.acknowledged_irreversible = window.get_acknowledged_irreversible();
@@ -1265,6 +1281,7 @@ fn scrub_install_secrets(state: &Arc<Mutex<InstallState>>) {
     if let Ok(mut state) = state.lock() {
         state.password.clear();
         state.mok_password.clear();
+        state.luks_passphrase.clear();
     }
 }
 
@@ -1287,6 +1304,7 @@ fn start_install(
                 if let Some(window) = weak.upgrade() {
                     window.set_password(SharedString::from(""));
                     window.set_mok_password(SharedString::from(""));
+                    window.set_luks_passphrase(SharedString::from(""));
                 }
             }
         });
@@ -1634,6 +1652,7 @@ fn main() -> Result<(), slint::PlatformError> {
             // so the cached state can never promise a mode the plan rejects.
             state.encryption = match encryption.as_str() {
                 "tpm2" => "tpm2".to_string(),
+                "passphrase" => "passphrase".to_string(),
                 _ => "none".to_string(),
             };
             if state.encryption != "tpm2" {
@@ -1662,6 +1681,10 @@ fn main() -> Result<(), slint::PlatformError> {
             };
             window.set_busy(true);
             window.set_error_text(SharedString::from(""));
+            // A new install must not inherit a previous install's
+            // one-time recovery key (or its acknowledgement).
+            window.set_recovery_key(SharedString::from(""));
+            window.set_recovery_key_ack(false);
             window.set_event_log(SharedString::from(install_plan_summary(&plan)));
             start_install(
                 start_weak.clone(),
@@ -1762,6 +1785,30 @@ mod tests {
     }
 
     #[test]
+    fn passphrase_requires_a_passphrase_and_a_wipe_install() {
+        // The request carries the passphrase so the daemon can provision
+        // LUKS with it; start stays blocked until a passphrase exists and
+        // the mode is the full-disk wipe the provisioning supports.
+        let mut state = InstallState::default();
+        state.disk = "/dev/sda".into();
+        state.username = "alice".into();
+        state.password = "secret".into();
+        state.confirm_erase = true;
+        state.confirm_current = true;
+        state.acknowledged_irreversible = true;
+        state.encryption = "passphrase".into();
+        assert!(!state.can_start());
+        state.luks_passphrase = "correct horse battery staple".into();
+        assert!(state.can_start());
+        assert_eq!(
+            state.as_request()["luks_passphrase"],
+            "correct horse battery staple"
+        );
+        state.install_mode = "alongside".into();
+        assert!(!state.can_start());
+    }
+
+    #[test]
     fn install_start_scrubs_retained_passwords() {
         // Mirrors the React frontend clearing password/mok_password from its
         // request state after start(): the native shell must not retain the
@@ -1771,12 +1818,14 @@ mod tests {
             let mut guard = state.lock().expect("installer state lock poisoned");
             guard.password = "secret".into();
             guard.mok_password = "mok-secret".into();
+            guard.luks_passphrase = "disk-secret".into();
             guard.username = "alice".into();
         }
         scrub_install_secrets(&state);
         let guard = state.lock().expect("installer state lock poisoned");
         assert!(guard.password.is_empty());
         assert!(guard.mok_password.is_empty());
+        assert!(guard.luks_passphrase.is_empty());
         // Non-secret fields are untouched.
         assert_eq!(guard.username, "alice");
     }

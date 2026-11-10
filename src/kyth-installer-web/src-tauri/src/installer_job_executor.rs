@@ -38,6 +38,12 @@ pub(crate) struct NativeInstallRequest {
     pub execution: InstallerExecutionInput,
     pub manual_mounts: Option<crate::installer_manual::ManualMountsInput>,
     pub secure_boot_password: String,
+    /// Disk passphrase for `encryption == "passphrase"` installs, in the
+    /// same plain-String request posture as `secure_boot_password`: the
+    /// executor moves it into a `Zeroizing` field at construction, and it
+    /// is consumed (and wiped) by the Storage phase. It never enters a
+    /// plan, the transaction file, or a report.
+    pub luks_passphrase: String,
     pub transaction_path: String,
 }
 
@@ -141,10 +147,34 @@ impl NativeInstallRequest {
         // (installer_plan.rs rejects the empty mode) instead of silently
         // defaulting to "wipe" and full-disk-erasing on a malformed request.
         let install_mode = text("install_mode", "").to_ascii_lowercase();
+        let encryption = text("encryption", "none");
+        let encryption_mode = encryption.trim().to_ascii_lowercase();
+        let luks_passphrase = text("luks_passphrase", "");
+        // H7: passphrase LUKS is provisioned by the installer itself, so
+        // it is valid only as a full-disk (wipe) install whose target the
+        // storage phase lays out from scratch. Reject the mismatches
+        // here, before any plan is built: a passphrase mode without a
+        // passphrase, a passphrase offered for any other mode (a stray
+        // secret the install would silently ignore), and passphrase
+        // encryption combined with a layout the installer does not
+        // provision.
+        if encryption_mode == "passphrase" {
+            if install_mode != "wipe" {
+                return Err("passphrase encryption requires Erase full disk (install_mode \"wipe\"): the installer provisions the encrypted layout itself, so it cannot be combined with alongside, free-space, NTFS-resize, or manual installs.".to_string());
+            }
+            if luks_passphrase.is_empty() {
+                return Err("passphrase encryption requires a disk passphrase: luks_passphrase must name the passphrase that will unlock the disk at boot.".to_string());
+            }
+        } else if !luks_passphrase.is_empty() {
+            return Err("a disk passphrase was supplied but passphrase encryption was not selected; refusing to accept a secret the install would not use.".to_string());
+        }
+        // Passphrase installs are filesystem installs in bootc shape (the
+        // provisioned mapper is mounted and written with to-filesystem),
+        // whatever the partitioning mode derivation says.
         let filesystem_install = matches!(
             install_mode.as_str(),
             "alongside" | "manual" | "free_space" | "resize_ntfs"
-        );
+        ) || encryption_mode == "passphrase";
         // Implied by the mode, never a separate request key: bootc to-disk
         // refuses a partitioned disk without --wipe, and no frontend sends
         // one. Filesystem installs never wipe the disk.
@@ -245,8 +275,15 @@ impl NativeInstallRequest {
                     // configuration phase still has to write into it.
                     skip_finalize: filesystem_install,
                     root_subvolume: flag("root_subvolume", filesystem_install),
-                    wipe: erase_disk,
-                    encryption: text("encryption", "none"),
+                    // --wipe is a to-disk-only bootc flag; filesystem
+                    // installs (including passphrase provisioning, whose
+                    // erasure the storage phase performs itself) never
+                    // carry it.
+                    wipe: erase_disk && !filesystem_install,
+                    encryption: encryption.clone(),
+                    // Populated by the image phase for passphrase installs
+                    // once Storage knows the LUKS UUID; empty here.
+                    root_kargs: Vec::new(),
                     tpm_recovery_ack: flag("tpm_recovery_ack", false),
                 },
                 configuration: crate::installer_configuration::ConfigurationInput {
@@ -269,6 +306,7 @@ impl NativeInstallRequest {
             },
             manual_mounts,
             secure_boot_password: text("mok_password", ""),
+            luks_passphrase,
             transaction_path: text(
                 "transaction_path",
                 &std::env::var("KYTH_INSTALLER_TRANSACTION")
@@ -360,6 +398,21 @@ pub(crate) struct NativePhaseExecutor {
     // L1: the MOK password is zeroized when the executor drops, so a crash
     // dump or a lingering process image cannot expose it after staging.
     secure_boot_password: zeroize::Zeroizing<String>,
+    // H7: the one-time LUKS recovery key generated during Configure for
+    // TPM2 installs. Held only in this in-memory field (zeroized on drop);
+    // the job supervisor takes it exactly once for the terminal Done
+    // event. It never enters the transaction file, /api/report, or the
+    // installer log.
+    recovery_key: Mutex<Option<zeroize::Zeroizing<String>>>,
+    // H7 Slice B: the disk passphrase for `passphrase` installs. Held
+    // only until the Storage phase has consumed it (provisioning runs
+    // there), then wiped; zeroized on drop regardless. It never enters a
+    // plan, the transaction file, /api/report, or the installer log.
+    luks_passphrase: Mutex<zeroize::Zeroizing<String>>,
+    // H7 Slice B: the LUKS volume UUID, probed by Storage after
+    // provisioning and consumed by Image (boot kargs) and Configure
+    // (crypttab). Not a secret.
+    luks_uuid: Mutex<Option<String>>,
     transaction_id: String,
     transaction_path: String,
     transaction: Mutex<crate::installer_transaction::TransactionState>,
@@ -432,6 +485,7 @@ impl NativePhaseExecutor {
         let secure_boot_kernel = request.execution.secure_boot.kernel.clone();
         let secure_boot_force_stage = request.execution.secure_boot.force_stage;
         let secure_boot_password = zeroize::Zeroizing::new(request.secure_boot_password);
+        let luks_passphrase = zeroize::Zeroizing::new(request.luks_passphrase);
         let transaction_path = request.transaction_path;
         let skip_fetch_check = request.execution.bootc.skip_fetch_check;
         let mut storage_plan = installer_plan::build_plan(request.storage)?;
@@ -477,6 +531,9 @@ impl NativePhaseExecutor {
             secure_boot_kernel,
             secure_boot_force_stage,
             secure_boot_password,
+            recovery_key: Mutex::new(None),
+            luks_passphrase: Mutex::new(luks_passphrase),
+            luks_uuid: Mutex::new(None),
             transaction_id: transaction_id.clone(),
             transaction_path,
             transaction: Mutex::new(transaction),
@@ -508,6 +565,7 @@ impl NativePhaseExecutor {
                 root_subvolume: false,
                 wipe: false,
                 encryption: String::new(),
+                root_kargs: Vec::new(),
                 tpm_recovery_ack: false,
             },
             account: None,
@@ -517,6 +575,9 @@ impl NativePhaseExecutor {
             secure_boot_kernel: "fedora".to_string(),
             secure_boot_force_stage: false,
             secure_boot_password: zeroize::Zeroizing::new(String::new()),
+            recovery_key: Mutex::new(None),
+            luks_passphrase: Mutex::new(zeroize::Zeroizing::new(String::new())),
+            luks_uuid: Mutex::new(None),
             transaction_id: transaction_id.clone(),
             transaction_path: "/run/kyth-installer/txn/transaction.json".to_string(),
             transaction: Mutex::new(transaction),
@@ -701,6 +762,16 @@ impl NativePhaseExecutor {
             Phase::SecureBoot => self.execute_secure_boot(phase, cancellation),
             Phase::Complete => self.execute_complete(phase),
         };
+        // H7 Slice B: the disk passphrase is consumed by the Storage
+        // phase (provisioning) and by nothing after it. Wipe the retained
+        // copy the moment Storage ends, whatever its outcome, so the
+        // secret does not ride along in executor memory for the rest of
+        // the install.
+        if matches!(phase, Phase::Storage) {
+            if let Ok(mut held) = self.luks_passphrase.lock() {
+                *held = zeroize::Zeroizing::new(String::new());
+            }
+        }
         result?;
 
         let completion = match phase {
@@ -1165,6 +1236,54 @@ impl NativePhaseExecutor {
                 })?;
                 self.execute_fixed_helper(phase, cancellation, "create-user", &request)?;
             }
+            // H7 Slice B: for passphrase installs, write the deployment's
+            // crypttab immediately BEFORE assurance runs, so assurance
+            // verifies the exact entry the installed system will boot
+            // with: `cryptroot` bound to the LUKS volume UUID, unlocked
+            // by passphrase — deliberately NO `tpm2-device` option,
+            // because nothing TPM-bound was enrolled on this volume.
+            if self.passphrase_encryption() {
+                let uuid = self
+                    .luks_uuid
+                    .lock()
+                    .map_err(|_| NativePhaseError::Execution {
+                        phase,
+                        message: "native LUKS UUID state is unavailable".to_string(),
+                    })?
+                    .clone()
+                    .ok_or_else(|| NativePhaseError::Execution {
+                        phase,
+                        message: "passphrase install reached configure without a LUKS UUID from the storage phase".to_string(),
+                    })?;
+                let crypttab_path = format!("{deploy_root}/etc/crypttab");
+                let crypttab = format!("cryptroot UUID={uuid} none luks\n");
+                Self::write_file_atomic(&crypttab_path, crypttab.as_bytes(), phase)?;
+            }
+            // H7: for TPM2 installs, enroll the one-time LUKS recovery
+            // key immediately BEFORE assurance runs, so assurance can
+            // independently verify the systemd-recovery token in the same
+            // phase. Generation captures cryptenroll's output (never the
+            // streaming helpers — their stdout lands in the persisted
+            // installer log) and the key is held only in memory. Failure
+            // fails the install closed: the user was promised this key at
+            // completion, and silently shipping without one would leave a
+            // TPM reset or board swap unrecoverable.
+            if self
+                .bootc_request
+                .encryption
+                .trim()
+                .eq_ignore_ascii_case("tpm2")
+            {
+                let key = crate::installer_luks::generate_tpm_recovery_key(&self.storage_plan.disk)
+                    .map_err(|message| NativePhaseError::Execution { phase, message })?;
+                *self
+                    .recovery_key
+                    .lock()
+                    .map_err(|_| NativePhaseError::Execution {
+                        phase,
+                        message: "native recovery key state is unavailable".to_string(),
+                    })? = Some(key);
+            }
             let assurance =
                 crate::installer_assurance::validate(crate::installer_assurance::AssuranceInput {
                     target_root: config.target_root.clone(),
@@ -1467,12 +1586,36 @@ impl NativePhaseExecutor {
         self.record_journal(phase, "image_write", OpState::Started)?;
         // M10: snapshot EFI boot entries before bootc can change them.
         let boot_entries_before = snapshot_boot_entries();
+        // H7 Slice B: passphrase installs inject their boot kargs here,
+        // not at request time: the LUKS UUID exists only after Storage
+        // provisioned the volume. The request stored in the executor
+        // keeps root_kargs empty; only this per-invocation clone carries
+        // them into the stream-helper JSON.
+        let mut bootc_request = self.bootc_request.clone();
+        if self.passphrase_encryption() {
+            let uuid = self
+                .luks_uuid
+                .lock()
+                .map_err(|_| NativePhaseError::Execution {
+                    phase,
+                    message: "native LUKS UUID state is unavailable".to_string(),
+                })?
+                .clone()
+                .ok_or_else(|| NativePhaseError::Execution {
+                    phase,
+                    message: "passphrase install reached the image phase without a LUKS UUID from the storage phase".to_string(),
+                })?;
+            bootc_request.root_kargs = vec![
+                format!("rd.luks.uuid={uuid}"),
+                format!("root=/dev/mapper/{}", crate::installer_luks::CRYPTROOT_NAME),
+            ];
+        }
         let status = self.execute_stream_helper(
             phase,
             cancellation,
             serde_json::json!({
                 "kind": "bootc_install",
-                "request": self.bootc_request.clone(),
+                "request": bootc_request,
             }),
             None,
         )?;
@@ -1481,10 +1624,13 @@ impl NativePhaseExecutor {
             self.warn_if_boot_entries_lost(phase, boot_entries_before)?;
             // M13: image_complete marker after a successful write.
             self.record_journal(phase, "image_write", OpState::Completed)?;
-            if self.storage_plan.mode == "wipe" {
+            if self.storage_plan.mode == "wipe" && !self.passphrase_encryption() {
                 // Relocate before mounting the installed root: the tmpfs
                 // journal is below WIPE_STAGING_MOUNTPOINT and would otherwise
                 // be hidden by that mount. Bootc has now created the ESP.
+                // Passphrase installs skip this: Storage already mounted
+                // the provisioned root (and ESP) at the filesystem staging
+                // mountpoint, and bootc created no layout to re-mount.
                 self.ensure_esp_journal(phase, cancellation)?;
                 self.mount_wipe_root(phase, cancellation)?;
             }
@@ -2569,6 +2715,21 @@ impl NativePhaseExecutor {
             .map_err(|message| NativePhaseError::Execution { phase, message })?
             .name
         };
+        self.format_and_mount_btrfs_target(phase, cancellation, &target)
+    }
+
+    /// Format an already-validated target device as the KythOS Btrfs
+    /// layout and mount it (plus the ESP) at the filesystem staging
+    /// mountpoint. Callers hold the disk lock and have validated the
+    /// target their own way: `prepare_btrfs_target` re-probes a
+    /// partition; the passphrase wipe path validates its LUKS mapping by
+    /// ancestry (`validate_mapper_format_target` inside the mkfs plan).
+    fn format_and_mount_btrfs_target(
+        &self,
+        phase: Phase,
+        cancellation: &CancellationToken,
+        target: &str,
+    ) -> Result<(), NativePhaseError> {
         // H4: durable format markers around the destructive format.
         self.record_journal(phase, "format", OpState::Started)?;
         self.execute_disk_helper(
@@ -2671,6 +2832,417 @@ impl NativePhaseExecutor {
         Ok(())
     }
 
+    /// Whether this install requested installer-provisioned passphrase
+    /// LUKS (H7 Slice B). Modeled on the TPM2 checks elsewhere in this
+    /// executor: trimmed, case-insensitive, read from the bootc request
+    /// the phases share.
+    fn passphrase_encryption(&self) -> bool {
+        self.bootc_request
+            .encryption
+            .trim()
+            .eq_ignore_ascii_case("passphrase")
+    }
+
+    /// The passphrase-wipe counterpart of `prepare_btrfs_target`: the
+    /// target is the LUKS mapping provisioned moments earlier, not a
+    /// partition from the plan, so there is no replace-target re-probe —
+    /// the mkfs plan validates the mapping by ancestry instead. The
+    /// format/mount tail is shared verbatim.
+    fn prepare_encrypted_btrfs_target(
+        &self,
+        phase: Phase,
+        cancellation: &CancellationToken,
+        mapper: &str,
+    ) -> Result<(), NativePhaseError> {
+        let _disk_lock = crate::installer_guard::acquire_disk_lock(&self.storage_plan.disk)
+            .map_err(|message| NativePhaseError::Execution { phase, message })?;
+        self.validate_target_disk(phase)?;
+        self.format_and_mount_btrfs_target(phase, cancellation, mapper)
+    }
+
+    /// Create one partition at an exact geometry and return its device
+    /// path, discovered by diffing snapshots around the create (never by
+    /// PARTLABEL: stale labels from prior installs collide — repo rule).
+    fn create_partition_at(
+        &self,
+        phase: Phase,
+        cancellation: &CancellationToken,
+        start: u64,
+        size: u64,
+        sector_size: u64,
+        fs: Option<&str>,
+        label: &str,
+    ) -> Result<String, NativePhaseError> {
+        let before = self.disk_snapshot(phase, &self.storage_plan.disk)?;
+        let operation = if let Some(fs) = fs {
+            serde_json::json!({
+                "operation": "create_partition",
+                "disk": &self.storage_plan.disk,
+                "start": start,
+                "size": size,
+                "fs": fs,
+                "label": label,
+                "sector_size": sector_size
+            })
+        } else {
+            serde_json::json!({
+                "operation": "create_unformatted_partition",
+                "disk": &self.storage_plan.disk,
+                "start": start,
+                "size": size,
+                "label": label,
+                "sector_size": sector_size
+            })
+        };
+        self.execute_disk_helper(phase, cancellation, &operation)?;
+        let after = self.disk_snapshot(phase, &self.storage_plan.disk)?;
+        crate::installer_storage::new_partition_from_snapshots(
+            &before,
+            &after,
+            start,
+            size,
+            sector_size,
+        )
+        .map_err(|message| NativePhaseError::Execution { phase, message })
+    }
+
+    /// Set a GPT flag on a partition created by this install, identified
+    /// by a fresh probe (number + PARTUUID), mirroring the bios_grub arm
+    /// of `create_target_partition`.
+    fn set_partition_flag_on(
+        &self,
+        phase: Phase,
+        cancellation: &CancellationToken,
+        partition: &str,
+        flag: &str,
+    ) -> Result<(), NativePhaseError> {
+        let snapshot = self.disk_snapshot(phase, &self.storage_plan.disk)?;
+        let sector_size = self.disk_sector_size(phase)?;
+        let probe = crate::installer_storage::partition_probe_from_snapshot(
+            &snapshot,
+            &self.storage_plan.disk,
+            partition,
+            sector_size,
+        )
+        .map_err(|message| NativePhaseError::Execution { phase, message })?;
+        self.execute_disk_helper(
+            phase,
+            cancellation,
+            &serde_json::json!({
+                "operation": "set_partition_flag",
+                "disk": &self.storage_plan.disk,
+                "part_num": probe.number,
+                "flag": flag,
+                "enabled": true,
+                "expected_partuuid": probe.partuuid
+            }),
+        )
+    }
+
+    /// Wipe + passphrase (H7 Slice B): lay out the disk the installer
+    /// provisions itself — GPT, an ESP, and one LUKS partition — format
+    /// and open the LUKS volume via the `luks-provision` helper op, and
+    /// record the volume UUID for the image (kargs) and configure
+    /// (crypttab) phases. Returns the mapper device path.
+    ///
+    /// The partition mutations run under a dedicated disk-lock scope that
+    /// drops before the caller formats the mapper: the lock is
+    /// non-reentrant and `prepare_encrypted_btrfs_target` acquires its
+    /// own. The passphrase leaves this executor exactly once, inside the
+    /// capturing helper invocation below.
+    fn provision_luks_wipe_target(
+        &self,
+        phase: Phase,
+        cancellation: &CancellationToken,
+    ) -> Result<String, NativePhaseError> {
+        let disk = self.storage_plan.disk.clone();
+        let disk_bytes =
+            probe_disk_size_bytes(&disk).ok_or_else(|| NativePhaseError::Execution {
+                phase,
+                message: "could not determine the target disk size for the encrypted layout"
+                    .to_string(),
+            })?;
+        let sector_size = self.disk_sector_size(phase)?;
+        let uefi = std::path::Path::new("/sys/firmware/efi").exists();
+        let layout = passphrase_wipe_layout(disk_bytes, sector_size, uefi)
+            .map_err(|message| NativePhaseError::Execution { phase, message })?;
+        let mapper = format!("/dev/mapper/{}", crate::installer_luks::CRYPTROOT_NAME);
+        let luks_partition = {
+            let _disk_lock = crate::installer_guard::acquire_disk_lock(&disk)
+                .map_err(|message| NativePhaseError::Execution { phase, message })?;
+            self.validate_target_disk(phase)?;
+            // H4: durable partition_table markers, as the other
+            // table-mutating storage paths record. guarded_table_mutation
+            // is NOT used: its backup step requires an existing table,
+            // and a wipe target may be blank.
+            self.record_journal(phase, "partition_table", OpState::Started)?;
+            let result = (|| {
+                self.execute_disk_helper(
+                    phase,
+                    cancellation,
+                    &serde_json::json!({
+                        "operation": "create_label",
+                        "device": &disk,
+                        "label_type": "gpt"
+                    }),
+                )?;
+                if let Some((start, size)) = layout.bios_grub {
+                    let bios = self.create_partition_at(
+                        phase,
+                        cancellation,
+                        start,
+                        size,
+                        sector_size,
+                        None,
+                        "biosboot",
+                    )?;
+                    self.set_partition_flag_on(phase, cancellation, &bios, "bios_grub")?;
+                }
+                let esp = self.create_partition_at(
+                    phase,
+                    cancellation,
+                    layout.esp.0,
+                    layout.esp.1,
+                    sector_size,
+                    Some("fat32"),
+                    "EFI",
+                )?;
+                // Format BEFORE flagging: the format-target validation
+                // refuses to format a partition that already reads as
+                // the ESP, so the esp flag goes on last.
+                self.execute_disk_helper(
+                    phase,
+                    cancellation,
+                    &serde_json::json!({
+                        "operation": "format_filesystem",
+                        "device": esp,
+                        "fs": "fat32",
+                        "label": "EFI",
+                        "expected_disk": &disk
+                    }),
+                )?;
+                self.set_partition_flag_on(phase, cancellation, &esp, "esp")?;
+                self.create_partition_at(
+                    phase,
+                    cancellation,
+                    layout.luks.0,
+                    layout.luks.1,
+                    sector_size,
+                    None,
+                    "cryptroot",
+                )
+            })();
+            if result.is_ok() {
+                self.record_journal(phase, "partition_table", OpState::Completed)?;
+            }
+            result?
+        };
+        self.execute_luks_provision(phase, cancellation, &luks_partition)?;
+        // The passphrase counterpart of mount_wipe_root's M12 check: the
+        // mapper must actually be open before anything formats or mounts
+        // through it.
+        if !self.luks_mapper_open(phase)? {
+            return Err(NativePhaseError::Execution {
+                phase,
+                message: "LUKS device did not open during provisioning; cannot continue"
+                    .to_string(),
+            });
+        }
+        let uuid = crate::installer_probe::lookup_uuid(crate::installer_probe::UuidInput {
+            device: luks_partition,
+        })
+        .map_err(|message| NativePhaseError::Execution { phase, message })?;
+        *self
+            .luks_uuid
+            .lock()
+            .map_err(|_| NativePhaseError::Execution {
+                phase,
+                message: "native LUKS UUID state is unavailable".to_string(),
+            })? = Some(uuid);
+        Ok(mapper)
+    }
+
+    /// Run the exec helper with its output captured, never streamed.
+    /// `run_command_with_input` (used by every disk op) feeds helper
+    /// stdout into the persisted installer log; the one operation whose
+    /// input carries a secret — `luks-provision` — must never take that
+    /// path, so it gets this dedicated spawn: piped output, a bounded
+    /// wait, and stderr returned only as an error detail.
+    fn execute_capturing_helper(
+        &self,
+        phase: Phase,
+        cancellation: &CancellationToken,
+        operation: &str,
+        input: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<(), NativePhaseError> {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut command = Command::new("/usr/bin/kyth-installer-exec");
+        command
+            .args(["--operation", operation])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        // SAFETY: sets the parent-death signal in the child between fork
+        // and exec; async-signal-safe operations only.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| NativePhaseError::Execution {
+                phase,
+                message: format!("could not run installer helper operation {operation}: {error}"),
+            })?;
+        // Inputs are small (a JSON body with one bounded secret); write
+        // on a scoped thread so a helper that never reads stdin cannot
+        // block the poll loop past the deadline.
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| NativePhaseError::Execution {
+                phase,
+                message: "installer helper stdin is unavailable".to_string(),
+            })?;
+        let write_result = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let outcome = stdin.write_all(input).and_then(|()| stdin.flush());
+                drop(stdin);
+                outcome
+            });
+            let started = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let write_outcome = writer.join().unwrap_or_else(|_| {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "helper input writer panicked",
+                            ))
+                        });
+                        return write_outcome.map(|_| status);
+                    }
+                    Ok(None) => {
+                        if cancellation.is_cancelled() || started.elapsed() >= timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = writer.join();
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                if cancellation.is_cancelled() {
+                                    "cancelled"
+                                } else {
+                                    "timed out"
+                                },
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                }
+            }
+        });
+        let status = match write_result {
+            Ok(status) => status,
+            Err(error) => {
+                return Err(NativePhaseError::Execution {
+                    phase,
+                    message: if error.kind() == std::io::ErrorKind::TimedOut
+                        && error.to_string() == "cancelled"
+                    {
+                        "installer was cancelled".to_string()
+                    } else {
+                        format!("installer helper operation {operation} failed: {error}")
+                    },
+                });
+            }
+        };
+        if status.success() {
+            return Ok(());
+        }
+        // The helper exited; drain its stderr for the diagnostic. The
+        // input (and therefore the passphrase) is never echoed into this
+        // error here; the caller additionally scrubs the passphrase from
+        // whatever the helper printed.
+        let mut detail = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_string(&mut detail);
+        }
+        let detail = detail.trim();
+        Err(NativePhaseError::Execution {
+            phase,
+            message: if detail.is_empty() {
+                format!("installer helper operation {operation} exited with status {status}")
+            } else {
+                format!("installer helper operation {operation} failed: {detail}")
+            },
+        })
+    }
+
+    /// Invoke `luks-provision` with the retained passphrase. The secret
+    /// crosses the helper boundary exactly once, inside this JSON body;
+    /// the helper's own diagnostics are scrubbed of it before they can
+    /// surface as a phase error.
+    fn execute_luks_provision(
+        &self,
+        phase: Phase,
+        cancellation: &CancellationToken,
+        luks_partition: &str,
+    ) -> Result<(), NativePhaseError> {
+        let passphrase = self
+            .luks_passphrase
+            .lock()
+            .map_err(|_| NativePhaseError::Execution {
+                phase,
+                message: "native LUKS passphrase state is unavailable".to_string(),
+            })?
+            .clone();
+        if passphrase.is_empty() {
+            return Err(NativePhaseError::Execution {
+                phase,
+                message: "passphrase encryption is missing its disk passphrase".to_string(),
+            });
+        }
+        let input = serde_json::json!({
+            "device": luks_partition,
+            "name": crate::installer_luks::CRYPTROOT_NAME,
+            "passphrase": passphrase.as_str(),
+        });
+        let bytes = serde_json::to_vec(&input).map_err(|error| NativePhaseError::Execution {
+            phase,
+            message: format!("could not encode LUKS provisioning request: {error}"),
+        })?;
+        // The helper's internal cryptsetup deadline is 600s; allow a
+        // small margin so its own error wins over this outer timeout.
+        self.execute_capturing_helper(
+            phase,
+            cancellation,
+            "luks-provision",
+            &bytes,
+            std::time::Duration::from_secs(660),
+        )
+        .map_err(|error| match error {
+            NativePhaseError::Execution { phase, message } => NativePhaseError::Execution {
+                phase,
+                message: message.replace(passphrase.as_str(), "[redacted]"),
+            },
+            other => other,
+        })
+    }
+
     fn mount_efi(
         &self,
         phase: Phase,
@@ -2723,9 +3295,23 @@ impl NativePhaseExecutor {
         self.open_durable_journal(phase)?;
         let target = match self.storage_plan.mode.as_str() {
             "wipe" => {
-                // bootc to-disk owns the complete wipe layout and is run in
-                // the image phase; there is no separate storage mutation.
-                return Ok(());
+                if self.passphrase_encryption() {
+                    // H7 Slice B: passphrase LUKS has no bootc block-setup,
+                    // so unlike every other wipe install the storage phase
+                    // DOES mutate here: it provisions the encrypted layout
+                    // (GPT + ESP + LUKS, mapper opened) and formats the
+                    // mapper, after which the image phase writes with
+                    // to-filesystem. The shared tail call below is skipped
+                    // for wipe — provisioning already ran it.
+                    let mapper = self.provision_luks_wipe_target(phase, cancellation)?;
+                    self.prepare_encrypted_btrfs_target(phase, cancellation, &mapper)?;
+                    mapper
+                } else {
+                    // bootc to-disk owns the complete wipe layout and is
+                    // run in the image phase; there is no separate storage
+                    // mutation.
+                    return Ok(());
+                }
             }
             "alongside" | "manual" => {
                 let requested = self
@@ -2828,7 +3414,9 @@ impl NativePhaseExecutor {
                 });
             }
         };
-        self.prepare_btrfs_target(phase, cancellation, &target)?;
+        if self.storage_plan.mode != "wipe" {
+            self.prepare_btrfs_target(phase, cancellation, &target)?;
+        }
         *self
             .storage_target
             .lock()
@@ -2922,6 +3510,15 @@ impl PhaseExecutor for NativePhaseExecutor {
             .lock()
             .ok()
             .and_then(|state| state.clone())
+    }
+
+    fn success_recovery_key(&self) -> Option<String> {
+        // Take-once: the stored key moves out to the terminal Done event
+        // and cannot be handed out again.
+        self.recovery_key
+            .lock()
+            .ok()
+            .and_then(|mut stored| stored.take().map(|key| key.to_string()))
     }
 }
 
@@ -3025,6 +3622,62 @@ fn probe_sector_size(disk: &str) -> Option<u64> {
 }
 
 /// L5: best-effort whole-disk size in bytes.
+/// The GPT layout the passphrase wipe path provisions (H7 Slice B), as
+/// `(start, size)` byte pairs. Pure so the geometry is unit-testable
+/// without touching a disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PassphraseWipeLayout {
+    /// Legacy-BIOS boot partition (BIOS boot only; UEFI has none).
+    bios_grub: Option<(u64, u64)>,
+    esp: (u64, u64),
+    luks: (u64, u64),
+}
+
+/// Compute the passphrase-wipe layout: a 1 MiB-aligned GPT holding an
+/// optional 1 MiB BIOS-boot partition (mirroring the guided modes'
+/// layout), a 512 MiB ESP, and one LUKS partition taking the rest of the
+/// disk minus a 1 MiB GPT tail reserve. The LUKS partition must fit the
+/// KythOS minimum system size, the same floor the other guided modes
+/// enforce.
+fn passphrase_wipe_layout(
+    disk_bytes: u64,
+    sector_size: u64,
+    uefi: bool,
+) -> Result<PassphraseWipeLayout, String> {
+    const MIB: u64 = 1024 * 1024;
+    const ESP_BYTES: u64 = 512 * MIB;
+    let align = sector_size.max(MIB);
+    let align_up = |value: u64| value.div_ceil(align) * align;
+    let align_down = |value: u64| value / align * align;
+    let mut cursor = align_up(MIB);
+    let bios_grub = if uefi {
+        None
+    } else {
+        let entry = (cursor, MIB);
+        cursor += MIB;
+        Some(entry)
+    };
+    let esp = (cursor, ESP_BYTES);
+    cursor += ESP_BYTES;
+    let tail = align_down(disk_bytes.saturating_sub(MIB));
+    if tail <= cursor {
+        return Err("the target disk is too small for an encrypted KythOS install".to_string());
+    }
+    let luks = (cursor, tail - cursor);
+    if luks.1 < crate::installer_storage::MIN_KYTHOS_BYTES {
+        return Err(format!(
+            "the encrypted system partition would be {} bytes, below the {}-byte KythOS minimum",
+            luks.1,
+            crate::installer_storage::MIN_KYTHOS_BYTES
+        ));
+    }
+    Ok(PassphraseWipeLayout {
+        bios_grub,
+        esp,
+        luks,
+    })
+}
+
 fn probe_disk_size_bytes(disk: &str) -> Option<u64> {
     let output = Command::new("/usr/bin/lsblk")
         .args(["--json", "--bytes", "--nodeps", "--output", "SIZE", disk])
@@ -3341,6 +3994,105 @@ mod tests {
     }
 
     #[test]
+    fn passphrase_wipe_request_decodes_as_a_filesystem_install() {
+        // H7 Slice B: passphrase encryption has no bootc block-setup, so
+        // a wipe request with it decodes to the filesystem-install shape
+        // (to-filesystem into the staging mountpoint, skip-finalize) with
+        // the passphrase carried on the request — never in the bootc
+        // input, which is serialized into the stream-helper JSON.
+        let request = NativeInstallRequest::from_http(serde_json::json!({
+            "disk": "sda",
+            "install_mode": "wipe",
+            "encryption": "passphrase",
+            "luks_passphrase": "correct horse battery staple",
+            "acknowledged_irreversible": true,
+        }))
+        .expect("passphrase wipe request should decode");
+        assert_eq!(request.luks_passphrase, "correct horse battery staple");
+        let bootc = &request.execution.bootc;
+        assert_eq!(bootc.encryption, "passphrase");
+        assert_eq!(bootc.subcommand, "to-filesystem");
+        assert_eq!(bootc.target, FILESYSTEM_STAGING_MOUNTPOINT);
+        assert!(bootc.skip_finalize);
+        assert!(!bootc.wipe);
+        assert!(bootc.root_kargs.is_empty());
+        let serialized = serde_json::to_string(bootc).expect("bootc input serializes");
+        assert!(
+            !serialized.contains("correct horse"),
+            "the passphrase leaked into the bootc input: {serialized}"
+        );
+        let plan = crate::installer_bootc::build_plan(request.execution.bootc)
+            .expect("passphrase bootc plan validates");
+        assert!(
+            !plan.argv.iter().any(|arg| arg == "--block-setup"),
+            "{:?}",
+            plan.argv
+        );
+    }
+
+    #[test]
+    fn passphrase_requests_fail_closed_on_mode_mismatches() {
+        // Passphrase mode without wipe: the installer provisions the
+        // layout itself, so no other partitioning mode may carry it.
+        let error = NativeInstallRequest::from_http(serde_json::json!({
+            "disk": "sda",
+            "install_mode": "alongside",
+            "target_partition": "sda3",
+            "encryption": "passphrase",
+            "luks_passphrase": "correct horse battery staple",
+            "acknowledged_irreversible": true,
+        }))
+        .err()
+        .expect("passphrase + alongside must fail closed");
+        assert!(error.contains("Erase full disk"), "{error}");
+        // Passphrase mode without a passphrase.
+        let error = NativeInstallRequest::from_http(serde_json::json!({
+            "disk": "sda",
+            "install_mode": "wipe",
+            "encryption": "passphrase",
+            "acknowledged_irreversible": true,
+        }))
+        .err()
+        .expect("passphrase mode without a passphrase must fail closed");
+        assert!(error.contains("requires a disk passphrase"), "{error}");
+        // A passphrase offered for any other encryption mode is a stray
+        // secret the install would silently ignore; refuse it.
+        for mode in ["none", "tpm2"] {
+            let error = NativeInstallRequest::from_http(serde_json::json!({
+                "disk": "sda",
+                "install_mode": "wipe",
+                "encryption": mode,
+                "luks_passphrase": "correct horse battery staple",
+                "acknowledged_irreversible": true,
+            }))
+            .err()
+            .expect("a stray passphrase must fail closed");
+            assert!(error.contains("would not use"), "{mode}: {error}");
+        }
+    }
+
+    #[test]
+    fn passphrase_wipe_layout_is_aligned_and_sized() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        // UEFI, 64 GiB: no BIOS partition; ESP second; LUKS takes the
+        // rest up to the 1 MiB GPT tail reserve.
+        let layout = passphrase_wipe_layout(64 * GIB, 512, true).expect("layout");
+        assert_eq!(layout.bios_grub, None);
+        assert_eq!(layout.esp, (MIB, 512 * MIB));
+        assert_eq!(layout.luks.0, MIB + 512 * MIB);
+        assert_eq!(layout.luks.0 + layout.luks.1, 64 * GIB - MIB);
+        // Legacy BIOS gains the 1 MiB bios_grub partition up front.
+        let layout = passphrase_wipe_layout(64 * GIB, 512, false).expect("layout");
+        assert_eq!(layout.bios_grub, Some((MIB, MIB)));
+        assert_eq!(layout.esp.0, 2 * MIB);
+        // Every edge is 1 MiB-aligned so partition_end geometry checks pass.
+        // A disk that cannot fit the KythOS minimum refuses.
+        assert!(passphrase_wipe_layout(20 * GIB, 512, true).is_err());
+        assert!(passphrase_wipe_layout(0, 512, true).is_err());
+    }
+
+    #[test]
     fn every_mode_that_creates_home_subvolume_mounts_it() {
         // free_space and resize_ntfs build the same @/@home layout as
         // alongside; skipping alongside-home for them left @home empty and
@@ -3451,6 +4203,7 @@ mod tests {
                     root_subvolume: false,
                     wipe: true,
                     encryption: "none".into(),
+                    root_kargs: Vec::new(),
                     tpm_recovery_ack: false,
                 },
                 configuration: ConfigurationInput {
@@ -3478,6 +4231,7 @@ mod tests {
             },
             manual_mounts: None,
             secure_boot_password: String::new(),
+            luks_passphrase: String::new(),
             transaction_path: "/run/kyth-installer/txn/transaction.json".into(),
         }
     }

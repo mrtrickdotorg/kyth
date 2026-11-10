@@ -36,6 +36,36 @@ test("native clients expose and clear the optional MOK secret", () => {
   assert.match(slint, /kernel == "cachyos"/);
 });
 
+test("TPM2 recovery key is delivered once and acknowledged in both clients", () => {
+  // The daemon enrolls a one-time LUKS recovery key during a TPM2 install
+  // and returns it only on the terminal done event; both clients must
+  // surface it and gate reboot on the user recording it.
+  assert.match(app, /recovery_key/);
+  assert.match(app, /recoveryKey/);
+  assert.match(app, /I have written down the recovery key/);
+  assert.match(native, /recovery_key/);
+  assert.match(native, /set_recovery_key/);
+  assert.match(slint, /recovery-key/);
+  assert.match(slint, /recovery-key-ack/);
+  // The retired ack copy claimed no recovery key exists; the installer
+  // now generates one, so the old wording must not come back.
+  assert.doesNotMatch(app, /No recovery key is generated or stored/);
+  assert.doesNotMatch(slint, /I escrowed a TPM recovery key/);
+});
+
+test("Passphrase LUKS mode is offered and gated in both clients", () => {
+  // Passphrase encryption is installer-provisioned LUKS on wipe installs;
+  // both clients must offer the mode, carry the passphrase field, and
+  // refuse to start without one (the daemon fails closed as well).
+  assert.match(app, /value="passphrase"/);
+  assert.match(app, /luks_passphrase/);
+  assert.match(native, /luks_passphrase/);
+  assert.match(native, /get_luks_passphrase\(\)/);
+  assert.match(native, /"passphrase" => "passphrase"\.to_string\(\)/);
+  assert.match(slint, /luks-passphrase/);
+  assert.match(slint, /encryption = "passphrase"/);
+});
+
 test("React/Tauri is the production installer client and streams native progress", () => {
   assert.match(native, /fn validated_install_plan/);
   assert.match(native, /stream_install_events/);

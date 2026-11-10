@@ -15,7 +15,7 @@ export interface RescueProbe { log_tail?: string; transaction?: TransactionRepor
 export interface InstallRequest {
   disk: string; install_mode: InstallMode; target_partition: string; resize_partition: string;
   resize_gib: number; free_region_start: number; free_region_end: number; hostname: string;
-  timezone: string; locale: string; keymap: string; username: string; password: string; mok_password: string; kernel: string;
+  timezone: string; locale: string; keymap: string; username: string; password: string; mok_password: string; luks_passphrase: string; kernel: string;
   confirm_backup: boolean; confirm_erase: boolean; confirm_current: boolean;
   encryption: string; tpm_recovery_ack: boolean; acknowledged_irreversible: boolean;
   mounts?: ManualMount[];
@@ -28,5 +28,5 @@ export type InstallerEvent =
   | { type: "progress"; value: number }
   | { type: "stats"; [key: string]: unknown }
   | { type: "phase"; phase: Phase }
-  | { type: "done"; mok_state?: string; requires_reboot_confirmation?: boolean }
+  | { type: "done"; mok_state?: string; requires_reboot_confirmation?: boolean; recovery_key?: string }
   | { type: "error"; message: string };
