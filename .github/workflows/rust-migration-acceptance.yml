@@ -68,10 +68,11 @@ permissions:
   actions: read
   contents: read
 
-# One acceptance VM at a time: schedule + dispatch runs each take ~150 min
-# on KVM runners and share artifact/download bandwidth. Queue rather than
-# interleave (cancel-in-progress stays false — a running 150-min VM is
-# never cheap to redo).
+# One acceptance run at a time: schedule + dispatch runs each drive three
+# disposable VMs (base, Secure Boot, Windows alongside) on KVM runners and
+# share artifact/download bandwidth. Queue rather than interleave
+# (cancel-in-progress stays false — a running acceptance VM is never
+# cheap to redo).
 concurrency:
   group: rust-migration-acceptance
   cancel-in-progress: false
@@ -83,7 +84,7 @@ jobs:
     # resolves the promoted testing image and channel ISO instead.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 300
     steps:
       - name: Checkout source commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -101,8 +102,13 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
+          # Variant tooling: python3-virt-firmware (virt-fw-vars) pre-enrolls
+          # the KythOS MOK for the Secure Boot variant; libguestfs-tools
+          # (guestfish) is the preferred Windows-fixture backend, with
+          # fdisk/ntfs-3g/dosfstools backing the qemu-nbd fallback.
           sudo apt-get install --yes --no-install-recommends \
-            qemu-system-x86 qemu-system-modules-spice qemu-utils ovmf socat skopeo
+            qemu-system-x86 qemu-system-modules-spice qemu-utils ovmf socat skopeo \
+            python3-virt-firmware libguestfs-tools fdisk ntfs-3g dosfstools
 
       - name: Grant runner access to /dev/kvm
         run: |
@@ -191,7 +197,7 @@ jobs:
     name: Nightly acceptance (promoted testing image)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 300
     permissions:
       actions: read
       contents: read
@@ -213,8 +219,13 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
+          # Variant tooling: python3-virt-firmware (virt-fw-vars) pre-enrolls
+          # the KythOS MOK for the Secure Boot variant; libguestfs-tools
+          # (guestfish) is the preferred Windows-fixture backend, with
+          # fdisk/ntfs-3g/dosfstools backing the qemu-nbd fallback.
           sudo apt-get install --yes --no-install-recommends \
-            qemu-system-x86 qemu-system-modules-spice qemu-utils ovmf socat skopeo
+            qemu-system-x86 qemu-system-modules-spice qemu-utils ovmf socat skopeo \
+            python3-virt-firmware libguestfs-tools fdisk ntfs-3g dosfstools
 
       - name: Grant runner access to /dev/kvm
         run: |

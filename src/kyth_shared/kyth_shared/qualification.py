@@ -22,6 +22,7 @@ _DIRECTIONS = {"higher", "lower", "neutral"}
 _ACCEPTANCE_LINE = re.compile(r"^KYTH_ACCEPTANCE:([A-Z_]+):(.*)$")
 _BASE_ACCEPTANCE_PHASES = (
     "LIVE_READY", "LIVE_SMOKE_OK", "INSTALL_COMPLETE", "INSTALLED_READY",
+    "INSTALLED_SELINUX_OK", "FIRSTBOOT_OK",
     "INSTALLED_SMOKE_OK", "COMPLETE",
 )
 _UPDATE_ACCEPTANCE_PHASES = (
@@ -32,6 +33,12 @@ _HUB_ACCEPTANCE_PHASES = (
     "HUB_BINARY_OK", "HUB_DEEP_LINKS_OK", "HUB_SECOND_LAUNCH_OK",
     "HUB_DASHBOARD_DEGRADED_OK", "HUB_UPDATES_OK", "HUB_PRIVILEGED_FAILURE_OK",
 )
+# Variant phases are required only when the host actually ran the
+# variant: a plain run must never fail for a Secure Boot or Windows
+# sentinel it never attempted, and a variant run must never pass
+# without them.
+_SECURE_BOOT_ACCEPTANCE_PHASES = ("INSTALLED_SECUREBOOT_OK",)
+_WINDOWS_ACCEPTANCE_PHASES = ("WINDOWS_NTFS_BEFORE", "WINDOWS_NTFS_OK")
 
 
 @dataclass(frozen=True)
@@ -264,13 +271,25 @@ def load_budgets(path: Path) -> tuple[RegressionBudget, ...]:
     return tuple(RegressionBudget(**item) for item in data.get("budgets", []))
 
 
-def acceptance_report(log: str, *, update_required: bool = False) -> QualificationReport:
+def acceptance_report(
+    log: str,
+    *,
+    update_required: bool = False,
+    secure_boot_required: bool = False,
+    windows_required: bool = False,
+) -> QualificationReport:
     events: dict[str, str] = {}
     for line in log.splitlines():
         match = _ACCEPTANCE_LINE.match(line.strip())
         if match:
             events[match.group(1)] = match.group(2)
-    expected = _BASE_ACCEPTANCE_PHASES + _HUB_ACCEPTANCE_PHASES + (_UPDATE_ACCEPTANCE_PHASES if update_required else ())
+    expected = (
+        _BASE_ACCEPTANCE_PHASES
+        + _HUB_ACCEPTANCE_PHASES
+        + (_UPDATE_ACCEPTANCE_PHASES if update_required else ())
+        + (_SECURE_BOOT_ACCEPTANCE_PHASES if secure_boot_required else ())
+        + (_WINDOWS_ACCEPTANCE_PHASES if windows_required else ())
+    )
     checks = [
         QualificationCheck(
             name=phase.lower().replace("_", " "),
@@ -387,6 +406,8 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance = subparsers.choices["acceptance"]
     acceptance.add_argument("--log", type=Path, required=True)
     acceptance.add_argument("--update-required", action="store_true")
+    acceptance.add_argument("--secure-boot-required", action="store_true")
+    acceptance.add_argument("--windows-required", action="store_true")
     gate = subparsers.add_parser("gate")
     gate.add_argument("--candidate", type=Path, required=True)
     gate.add_argument("--baseline", type=Path, required=True)
@@ -401,7 +422,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "collect":
         report = local_report(include_gaming=args.include_gaming)
     elif args.command == "acceptance":
-        report = acceptance_report(args.log.read_text(encoding="utf-8", errors="replace"), update_required=args.update_required)
+        report = acceptance_report(
+            args.log.read_text(encoding="utf-8", errors="replace"),
+            update_required=args.update_required,
+            secure_boot_required=args.secure_boot_required,
+            windows_required=args.windows_required,
+        )
     else:
         report = evaluate_regressions(
             QualificationReport.read(args.candidate),

@@ -418,6 +418,8 @@ pub fn evaluate_regressions(
 pub fn acceptance_report(
     log: &str,
     update_required: bool,
+    secure_boot_required: bool,
+    windows_required: bool,
     generated_at: impl Into<String>,
 ) -> QualificationReport {
     static SENTINEL: OnceLock<Regex> = OnceLock::new();
@@ -455,10 +457,18 @@ pub fn acceptance_report(
         "ROLLBACK_BOOTED",
         "ROLLBACK_SMOKE_OK",
     ];
+    // Variant phases are required only when the host actually ran the
+    // variant: a plain run must never fail for a Secure Boot or Windows
+    // sentinel it never attempted, and a variant run must never pass
+    // without them.
+    let secure_boot = ["INSTALLED_SECUREBOOT_OK"];
+    let windows = ["WINDOWS_NTFS_BEFORE", "WINDOWS_NTFS_OK"];
     let phases = base
         .into_iter()
         .chain(hub)
-        .chain(update.into_iter().filter(|_| update_required));
+        .chain(update.into_iter().filter(|_| update_required))
+        .chain(secure_boot.into_iter().filter(|_| secure_boot_required))
+        .chain(windows.into_iter().filter(|_| windows_required));
     let checks = phases
         .map(|phase| QualificationCheck {
             name: phase.to_ascii_lowercase().replace('_', " "),
@@ -522,6 +532,8 @@ mod tests {
         let report = acceptance_report(
             "KYTH_ACCEPTANCE:LIVE_READY:fedora\nKYTH_ACCEPTANCE:INSTALL_COMPLETE:sha256:x\n",
             true,
+            false,
+            false,
             "now",
         );
         assert_eq!(report.identity["installed_image"], "sha256:x");
@@ -537,6 +549,39 @@ mod tests {
             18
         );
         assert_eq!(report.overall(), "fail");
+    }
+
+    #[test]
+    fn variant_phases_are_required_only_when_the_variant_ran() {
+        let log = "KYTH_ACCEPTANCE:LIVE_READY:fedora\n\
+                   KYTH_ACCEPTANCE:INSTALLED_SECUREBOOT_OK:enabled\n\
+                   KYTH_ACCEPTANCE:WINDOWS_NTFS_BEFORE:device=/dev/vda2 uuid=5A8C\n\
+                   KYTH_ACCEPTANCE:WINDOWS_NTFS_OK:device=/dev/vda2 uuid=5A8C\n";
+        // Not required: the variant sentinels in the log are ignored and
+        // their absence would not fail a plain run either.
+        let report = acceptance_report(log, false, false, false, "now");
+        assert!(report
+            .checks
+            .iter()
+            .all(|check| !check.name.contains("secureboot") && !check.name.contains("ntfs")));
+        // Required and present: both variant checks pass.
+        let report = acceptance_report(log, false, true, true, "now");
+        let variant: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|check| check.name.contains("secureboot") || check.name.contains("ntfs"))
+            .collect();
+        assert_eq!(variant.len(), 3);
+        assert!(variant.iter().all(|check| check.status == "pass"));
+        // Required and absent: the variant checks fail the report.
+        let report = acceptance_report("", false, true, true, "now");
+        let variant: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|check| check.name.contains("secureboot") || check.name.contains("ntfs"))
+            .collect();
+        assert_eq!(variant.len(), 3);
+        assert!(variant.iter().all(|check| check.status == "fail"));
     }
 
     #[test]

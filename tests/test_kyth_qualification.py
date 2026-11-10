@@ -139,7 +139,8 @@ class AcceptanceReportTests(unittest.TestCase):
             f"KYTH_ACCEPTANCE:{phase}:ok"
             for phase in (
                 "LIVE_READY", "LIVE_SMOKE_OK", "INSTALL_COMPLETE",
-                "INSTALLED_READY", "INSTALLED_SMOKE_OK", "COMPLETE",
+                "INSTALLED_READY", "INSTALLED_SELINUX_OK", "FIRSTBOOT_OK",
+                "INSTALLED_SMOKE_OK", "COMPLETE",
                 "HUB_BINARY_OK", "HUB_DEEP_LINKS_OK", "HUB_SECOND_LAUNCH_OK",
                 "HUB_DASHBOARD_DEGRADED_OK", "HUB_UPDATES_OK", "HUB_PRIVILEGED_FAILURE_OK",
             )
@@ -148,8 +149,48 @@ class AcceptanceReportTests(unittest.TestCase):
         report = acceptance_report(log)
 
         self.assertEqual(report.overall, "pass")
-        self.assertEqual(len(report.checks), 12)
+        self.assertEqual(len(report.checks), 14)
         self.assertEqual(report.identity["installed_image"], "ok")
+
+    def test_variant_phases_required_only_when_variant_ran(self):
+        base_log = "\n".join(
+            f"KYTH_ACCEPTANCE:{phase}:ok"
+            for phase in (
+                "LIVE_READY", "LIVE_SMOKE_OK", "INSTALL_COMPLETE",
+                "INSTALLED_READY", "INSTALLED_SELINUX_OK", "FIRSTBOOT_OK",
+                "INSTALLED_SMOKE_OK", "COMPLETE",
+                "HUB_BINARY_OK", "HUB_DEEP_LINKS_OK", "HUB_SECOND_LAUNCH_OK",
+                "HUB_DASHBOARD_DEGRADED_OK", "HUB_UPDATES_OK", "HUB_PRIVILEGED_FAILURE_OK",
+            )
+        )
+        # Not required: a plain run neither gains nor needs the checks.
+        report = acceptance_report(base_log)
+        self.assertEqual(report.overall, "pass")
+        self.assertEqual(len(report.checks), 14)
+
+        variant_log = base_log + "\n" + "\n".join(
+            (
+                "KYTH_ACCEPTANCE:INSTALLED_SECUREBOOT_OK:enabled",
+                "KYTH_ACCEPTANCE:WINDOWS_NTFS_BEFORE:device=/dev/vda2 uuid=5A8C",
+                "KYTH_ACCEPTANCE:WINDOWS_NTFS_OK:device=/dev/vda2 uuid=5A8C",
+            )
+        )
+        report = acceptance_report(
+            variant_log, secure_boot_required=True, windows_required=True
+        )
+        self.assertEqual(report.overall, "pass")
+        self.assertEqual(len(report.checks), 17)
+
+        # Required but absent: the variant checks fail the report.
+        report = acceptance_report(
+            base_log, secure_boot_required=True, windows_required=True
+        )
+        self.assertEqual(report.overall, "fail")
+        names = {check.name for check in report.checks if check.status == "fail"}
+        self.assertEqual(
+            names,
+            {"installed secureboot ok", "windows ntfs before", "windows ntfs ok"},
+        )
 
     def test_update_gate_requires_update_and_rollback_phases(self):
         report = acceptance_report(

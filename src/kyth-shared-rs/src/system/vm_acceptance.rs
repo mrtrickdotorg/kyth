@@ -6,7 +6,9 @@
 //! reporting have one Rust owner.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Output, Stdio};
 use std::thread;
@@ -61,6 +63,30 @@ pub fn update_ref() -> String {
 
 pub fn network_check_enabled() -> bool {
     read_trimmed(format!("{FW_CFG_ROOT}/network-check/raw")) == "1"
+}
+
+/// Opt-in (fw_cfg `installer-mode=daemon`) install route: drive the real
+/// installer daemon over its authenticated Unix socket instead of the raw
+/// bootc path. Off by default so the established raw route stays the
+/// default until the daemon route has qualified.
+pub fn installer_daemon_mode() -> bool {
+    read_trimmed(format!("{FW_CFG_ROOT}/installer-mode/raw")) == "daemon"
+}
+
+/// Variant flag (fw_cfg `secure-boot`): the host booted secboot OVMF
+/// firmware with the KythOS MOK certificate pre-enrolled, so the
+/// installed lifecycle must prove the installed system really reports
+/// Secure Boot enabled.
+pub fn secure_boot_mode() -> bool {
+    read_trimmed(format!("{FW_CFG_ROOT}/secure-boot/raw")) == "1"
+}
+
+/// Variant flag (fw_cfg `windows`): the host prepared a Windows side
+/// (GPT + ESP + NTFS) on the acceptance disk, so the daemon route must
+/// perform an alongside NTFS-shrink install and the installed lifecycle
+/// must prove the NTFS volume survived.
+pub fn windows_mode() -> bool {
+    read_trimmed(format!("{FW_CFG_ROOT}/windows/raw")) == "1"
 }
 
 pub fn booted_digest_from_json(output: &str) -> Option<String> {
@@ -450,6 +476,731 @@ fn install_from_live_iso() -> io::Result<()> {
         Duration::from_secs(1800),
         "bootc install to-disk failed",
     )?;
+    emit("INSTALL_COMPLETE", target_ref);
+    power("reboot");
+    Ok(())
+}
+
+const INSTALLER_RUN_DIR: &str = "/run/kyth-installer";
+const INSTALLER_SOCKET_PATH: &str = "/run/kyth-installer/api.sock";
+const INSTALLER_TOKEN_FILE: &str = "/run/kyth-installer/session-token";
+const INSTALLER_LOCK_FILE: &str = "/run/lock/kyth-installer.lock";
+const ACCEPTANCE_HOSTNAME: &str = "kyth-acceptance";
+const ACCEPTANCE_USERNAME: &str = "kyth-acceptance";
+/// Throwaway password for the throwaway acceptance account on a VM that
+/// is discarded after the run; it exists only because the daemon requires
+/// a non-empty login password at its API boundary
+/// (validate_start_acknowledgements in installer_daemon.rs).
+const ACCEPTANCE_PASSWORD: &str = "kyth-acceptance";
+/// The stream wait must leave headroom inside the guest unit's 1800s
+/// TimeoutStartSec for the daemon preparation and report evaluation.
+const DAEMON_STREAM_BUDGET: Duration = Duration::from_secs(1500);
+/// Assurance check names emitted by installer_assurance::validate
+/// (installer_assurance.rs). The daemon's report mixes these with other
+/// progress checks (power, boot_entries); only the assurance set is
+/// required to be present and passing.
+const ASSURANCE_CHECK_NAMES: [&str; 10] = [
+    "hostname",
+    "locale",
+    "keymap",
+    "timezone",
+    "account",
+    "filesystem",
+    "selinux",
+    "encryption",
+    "kernel",
+    "bootloader",
+];
+
+/// The /api/start body for a wipe install, mirroring the web frontend's
+/// InstallRequest field set (src/kyth-installer-web/src/types.ts) and the
+/// values native_request_from_start + validate_start_acknowledgements
+/// require (installer_daemon.rs): the erase/backup confirmations and the
+/// irreversible acknowledgement must all be true, and a login username
+/// and password must be present. `encryption` stays "none" (the
+/// from_http default in installer_job_executor.rs): acceptance exercises
+/// the install route, not a LUKS variant. The image source is NOT a
+/// request field — the daemon reads KYTH_SOURCE_IMAGE from its own
+/// EnvironmentFile — so the caller fail-closes on the pin separately via
+/// installer_source_ref().
+pub fn daemon_start_request(disk: &str, hostname: &str, username: &str, password: &str) -> Value {
+    serde_json::json!({
+        "disk": disk,
+        "install_mode": "wipe",
+        "target_partition": "",
+        "resize_partition": "",
+        "resize_gib": 0,
+        "free_region_start": 0,
+        "free_region_end": 0,
+        "hostname": hostname,
+        "timezone": "UTC",
+        "locale": "en_US.UTF-8",
+        "keymap": "us",
+        "username": username,
+        "password": password,
+        "mok_password": "",
+        "kernel": "fedora",
+        "confirm_backup": true,
+        "confirm_erase": true,
+        "confirm_current": false,
+        "encryption": "none",
+        "tpm_recovery_ack": false,
+        "acknowledged_irreversible": true,
+        "flatpaks": [],
+    })
+}
+
+/// The smallest NTFS partition the installer offers as a shrink
+/// candidate (installer_storage.rs: NTFS_MIN_BYTES = 64 GiB Windows
+/// floor + 32 GiB KythOS minimum, the latter also installer_plan.rs
+/// MIN_KYTHOS_GIB). The host's --windows variant sizes its disk so the
+/// prepared NTFS partition clears this bar.
+const NTFS_RESIZE_MIN_BYTES: u64 = (64 + 32) * 1024 * 1024 * 1024;
+/// The Windows side keeps at least this much room in a shrink install;
+/// KythOS takes the rest (see NTFS_RESIZE_MIN_BYTES).
+const WINDOWS_FLOOR_GIB: u64 = 64;
+
+/// How many GiB KythOS takes when shrinking an NTFS partition of
+/// `size_bytes`: everything above the Windows floor, or None when the
+/// partition is below the installer's own candidacy minimum (so the
+/// result always satisfies MIN_KYTHOS_GIB = 32).
+pub fn windows_resize_gib(size_bytes: u64) -> Option<u64> {
+    if size_bytes < NTFS_RESIZE_MIN_BYTES {
+        return None;
+    }
+    Some(size_bytes / (1024 * 1024 * 1024) - WINDOWS_FLOOR_GIB)
+}
+
+/// Pick the NTFS shrink target out of the daemon's /api/partitions
+/// inventory for the acceptance disk: the record the installer itself
+/// flags `ntfs_resize_candidate` (the same candidacy the web UI offers),
+/// paired with the computed shrink size.
+pub fn windows_resize_target_from_partitions(partitions: &Value) -> Option<(String, u64)> {
+    partitions.as_array()?.iter().find_map(|partition| {
+        if partition
+            .get("ntfs_resize_candidate")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return None;
+        }
+        let name = partition.get("name").and_then(Value::as_str)?;
+        let size = partition.get("size_bytes").and_then(Value::as_u64)?;
+        windows_resize_gib(size).map(|gib| (name.to_owned(), gib))
+    })
+}
+
+/// The /api/start body for the --windows variant: identical field set
+/// to daemon_start_request, but an NTFS shrink (alongside) install of
+/// the prepared Windows partition. The erase confirmation stays true:
+/// validate_start_acknowledgements requires it for every mode, and the
+/// shrink is destructive to the partition layout even though the NTFS
+/// volume itself is preserved.
+pub fn daemon_windows_start_request(
+    disk: &str,
+    hostname: &str,
+    username: &str,
+    password: &str,
+    resize_partition: &str,
+    resize_gib: u64,
+) -> Value {
+    let mut request = daemon_start_request(disk, hostname, username, password);
+    request["install_mode"] = "resize_ntfs".into();
+    request["resize_partition"] = resize_partition.into();
+    request["resize_gib"] = resize_gib.into();
+    request
+}
+
+/// Pure parse of `lsblk -npro NAME,FSTYPE,UUID` output into the NTFS
+/// rows: (device, volume UUID). The NTFS volume UUID (its serial) is
+/// the identity the alongside assertions compare before/after — an
+/// ntfsresize shrink does not change it, so a changed or missing UUID
+/// means the volume did not survive.
+pub fn ntfs_entries_from_lsblk(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let fstype = fields.next()?;
+            if !fstype.eq_ignore_ascii_case("ntfs") && !fstype.eq_ignore_ascii_case("ntfs3") {
+                return None;
+            }
+            let uuid = fields.next().unwrap_or_default().to_owned();
+            Some((name.to_owned(), uuid))
+        })
+        .collect()
+}
+
+/// Pure parse of `mokutil --sb-state` output ("SecureBoot enabled" /
+/// "SecureBoot disabled"). None when the state cannot be determined.
+pub fn secure_boot_state_from_output(output: &str) -> Option<bool> {
+    for line in output.lines() {
+        let Some(state) = line.trim().strip_prefix("SecureBoot") else {
+            continue;
+        };
+        let state = state.trim().to_ascii_lowercase();
+        if state.starts_with("enabled") {
+            return Some(true);
+        }
+        if state.starts_with("disabled") {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// NTFS volumes visible on one device (or every device when `device`
+/// is None), as (device, UUID) pairs.
+fn ntfs_uuids(device: Option<&str>) -> Vec<(String, String)> {
+    let mut argv = vec![
+        "lsblk".to_owned(),
+        "-npro".to_owned(),
+        "NAME,FSTYPE,UUID".to_owned(),
+    ];
+    if let Some(device) = device {
+        argv.push(device.to_owned());
+    }
+    run_bounded(&argv, Duration::from_secs(30))
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| ntfs_entries_from_lsblk(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+/// Secure Boot variant truth: the installed system must report Secure
+/// Boot enabled — the variant boots secboot firmware with the KythOS
+/// MOK pre-enrolled, so a disabled or unreadable state means the
+/// signed boot chain did not engage.
+fn secure_boot_check() -> io::Result<()> {
+    let output = run_bounded(
+        &["mokutil".into(), "--sb-state".into()],
+        Duration::from_secs(10),
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other("mokutil --sb-state did not complete"));
+    }
+    match secure_boot_state_from_output(&String::from_utf8_lossy(&output.stdout)) {
+        Some(true) => {
+            emit("INSTALLED_SECUREBOOT_OK", "enabled");
+            Ok(())
+        }
+        Some(false) => Err(io::Error::other(
+            "installed system reports Secure Boot disabled",
+        )),
+        None => Err(io::Error::other(
+            "could not determine the installed Secure Boot state from mokutil output",
+        )),
+    }
+}
+
+/// Windows variant truth for the installed lifecycle: an NTFS volume
+/// with a readable UUID must still exist after the alongside install
+/// and the reboot into the installed system.
+fn windows_ntfs_survived() -> io::Result<()> {
+    match ntfs_uuids(None)
+        .into_iter()
+        .find(|(_, uuid)| !uuid.is_empty())
+    {
+        Some((device, uuid)) => {
+            emit("WINDOWS_NTFS_OK", format!("device={device} uuid={uuid}"));
+            Ok(())
+        }
+        None => Err(io::Error::other(
+            "no NTFS partition with a volume UUID survived the alongside install",
+        )),
+    }
+}
+
+/// Pick the dedicated acceptance disk out of the daemon's /api/disks
+/// inventory. The raw path identifies the target by resolving
+/// /dev/disk/by-id/virtio-KYTH_ACCEPT (the QEMU serial the host wrapper
+/// assigns); the daemon inventory carries no serial, so the resolved
+/// device path is matched against each record's `name` instead. A record
+/// flagged `current` hosts the live system and is never eligible.
+pub fn acceptance_disk_from_inventory(inventory: &Value, target: &Path) -> Option<String> {
+    let target = target.display().to_string();
+    inventory.as_array()?.iter().find_map(|disk| {
+        let name = disk.get("name").and_then(Value::as_str)?;
+        if name != target || disk.get("current").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        Some(name.to_owned())
+    })
+}
+
+/// Evaluate a /api/report body: the failure list is empty only when the
+/// job completed and every assurance check is present and passing.
+/// Non-assurance progress checks fail the run only on an explicit
+/// "fail" status — the daemon legitimately records "warning" entries
+/// (e.g. boot_entries) on successful installs.
+pub fn report_failures(report: &Value) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Some(status) = report.get("status").and_then(Value::as_str) {
+        if status != "complete" {
+            failures.push(format!("installer job status is {status:?}"));
+        }
+    }
+    let Some(checks) = report
+        .get("checks")
+        .and_then(Value::as_array)
+        .filter(|checks| !checks.is_empty())
+    else {
+        failures.push("installer report carries no checks".to_string());
+        return failures;
+    };
+    for name in ASSURANCE_CHECK_NAMES {
+        match checks
+            .iter()
+            .find(|check| check.get("name").and_then(Value::as_str) == Some(name))
+        {
+            Some(check) => {
+                if check.get("status").and_then(Value::as_str) != Some("pass") {
+                    failures.push(format!("assurance check {name} did not pass"));
+                }
+            }
+            None => failures.push(format!("assurance check {name} is missing")),
+        }
+    }
+    for check in checks {
+        let name = check
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if check.get("status").and_then(Value::as_str) == Some("fail")
+            && !ASSURANCE_CHECK_NAMES.contains(&name)
+        {
+            failures.push(format!("installer check {name} failed"));
+        }
+    }
+    failures
+}
+
+/// Best-effort extraction of the daemon's error message from a response
+/// body ({"message": ...} or {"error": ...}); falls back to the raw body.
+pub fn daemon_error_message(body: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        for key in ["message", "error"] {
+            if let Some(message) = value.get(key).and_then(Value::as_str) {
+                return message.to_owned();
+            }
+        }
+    }
+    body.chars().take(512).collect()
+}
+
+fn daemon_connect() -> io::Result<UnixStream> {
+    let mut last_error = None;
+    for _ in 0..10 {
+        match UnixStream::connect(INSTALLER_SOCKET_PATH) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("installer daemon socket is unavailable")))
+}
+
+/// Read an HTTP/1.1 response head one byte at a time so no body bytes
+/// are buffered past the header terminator (the event-stream reader
+/// continues on the same socket). Returns the status code and the
+/// Content-Length, when the response carries one.
+fn read_http_head(reader: &mut impl Read) -> io::Result<(u16, Option<usize>)> {
+    let mut head = Vec::with_capacity(1024);
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 64 * 1024 {
+            return Err(io::Error::other(
+                "installer daemon response headers are too large",
+            ));
+        }
+        if reader.read(&mut byte)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "installer daemon closed the connection",
+            ));
+        }
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let mut lines = text.lines();
+    let status_line = lines.next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "installer daemon sent a malformed status line: {status_line:?}"
+            ))
+        })?;
+    let content_length = lines.find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    Ok((status, content_length))
+}
+
+/// One authenticated request against the daemon's Unix socket. The
+/// daemon requires exactly one X-Kyth-Session-Token header matching the
+/// session token file (installer_daemon.rs handle()).
+fn daemon_request(
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&str>,
+) -> io::Result<(u16, String)> {
+    let mut stream = daemon_connect()?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let payload = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: installer\r\n\
+         X-Kyth-Session-Token: {token}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    let (status, content_length) = read_http_head(&mut stream)?;
+    let mut bytes = Vec::new();
+    match content_length {
+        Some(length) => {
+            bytes.resize(length, 0);
+            stream.read_exact(&mut bytes)?;
+        }
+        None => {
+            stream.read_to_end(&mut bytes)?;
+        }
+    }
+    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// Follow GET /api/stream until the daemon closes it after a terminal
+/// (done/error) job event. Returns the last event payload seen; an
+/// error event or a blown budget is an Err carrying the last state.
+fn daemon_stream_terminal_state(token: &str) -> io::Result<String> {
+    let mut stream = daemon_connect()?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let request = format!(
+        "GET /api/stream HTTP/1.1\r\nHost: installer\r\n\
+         X-Kyth-Session-Token: {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    let (status, _) = read_http_head(&mut stream)?;
+    if status != 200 {
+        return Err(io::Error::other(format!(
+            "installer event stream answered HTTP {status}"
+        )));
+    }
+    let deadline = Instant::now() + DAEMON_STREAM_BUDGET;
+    let mut reader = BufReader::new(stream);
+    let mut last_state = String::new();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Ok(last_state),
+            Ok(_) => {
+                let Some(payload) = line.trim_end().strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                last_state = payload.chars().take(512).collect();
+                if let Ok(event) = serde_json::from_str::<Value>(payload) {
+                    match event.get("type").and_then(Value::as_str) {
+                        Some("done") => return Ok(last_state),
+                        Some("error") => {
+                            let message = event
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("installer reported an error");
+                            return Err(io::Error::other(format!(
+                                "installer job failed: {message}"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(format!(
+                        "installer job did not finish within {}s; last event: {last_state}",
+                        DAEMON_STREAM_BUDGET.as_secs()
+                    )));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A prepared daemon session: the token the daemon authenticated
+/// against, plus the launcher lock held for the session's lifetime.
+struct InstallerDaemonSession {
+    token: String,
+    _lock: File,
+}
+
+/// Replicate kyth-launch-installer's daemon preparation without the
+/// GUI shell: the runtime directory (0750 root:liveuser), the session
+/// lock, a fresh root-owned 0600 session token (the daemon's
+/// read_session_token requires uid 0 and no group/other access), and a
+/// daemon restart so it picks the new token up. The launcher's
+/// client-<uid>/tokens.json sidecar exists only for the GUI shell and
+/// has no headless equivalent.
+fn prepare_installer_daemon() -> io::Result<InstallerDaemonSession> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(INSTALLER_LOCK_FILE)?;
+    // SAFETY: flock operates on the open file descriptor above; the
+    // result is checked before the lock is treated as held.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::other(
+            "another installer session is already in progress",
+        ));
+    }
+    run_logged(
+        &[
+            "install".into(),
+            "-d".into(),
+            "-m".into(),
+            "0750".into(),
+            "-o".into(),
+            "root".into(),
+            "-g".into(),
+            "liveuser".into(),
+            INSTALLER_RUN_DIR.into(),
+        ],
+        COMMAND_TIMEOUT,
+        "could not create the installer runtime directory",
+    )?;
+    let output = run_logged(
+        &["openssl".into(), "rand".into(), "-hex".into(), "32".into()],
+        Duration::from_secs(30),
+        "could not generate an installer session token",
+    )?;
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::other(
+            "openssl produced an unexpected session token",
+        ));
+    }
+    let temporary = format!("{INSTALLER_TOKEN_FILE}.{}", std::process::id());
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(token.as_bytes())?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    fs::rename(&temporary, INSTALLER_TOKEN_FILE)?;
+    run_logged(
+        &[
+            "systemctl".into(),
+            "restart".into(),
+            "kyth-installerd.service".into(),
+        ],
+        COMMAND_TIMEOUT,
+        "could not restart the installer daemon",
+    )?;
+    for _ in 0..30 {
+        let active = run_bounded(
+            &[
+                "systemctl".into(),
+                "is-active".into(),
+                "--quiet".into(),
+                "kyth-installerd.service".into(),
+            ],
+            Duration::from_secs(5),
+        )
+        .is_ok_and(|output| output.status.success());
+        if active && Path::new(INSTALLER_SOCKET_PATH).exists() {
+            return Ok(InstallerDaemonSession { token, _lock: lock });
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(io::Error::other("installer daemon did not become ready"))
+}
+
+/// Daemon-driven install: same live prelude and completion contract as
+/// the raw bootc path (LIVE_READY, INSTALL_STARTED, INSTALL_COMPLETE,
+/// reboot into the installed lifecycle), but the install itself is the
+/// real kyth-installerd job a user session would start.
+fn install_via_installer_daemon() -> io::Result<()> {
+    if !wait_for_desktop("live") {
+        return Err(io::Error::other("live Plasma desktop did not become ready"));
+    }
+    emit("LIVE_READY", "plasmashell-active");
+    smoke_check("LIVE")?;
+    let target = Path::new(TARGET_BY_ID).canonicalize().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "dedicated acceptance disk not found",
+        )
+    })?;
+    if !is_block_device(&target) {
+        return Err(io::Error::other(
+            "acceptance disk symlink did not resolve to a block device",
+        ));
+    }
+    // The daemon takes its source from KYTH_SOURCE_IMAGE in its own
+    // EnvironmentFile and falls back to a floating tag when the pin is
+    // absent; resolve the pin here and fail closed exactly like the raw
+    // path does before it passes the pin to bootc.
+    let source_ref = installer_source_ref()?;
+    if !valid_update_ref(&source_ref) {
+        return Err(io::Error::other(
+            "installer source image reference contains unsupported characters",
+        ));
+    }
+    let target_ref = installer_target_ref();
+    let session = prepare_installer_daemon()?;
+    let (status, body) = daemon_request("GET", "/api/disks", &session.token, None)?;
+    if status != 200 {
+        return Err(io::Error::other(format!(
+            "installer disk inventory answered HTTP {status}: {}",
+            daemon_error_message(&body)
+        )));
+    }
+    let inventory: Value = serde_json::from_str(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let disk = acceptance_disk_from_inventory(&inventory, &target).ok_or_else(|| {
+        io::Error::other(format!(
+            "dedicated acceptance disk {} is missing from the installer inventory or hosts the live system",
+            target.display()
+        ))
+    })?;
+    // Windows variant: the install is an NTFS shrink of the prepared
+    // Windows partition, chosen by the daemon's own candidacy flag.
+    // Record the volume identity first so the post-install probe (and
+    // the installed lifecycle) can prove the shrink preserved it.
+    let mut windows_target: Option<(String, String)> = None;
+    let request = if windows_mode() {
+        let (status, body) = daemon_request(
+            "GET",
+            &format!("/api/partitions?disk={}", percent_encode(&disk)),
+            &session.token,
+            None,
+        )?;
+        if status != 200 {
+            return Err(io::Error::other(format!(
+                "installer partition inventory answered HTTP {status}: {}",
+                daemon_error_message(&body)
+            )));
+        }
+        let partitions: Value = serde_json::from_str(&body)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let (partition, resize_gib) = windows_resize_target_from_partitions(&partitions)
+            .ok_or_else(|| {
+                io::Error::other(
+                    "installer inventory offers no NTFS shrink candidate on the \
+                     acceptance disk; the prepared Windows partition is missing \
+                     or below the 96 GiB candidacy minimum",
+                )
+            })?;
+        let uuid = ntfs_uuids(Some(&target.display().to_string()))
+            .into_iter()
+            .find(|(name, _)| name == &partition)
+            .map(|(_, uuid)| uuid)
+            .filter(|uuid| !uuid.is_empty())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "prepared NTFS partition {partition} has no readable volume UUID"
+                ))
+            })?;
+        emit(
+            "WINDOWS_NTFS_BEFORE",
+            format!("device={partition} uuid={uuid}"),
+        );
+        windows_target = Some((partition.clone(), uuid));
+        daemon_windows_start_request(
+            &disk,
+            ACCEPTANCE_HOSTNAME,
+            ACCEPTANCE_USERNAME,
+            ACCEPTANCE_PASSWORD,
+            &partition,
+            resize_gib,
+        )
+    } else {
+        daemon_start_request(
+            &disk,
+            ACCEPTANCE_HOSTNAME,
+            ACCEPTANCE_USERNAME,
+            ACCEPTANCE_PASSWORD,
+        )
+    };
+    emit("INSTALL_STARTED", target.display().to_string());
+    let (status, body) = daemon_request(
+        "POST",
+        "/api/start",
+        &session.token,
+        Some(&request.to_string()),
+    )?;
+    if status != 200 {
+        return Err(io::Error::other(format!(
+            "installer start answered HTTP {status}: {}",
+            daemon_error_message(&body)
+        )));
+    }
+    daemon_stream_terminal_state(&session.token)?;
+    let (status, body) = daemon_request("GET", "/api/report", &session.token, None)?;
+    if status != 200 {
+        return Err(io::Error::other(format!(
+            "installer report answered HTTP {status}: {}",
+            daemon_error_message(&body)
+        )));
+    }
+    let report: Value = serde_json::from_str(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let failures = report_failures(&report);
+    if !failures.is_empty() {
+        return Err(io::Error::other(format!(
+            "installer assurance failed: {}",
+            failures.join(", ")
+        )));
+    }
+    if let Some((partition, uuid_before)) = &windows_target {
+        let uuid_after = ntfs_uuids(Some(&target.display().to_string()))
+            .into_iter()
+            .find(|(name, _)| name == partition)
+            .map(|(_, uuid)| uuid)
+            .unwrap_or_default();
+        if uuid_after.is_empty() {
+            return Err(io::Error::other(format!(
+                "NTFS partition {partition} is missing or lost its volume \
+                 identity during the alongside install"
+            )));
+        }
+        if !uuid_after.eq_ignore_ascii_case(uuid_before) {
+            return Err(io::Error::other(format!(
+                "NTFS volume identity changed during the alongside install: \
+                 {uuid_before} -> {uuid_after}"
+            )));
+        }
+        emit(
+            "WINDOWS_NTFS_AFTER",
+            format!("device={partition} uuid={uuid_after}"),
+        );
+    }
     emit("INSTALL_COMPLETE", target_ref);
     power("reboot");
     Ok(())
@@ -872,6 +1623,12 @@ fn installed_lifecycle() -> io::Result<()> {
             emit("INSTALLED_READY", "display-manager-active");
             selinux_enforcing()?;
             first_boot_check()?;
+            if secure_boot_mode() {
+                secure_boot_check()?;
+            }
+            if windows_mode() {
+                windows_ntfs_survived()?;
+            }
             if network_check_enabled() {
                 network_check()?;
             }
@@ -957,7 +1714,11 @@ pub fn run() -> io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let result = if Path::new(INSTALLER_ENV_FILE).is_file() {
-        install_from_live_iso()
+        if installer_daemon_mode() {
+            install_via_installer_daemon()
+        } else {
+            install_from_live_iso()
+        }
     } else {
         installed_lifecycle()
     };
@@ -1039,6 +1800,283 @@ mod tests {
             "ghcr.io"
         );
         assert_eq!(registry_host("ghcr.io"), "ghcr.io");
+    }
+
+    fn complete_report() -> Value {
+        let checks: Vec<Value> = ASSURANCE_CHECK_NAMES
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "status": "pass", "detail": ""}))
+            .collect();
+        serde_json::json!({"status": "complete", "checks": checks})
+    }
+
+    #[test]
+    fn daemon_start_request_matches_the_native_contract() {
+        let request = daemon_start_request(
+            "/dev/vda",
+            "kyth-acceptance",
+            "kyth-acceptance",
+            "kyth-acceptance",
+        );
+        let object = request.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "acknowledged_irreversible",
+                "confirm_backup",
+                "confirm_current",
+                "confirm_erase",
+                "disk",
+                "encryption",
+                "flatpaks",
+                "free_region_end",
+                "free_region_start",
+                "hostname",
+                "install_mode",
+                "kernel",
+                "keymap",
+                "locale",
+                "mok_password",
+                "password",
+                "resize_gib",
+                "resize_partition",
+                "target_partition",
+                "timezone",
+                "tpm_recovery_ack",
+                "username",
+            ]
+        );
+        assert_eq!(request["disk"], "/dev/vda");
+        assert_eq!(request["install_mode"], "wipe");
+        assert_eq!(request["confirm_backup"], true);
+        assert_eq!(request["confirm_erase"], true);
+        assert_eq!(request["acknowledged_irreversible"], true);
+        assert_eq!(request["encryption"], "none");
+        assert_eq!(request["hostname"], "kyth-acceptance");
+        assert_eq!(request["username"], "kyth-acceptance");
+        assert_eq!(request["password"], "kyth-acceptance");
+    }
+
+    #[test]
+    fn selects_only_the_dedicated_acceptance_disk() {
+        let inventory = serde_json::json!([
+            {"name": "/dev/sda", "current": true},
+            {"name": "/dev/vda", "current": false},
+        ]);
+        assert_eq!(
+            acceptance_disk_from_inventory(&inventory, Path::new("/dev/vda")),
+            Some("/dev/vda".to_string())
+        );
+        // The disk hosting the live system is never eligible.
+        assert_eq!(
+            acceptance_disk_from_inventory(&inventory, Path::new("/dev/sda")),
+            None
+        );
+        assert_eq!(
+            acceptance_disk_from_inventory(&inventory, Path::new("/dev/vdb")),
+            None
+        );
+        assert_eq!(
+            acceptance_disk_from_inventory(&serde_json::json!({}), Path::new("/dev/vda")),
+            None
+        );
+    }
+
+    #[test]
+    fn report_evaluation_requires_completion_and_passing_assurance() {
+        assert!(report_failures(&complete_report()).is_empty());
+
+        // A warning progress check (the daemon records these on
+        // successful installs, e.g. boot_entries) does not fail the run.
+        let mut report = complete_report();
+        report["checks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "boot_entries", "status": "warning"}));
+        assert!(report_failures(&report).is_empty());
+
+        // A missing assurance check fails, naming the check.
+        let mut report = complete_report();
+        report["checks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|check| check["name"] != "selinux");
+        assert_eq!(
+            report_failures(&report),
+            ["assurance check selinux is missing"]
+        );
+
+        // A non-pass assurance check fails, naming the check.
+        let mut report = complete_report();
+        for check in report["checks"].as_array_mut().unwrap() {
+            if check["name"] == "selinux" {
+                check["status"] = Value::String("fail".into());
+            }
+        }
+        assert_eq!(
+            report_failures(&report),
+            ["assurance check selinux did not pass"]
+        );
+
+        // Any other check with an explicit fail status fails the run.
+        let mut report = complete_report();
+        report["checks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "power", "status": "fail"}));
+        assert_eq!(report_failures(&report), ["installer check power failed"]);
+
+        // A job that did not complete fails even with passing checks.
+        let mut report = complete_report();
+        report["status"] = Value::String("failed".into());
+        assert_eq!(
+            report_failures(&report),
+            ["installer job status is \"failed\""]
+        );
+
+        // No checks at all cannot be verified as passing.
+        let report = serde_json::json!({"status": "complete", "checks": []});
+        assert_eq!(
+            report_failures(&report),
+            ["installer report carries no checks"]
+        );
+    }
+
+    #[test]
+    fn parses_daemon_http_heads_and_error_messages() {
+        let mut cursor =
+            io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec());
+        let (status, length) = read_http_head(&mut cursor).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(length, Some(2));
+
+        let mut cursor = io::Cursor::new(
+            b"HTTP/1.1 409 Conflict\r\nContent-Type: text/event-stream\r\n\r\n".to_vec(),
+        );
+        let (status, length) = read_http_head(&mut cursor).unwrap();
+        assert_eq!(status, 409);
+        assert_eq!(length, None);
+
+        assert_eq!(
+            daemon_error_message("{\"started\":false,\"message\":\"disk busy\"}"),
+            "disk busy"
+        );
+        assert_eq!(daemon_error_message("{\"error\":\"nope\"}"), "nope");
+        assert_eq!(daemon_error_message("plain failure"), "plain failure");
+    }
+
+    #[test]
+    fn windows_start_request_is_a_resize_of_the_prepared_partition() {
+        let request = daemon_windows_start_request(
+            "/dev/vda",
+            "kyth-acceptance",
+            "kyth-acceptance",
+            "kyth-acceptance",
+            "/dev/vda2",
+            63,
+        );
+        // Same field set as the wipe request; only the mode fields move.
+        let wipe = daemon_start_request(
+            "/dev/vda",
+            "kyth-acceptance",
+            "kyth-acceptance",
+            "kyth-acceptance",
+        );
+        let mut keys: Vec<&str> = request
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut wipe_keys: Vec<&str> = wipe
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        wipe_keys.sort_unstable();
+        assert_eq!(keys, wipe_keys);
+        assert_eq!(request["install_mode"], "resize_ntfs");
+        assert_eq!(request["resize_partition"], "/dev/vda2");
+        assert_eq!(request["resize_gib"], 63);
+        assert_eq!(request["confirm_erase"], true);
+        assert_eq!(request["encryption"], "none");
+    }
+
+    #[test]
+    fn windows_resize_sizing_keeps_the_windows_floor() {
+        let gib = 1024 * 1024 * 1024;
+        // Below the installer's 96 GiB candidacy minimum: no target.
+        assert_eq!(windows_resize_gib(64 * gib), None);
+        assert_eq!(windows_resize_gib(96 * gib - 1), None);
+        // At the minimum KythOS gets exactly its 32 GiB floor.
+        assert_eq!(windows_resize_gib(96 * gib), Some(32));
+        // The 128 GiB windows-variant disk: ~127 GiB NTFS -> 63 GiB.
+        assert_eq!(windows_resize_gib(127 * gib), Some(63));
+    }
+
+    #[test]
+    fn windows_target_requires_the_daemons_own_candidate_flag() {
+        let partitions = serde_json::json!([
+            {"name": "/dev/vda1", "size_bytes": 512 * 1024 * 1024,
+             "fstype": "vfat", "ntfs_resize_candidate": false},
+            {"name": "/dev/vda2", "size_bytes": 127_u64 * 1024 * 1024 * 1024,
+             "fstype": "ntfs", "ntfs_resize_candidate": true},
+        ]);
+        assert_eq!(
+            windows_resize_target_from_partitions(&partitions),
+            Some(("/dev/vda2".to_string(), 63))
+        );
+        // An NTFS partition the daemon does not flag (e.g. too small) is
+        // never selected behind its back.
+        let small = serde_json::json!([
+            {"name": "/dev/vda2", "size_bytes": 63_u64 * 1024 * 1024 * 1024,
+             "fstype": "ntfs", "ntfs_resize_candidate": false},
+        ]);
+        assert_eq!(windows_resize_target_from_partitions(&small), None);
+        assert_eq!(
+            windows_resize_target_from_partitions(&serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_ntfs_rows_from_lsblk_output() {
+        let output = "/dev/vda\n\
+                      /dev/vda1 vfat 8CA4-F0D2\n\
+                      /dev/vda2 ntfs 5A8C4E2F12345678\n\
+                      /dev/vda3 btrfs 9f1c-UUID\n\
+                      /dev/vdb1 ntfs3 FEDCBA0987654321\n\
+                      /dev/vdb2 ntfs\n";
+        assert_eq!(
+            ntfs_entries_from_lsblk(output),
+            [
+                ("/dev/vda2".to_string(), "5A8C4E2F12345678".to_string()),
+                ("/dev/vdb1".to_string(), "FEDCBA0987654321".to_string()),
+                ("/dev/vdb2".to_string(), String::new()),
+            ]
+        );
+        assert!(ntfs_entries_from_lsblk("").is_empty());
+    }
+
+    #[test]
+    fn parses_mokutil_secure_boot_state() {
+        assert_eq!(
+            secure_boot_state_from_output("SecureBoot enabled\n"),
+            Some(true)
+        );
+        assert_eq!(
+            secure_boot_state_from_output("SecureBoot disabled\n"),
+            Some(false)
+        );
+        assert_eq!(secure_boot_state_from_output(""), None);
+        assert_eq!(
+            secure_boot_state_from_output("mokutil: EFI variables are not supported\n"),
+            None
+        );
     }
 
     #[test]

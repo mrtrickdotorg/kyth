@@ -10,6 +10,7 @@ usage() {
 	cat <<'EOF'
 Usage: vm-acceptance.sh --iso PATH [--update-ref IMAGE] [--artifacts DIR]
                         [--timeout-minutes N] [--allow-tcg] [--network-check]
+                        [--installer-daemon] [--secure-boot] [--windows]
 
 Without --update-ref, validates live boot, bundled-image installation, and the
 first installed boot. With --update-ref, also stages that image, boots it,
@@ -18,6 +19,27 @@ stages rollback, and verifies the original digest after the rollback boot.
 With --network-check, the guest additionally verifies that the installed
 system can resolve and reach its target registry. It is off by default so
 hermetic runs without outbound networking do not false-fail.
+
+With --installer-daemon, the guest installs by driving the real installer
+daemon (kyth-installerd) over its authenticated socket and asserts every
+assurance check in its report, instead of running bootc directly. It is
+opt-in so the raw bootc route remains the default.
+
+With --secure-boot, the VM boots secboot OVMF firmware with the KythOS
+MOK certificate pre-enrolled into a per-run copy of the variables file
+(via virt-fw-vars), and the installed system must report Secure Boot
+enabled. The secboot firmware is probed for and never silently replaced
+with non-secboot firmware.
+
+With --windows, a Windows side (GPT + ESP + NTFS, see
+vm-acceptance-prep-windows.sh) is prepared on the install disk first and
+the guest performs an alongside NTFS-shrink install, asserting the NTFS
+volume's identity survives. It requires --installer-daemon: the raw
+bootc route can only wipe the disk and would destroy the prepared NTFS
+partition. The disk grows to 128G for this variant: the installer only
+offers NTFS partitions of at least 96 GiB as shrink candidates (a 64 GiB
+Windows floor plus the 32 GiB KythOS minimum), which a 64G disk can
+never satisfy.
 
 Booting a full desktop OS under software emulation (no /dev/kvm) is too slow
 to finish inside any practical timeout, so hardware acceleration is required
@@ -32,6 +54,9 @@ ARTIFACTS=
 TIMEOUT_MINUTES=75
 ALLOW_TCG=0
 NETWORK_CHECK=0
+INSTALLER_DAEMON=0
+SECURE_BOOT=0
+WINDOWS=0
 while (($#)); do
 	case "$1" in
 	--iso)
@@ -58,6 +83,18 @@ while (($#)); do
 		NETWORK_CHECK=1
 		shift
 		;;
+	--installer-daemon)
+		INSTALLER_DAEMON=1
+		shift
+		;;
+	--secure-boot)
+		SECURE_BOOT=1
+		shift
+		;;
+	--windows)
+		WINDOWS=1
+		shift
+		;;
 	--help | -h)
 		usage
 		exit 0
@@ -78,6 +115,12 @@ done
 	echo "Invalid timeout" >&2
 	exit 64
 }
+if ((WINDOWS)) && ((INSTALLER_DAEMON == 0)); then
+	echo "--windows requires --installer-daemon: the raw bootc route can" >&2
+	echo "only wipe the install disk, which would destroy the prepared" >&2
+	echo "NTFS partition instead of shrinking it." >&2
+	exit 64
+fi
 for command in qemu-img qemu-system-x86_64 timeout; do
 	command -v "${command}" >/dev/null || {
 		echo "Missing command: ${command}" >&2
@@ -97,25 +140,99 @@ SERIAL_LOG="${ARTIFACTS}/serial.log"
 QEMU_LOG="${ARTIFACTS}/qemu.log"
 MONITOR="${ARTIFACTS}/monitor.sock"
 rm -f "${DISK}" "${SERIAL_LOG}" "${QEMU_LOG}" "${MONITOR}"
-qemu-img create -q -f qcow2 -o lazy_refcounts=on "${DISK}" 64G
+DISK_SIZE=64G
+if ((WINDOWS)); then
+	# The installer's NTFS shrink candidacy starts at 96 GiB of NTFS
+	# (64 GiB Windows floor + 32 GiB KythOS minimum), so the Windows
+	# variant's disk must be larger than the standard 64G.
+	DISK_SIZE=128G
+fi
+qemu-img create -q -f qcow2 -o lazy_refcounts=on "${DISK}" "${DISK_SIZE}"
 
+WINDOWS_NTFS_UUID=
+if ((WINDOWS)); then
+	"${SCRIPT_DIR}/vm-acceptance-prep-windows.sh" \
+		--disk "${DISK}" --report "${ARTIFACTS}/windows-prep.txt"
+	WINDOWS_NTFS_UUID="$(sed -n 's/^NTFS_UUID=//p' "${ARTIFACTS}/windows-prep.txt" | head -1)"
+	[[ -n "${WINDOWS_NTFS_UUID}" ]] || {
+		echo "Windows preparation did not report an NTFS volume UUID" >&2
+		exit 1
+	}
+fi
+
+MACHINE_ARGS=(-machine q35)
 OVMF_ARGS=()
-for code in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd; do
-	[[ -r "${code}" ]] || continue
-	vars_template="${code/CODE/VARS}"
-	if [[ -r "${vars_template}" ]]; then
-		cp "${vars_template}" "${ARTIFACTS}/OVMF_VARS.fd"
-		OVMF_ARGS=(
-			-drive "if=pflash,format=raw,unit=0,readonly=on,file=${code}"
-			-drive "if=pflash,format=raw,unit=1,file=${ARTIFACTS}/OVMF_VARS.fd"
-		)
-		break
-	fi
-done
+if ((SECURE_BOOT)); then
+	# Secure Boot variant: secboot firmware only (never a silent
+	# fallback), SMM on, and the KythOS MOK certificate pre-enrolled
+	# into a per-run copy of the variables file — the system template
+	# is only ever read, via virt-fw-vars -i/-o.
+	MOK_CERT="${REPO_ROOT}/build_files/secureboot/kyth-secureboot.cer"
+	# Owner GUID shim records MokList entries under.
+	SHIM_GUID="605dab50-e046-4300-abb6-3dd810dd8b23"
+	command -v virt-fw-vars >/dev/null || {
+		echo "--secure-boot requires virt-fw-vars to pre-enroll the" >&2
+		echo "KythOS MOK certificate (package: python3-virt-firmware)." >&2
+		exit 69
+	}
+	[[ -r "${MOK_CERT}" ]] || {
+		echo "KythOS MOK certificate is missing: ${MOK_CERT}" >&2
+		exit 66
+	}
+	SECBOOT_PAIRS=(
+		# Fedora layout: dedicated secboot variables file.
+		"/usr/share/OVMF/OVMF_CODE_4M.secboot.fd:/usr/share/OVMF/OVMF_VARS_4M.secboot.fd"
+		# Debian/Ubuntu layout: the secboot CODE pairs with the .ms
+		# variables file (no VARS_4M.secboot.fd is shipped).
+		"/usr/share/OVMF/OVMF_CODE_4M.secboot.fd:/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+		"/usr/share/OVMF/OVMF_CODE_4M.ms.fd:/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+		"/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.fd:/usr/share/edk2/ovmf/OVMF_VARS_4M.secboot.fd"
+		"/usr/share/edk2-ovmf/x64/OVMF_CODE.secboot.fd:/usr/share/edk2-ovmf/x64/OVMF_VARS.secboot.fd"
+	)
+	SECBOOT_CODE=
+	SECBOOT_VARS=
+	for pair in "${SECBOOT_PAIRS[@]}"; do
+		if [[ -r "${pair%%:*}" && -r "${pair##*:}" ]]; then
+			SECBOOT_CODE="${pair%%:*}"
+			SECBOOT_VARS="${pair##*:}"
+			break
+		fi
+	done
+	[[ -n "${SECBOOT_CODE}" ]] || {
+		echo "Secure Boot OVMF firmware was not found. Probed pairs:" >&2
+		printf '  %s\n' "${SECBOOT_PAIRS[@]}" >&2
+		echo "Install the ovmf (Debian/Ubuntu) or edk2-ovmf (Fedora)" >&2
+		echo "package. Refusing to fall back to non-Secure-Boot firmware." >&2
+		exit 69
+	}
+	virt-fw-vars -i "${SECBOOT_VARS}" -o "${ARTIFACTS}/OVMF_VARS.fd" \
+		--sb --add-mok "${SHIM_GUID}" "${MOK_CERT}"
+	OVMF_ARGS=(
+		-drive "if=pflash,format=raw,unit=0,readonly=on,file=${SECBOOT_CODE}"
+		-drive "if=pflash,format=raw,unit=1,file=${ARTIFACTS}/OVMF_VARS.fd"
+	)
+	MACHINE_ARGS=(
+		-machine "q35,smm=on"
+		-global "driver=cfi.pflash01,property=secure,value=on"
+	)
+else
+	for code in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd; do
+		[[ -r "${code}" ]] || continue
+		vars_template="${code/CODE/VARS}"
+		if [[ -r "${vars_template}" ]]; then
+			cp "${vars_template}" "${ARTIFACTS}/OVMF_VARS.fd"
+			OVMF_ARGS=(
+				-drive "if=pflash,format=raw,unit=0,readonly=on,file=${code}"
+				-drive "if=pflash,format=raw,unit=1,file=${ARTIFACTS}/OVMF_VARS.fd"
+			)
+			break
+		fi
+	done
+fi
 
 # shellcheck disable=SC2054  # commas below are qemu's own option syntax, not array separators
 QEMU_ARGS=(
-	-machine q35
+	"${MACHINE_ARGS[@]}"
 	-smp 4
 	-m 8192
 	-nodefaults
@@ -161,6 +278,15 @@ if [[ -n "${UPDATE_REF}" ]]; then
 fi
 if ((NETWORK_CHECK)); then
 	QEMU_ARGS+=(-fw_cfg "name=opt/com.kyth/network-check,string=1")
+fi
+if ((INSTALLER_DAEMON)); then
+	QEMU_ARGS+=(-fw_cfg "name=opt/com.kyth/installer-mode,string=daemon")
+fi
+if ((SECURE_BOOT)); then
+	QEMU_ARGS+=(-fw_cfg "name=opt/com.kyth/secure-boot,string=1")
+fi
+if ((WINDOWS)); then
+	QEMU_ARGS+=(-fw_cfg "name=opt/com.kyth/windows,string=1")
 fi
 
 echo "Acceptance artifacts: ${ARTIFACTS}"
@@ -240,6 +366,30 @@ if ((NETWORK_CHECK)); then
 			exit 1
 		}
 fi
+if ((SECURE_BOOT)); then
+	grep -q '^KYTH_ACCEPTANCE:INSTALLED_SECUREBOOT_OK:' "${SERIAL_LOG}" ||
+		{
+			echo "Installed Secure Boot sentinel missing" >&2
+			exit 1
+		}
+fi
+if ((WINDOWS)); then
+	for phase in WINDOWS_NTFS_BEFORE WINDOWS_NTFS_AFTER WINDOWS_NTFS_OK; do
+		grep -q "^KYTH_ACCEPTANCE:${phase}:" "${SERIAL_LOG}" ||
+			{
+				echo "${phase} sentinel missing" >&2
+				exit 1
+			}
+		# The NTFS volume identity the guest reports at every stage
+		# must be the one the host prepared: a shrink preserves the
+		# volume serial, so any drift means the volume was recreated.
+		reported_uuid="$(sed -n "s/^KYTH_ACCEPTANCE:${phase}:.*uuid=\([0-9A-Fa-f-]*\).*/\1/p" "${SERIAL_LOG}" | head -1)"
+		if [[ "${reported_uuid,,}" != "${WINDOWS_NTFS_UUID,,}" ]]; then
+			echo "${phase} reports NTFS uuid '${reported_uuid}', expected the prepared '${WINDOWS_NTFS_UUID}'" >&2
+			exit 1
+		fi
+	done
+fi
 if [[ -n "${UPDATE_REF}" ]]; then
 	for phase in UPDATE_STAGED UPDATE_BOOTED ROLLBACK_STAGED ROLLBACK_BOOTED; do
 		grep -q "^KYTH_ACCEPTANCE:${phase}:" "${SERIAL_LOG}" ||
@@ -265,6 +415,12 @@ QUALIFICATION_ARGS=(
 )
 if [[ -n "${UPDATE_REF}" ]]; then
 	QUALIFICATION_ARGS+=(--update-required)
+fi
+if ((SECURE_BOOT)); then
+	QUALIFICATION_ARGS+=(--secure-boot-required)
+fi
+if ((WINDOWS)); then
+	QUALIFICATION_ARGS+=(--windows-required)
 fi
 if [[ -x /usr/bin/kyth-qualify ]]; then
 	qualification_cmd=(/usr/bin/kyth-qualify)

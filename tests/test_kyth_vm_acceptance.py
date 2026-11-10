@@ -12,6 +12,7 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 GUEST = ROOT / "build_files" / "kyth-vm-acceptance-guest"
 HOST = ROOT / "build_files" / "scripts" / "vm-acceptance.sh"
+PREP = ROOT / "build_files" / "scripts" / "vm-acceptance-prep-windows.sh"
 UNIT = ROOT / "build_files" / "kyth-vm-acceptance.service"
 sys.path.insert(0, str(ROOT / "build_files" / "kyth_shared"))
 
@@ -27,6 +28,7 @@ class VmAcceptanceTests(unittest.TestCase):
         subprocess.run(["bash", "-n", str(GUEST)], check=True)
         self.assertIn("/usr/bin/kyth-vm-acceptance-guest", GUEST.read_text(encoding="utf-8"))
         subprocess.run(["bash", "-n", str(HOST)], check=True)
+        subprocess.run(["bash", "-n", str(PREP)], check=True)
 
     def test_guest_is_firmware_gated_and_covers_lifecycle(self):
         text = pathlib.Path(vm_acceptance.__file__).read_text(encoding="utf-8")
@@ -548,6 +550,627 @@ class InstalledTruthCheckTests(unittest.TestCase):
             vm_acceptance._registry_host("ghcr.io/example/kyth:testing"), "ghcr.io"
         )
         self.assertEqual(vm_acceptance._registry_host("ghcr.io"), "ghcr.io")
+
+
+def _complete_report() -> dict:
+    return {
+        "status": "complete",
+        "checks": [
+            {"name": name, "status": "pass", "detail": ""}
+            for name in vm_acceptance.ASSURANCE_CHECK_NAMES
+        ],
+    }
+
+
+class _FakeTarget:
+    """Stand-in for the resolved acceptance disk path."""
+
+    def is_block_device(self) -> bool:
+        return True
+
+    def resolve(self, strict: bool = True) -> "_FakeTarget":
+        return self
+
+    def __str__(self) -> str:
+        return "/dev/vda"
+
+
+class InstallerDaemonModeTests(unittest.TestCase):
+    def test_installer_daemon_mode_reads_fw_cfg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mode_file = pathlib.Path(tmp) / "mode"
+            mode_file.write_bytes(b"daemon\x00")
+            with mock.patch("kyth_shared.vm_acceptance.INSTALLER_MODE_FILE", mode_file):
+                self.assertTrue(vm_acceptance.installer_daemon_mode())
+            mode_file.write_bytes(b"raw")
+            with mock.patch("kyth_shared.vm_acceptance.INSTALLER_MODE_FILE", mode_file):
+                self.assertFalse(vm_acceptance.installer_daemon_mode())
+            with mock.patch(
+                "kyth_shared.vm_acceptance.INSTALLER_MODE_FILE",
+                pathlib.Path(tmp) / "absent",
+            ):
+                self.assertFalse(vm_acceptance.installer_daemon_mode())
+
+    def test_daemon_mode_contract_is_present_in_both_guests_and_host(self):
+        python_text = pathlib.Path(vm_acceptance.__file__).read_text(encoding="utf-8")
+        rust_text = (
+            ROOT / "src/kyth-shared-rs/src/system/vm_acceptance.rs"
+        ).read_text(encoding="utf-8")
+        for text in (python_text, rust_text):
+            for marker in (
+                "/api/disks", "/api/start", "/api/report", "/api/stream",
+                "X-Kyth-Session-Token", "installer-mode", "INSTALL_COMPLETE",
+            ):
+                self.assertIn(marker, text)
+        host_text = HOST.read_text(encoding="utf-8")
+        self.assertIn("--installer-daemon", host_text)
+        self.assertIn("opt/com.kyth/installer-mode,string=daemon", host_text)
+
+    def test_daemon_start_request_matches_the_native_contract(self):
+        request = vm_acceptance._daemon_start_request(
+            "/dev/vda", "kyth-acceptance", "kyth-acceptance", "kyth-acceptance"
+        )
+        self.assertEqual(
+            set(request),
+            {
+                "acknowledged_irreversible", "confirm_backup", "confirm_current",
+                "confirm_erase", "disk", "encryption", "flatpaks",
+                "free_region_end", "free_region_start", "hostname",
+                "install_mode", "kernel", "keymap", "locale", "mok_password",
+                "password", "resize_gib", "resize_partition",
+                "target_partition", "timezone", "tpm_recovery_ack", "username",
+            },
+        )
+        self.assertEqual(request["disk"], "/dev/vda")
+        self.assertEqual(request["install_mode"], "wipe")
+        self.assertIs(request["confirm_backup"], True)
+        self.assertIs(request["confirm_erase"], True)
+        self.assertIs(request["acknowledged_irreversible"], True)
+        self.assertEqual(request["encryption"], "none")
+        self.assertEqual(request["hostname"], "kyth-acceptance")
+        self.assertEqual(request["username"], "kyth-acceptance")
+        self.assertEqual(request["password"], "kyth-acceptance")
+
+    def test_acceptance_disk_selection_matches_the_raw_path_target(self):
+        inventory = [
+            {"name": "/dev/sda", "current": True},
+            {"name": "/dev/vda", "current": False},
+        ]
+        target = pathlib.Path("/dev/vda")
+        self.assertEqual(
+            vm_acceptance._acceptance_disk_from_inventory(inventory, target),
+            "/dev/vda",
+        )
+        # The disk hosting the live system is never eligible.
+        self.assertIsNone(
+            vm_acceptance._acceptance_disk_from_inventory(
+                inventory, pathlib.Path("/dev/sda")
+            )
+        )
+        self.assertIsNone(
+            vm_acceptance._acceptance_disk_from_inventory(
+                inventory, pathlib.Path("/dev/vdb")
+            )
+        )
+        self.assertIsNone(
+            vm_acceptance._acceptance_disk_from_inventory({}, target)
+        )
+
+    def test_report_evaluation_requires_completion_and_passing_assurance(self):
+        self.assertEqual(vm_acceptance._report_failures(_complete_report()), [])
+
+        # A warning progress check (the daemon records these on
+        # successful installs, e.g. boot_entries) does not fail the run.
+        report = _complete_report()
+        report["checks"].append({"name": "boot_entries", "status": "warning"})
+        self.assertEqual(vm_acceptance._report_failures(report), [])
+
+        report = _complete_report()
+        report["checks"] = [
+            check for check in report["checks"] if check["name"] != "selinux"
+        ]
+        self.assertEqual(
+            vm_acceptance._report_failures(report),
+            ["assurance check selinux is missing"],
+        )
+
+        report = _complete_report()
+        for check in report["checks"]:
+            if check["name"] == "selinux":
+                check["status"] = "fail"
+        self.assertEqual(
+            vm_acceptance._report_failures(report),
+            ["assurance check selinux did not pass"],
+        )
+
+        report = _complete_report()
+        report["checks"].append({"name": "power", "status": "fail"})
+        self.assertEqual(
+            vm_acceptance._report_failures(report),
+            ["installer check power failed"],
+        )
+
+        report = _complete_report()
+        report["status"] = "failed"
+        self.assertEqual(
+            vm_acceptance._report_failures(report),
+            ['installer job status is "failed"'],
+        )
+
+        self.assertEqual(
+            vm_acceptance._report_failures({"status": "complete", "checks": []}),
+            ["installer report carries no checks"],
+        )
+
+    def test_daemon_error_message_extraction(self):
+        self.assertEqual(
+            vm_acceptance._daemon_error_message(
+                '{"started": false, "message": "disk busy"}'
+            ),
+            "disk busy",
+        )
+        self.assertEqual(
+            vm_acceptance._daemon_error_message('{"error": "nope"}'), "nope"
+        )
+        self.assertEqual(
+            vm_acceptance._daemon_error_message("plain failure"), "plain failure"
+        )
+
+    def test_run_command_dispatches_to_daemon_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "kyth-installer.env"
+            env_file.write_text("x=1")
+            with mock.patch("kyth_shared.vm_acceptance.enabled", return_value=True), \
+                 mock.patch("kyth_shared.vm_acceptance.INSTALLER_ENV_FILE", env_file), \
+                 mock.patch("kyth_shared.vm_acceptance.installer_daemon_mode", return_value=True), \
+                 mock.patch("kyth_shared.vm_acceptance.install_via_installer_daemon") as mock_daemon, \
+                 mock.patch("kyth_shared.vm_acceptance.install_from_live_iso") as mock_live:
+                self.assertEqual(vm_acceptance.main(["run"]), 0)
+                mock_daemon.assert_called_once()
+                mock_live.assert_not_called()
+
+    def _daemon_flow_mocks(self, report: dict):
+        requests: list[tuple] = []
+
+        def fake_request(method, path, token, body=None):
+            requests.append((method, path, token, body))
+            if path == "/api/disks":
+                return 200, json.dumps([
+                    {"name": "/dev/sda", "current": True},
+                    {"name": "/dev/vda", "current": False},
+                ])
+            if path == "/api/start":
+                return 200, '{"started": true, "job_id": 1, "first_event_id": 1}'
+            if path == "/api/report":
+                return 200, json.dumps(report)
+            raise AssertionError(f"unexpected daemon path {path}")
+
+        return requests, fake_request
+
+    def test_install_via_installer_daemon_runs_the_full_flow(self):
+        requests, fake_request = self._daemon_flow_mocks(_complete_report())
+        with mock.patch("kyth_shared.vm_acceptance.wait_for_desktop", return_value=True), \
+             mock.patch("kyth_shared.vm_acceptance.run_smoke_check"), \
+             mock.patch("kyth_shared.vm_acceptance.TARGET_BY_ID", _FakeTarget()), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._installer_source_ref",
+                 return_value="ghcr.io/mrtrickdotorg/kyth@sha256:abc",
+             ), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._installer_target_ref",
+                 return_value="ghcr.io/mrtrickdotorg/kyth:testing",
+             ), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._prepare_installer_daemon",
+                 return_value=("token-123", object()),
+             ), \
+             mock.patch("kyth_shared.vm_acceptance._daemon_request", side_effect=fake_request), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._daemon_stream_terminal_state",
+                 return_value='{"id": 9, "type": "done"}',
+             ) as mock_stream, \
+             mock.patch("kyth_shared.vm_acceptance.emit") as emit, \
+             mock.patch("kyth_shared.vm_acceptance.power") as power:
+            vm_acceptance.install_via_installer_daemon()
+        self.assertEqual(
+            [(method, path) for method, path, _token, _body in requests],
+            [("GET", "/api/disks"), ("POST", "/api/start"), ("GET", "/api/report")],
+        )
+        self.assertTrue(all(token == "token-123" for _m, _p, token, _b in requests))
+        start_body = requests[1][3]
+        self.assertEqual(start_body["disk"], "/dev/vda")
+        self.assertEqual(start_body["install_mode"], "wipe")
+        self.assertIs(start_body["confirm_erase"], True)
+        self.assertIs(start_body["acknowledged_irreversible"], True)
+        self.assertEqual(start_body["encryption"], "none")
+        mock_stream.assert_called_once_with("token-123")
+        emitted = [(call.args[0], call.args[1]) for call in emit.call_args_list]
+        self.assertIn(("INSTALL_STARTED", "/dev/vda"), emitted)
+        self.assertIn(
+            ("INSTALL_COMPLETE", "ghcr.io/mrtrickdotorg/kyth:testing"), emitted
+        )
+        power.assert_called_once_with("reboot")
+
+    def test_install_via_installer_daemon_fails_on_a_failed_assurance_check(self):
+        report = _complete_report()
+        for check in report["checks"]:
+            if check["name"] == "selinux":
+                check["status"] = "fail"
+        _requests, fake_request = self._daemon_flow_mocks(report)
+        with mock.patch("kyth_shared.vm_acceptance.wait_for_desktop", return_value=True), \
+             mock.patch("kyth_shared.vm_acceptance.run_smoke_check"), \
+             mock.patch("kyth_shared.vm_acceptance.TARGET_BY_ID", _FakeTarget()), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._installer_source_ref",
+                 return_value="ghcr.io/mrtrickdotorg/kyth@sha256:abc",
+             ), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._installer_target_ref",
+                 return_value="ghcr.io/mrtrickdotorg/kyth:testing",
+             ), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._prepare_installer_daemon",
+                 return_value=("token-123", object()),
+             ), \
+             mock.patch("kyth_shared.vm_acceptance._daemon_request", side_effect=fake_request), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._daemon_stream_terminal_state",
+                 return_value='{"id": 9, "type": "done"}',
+             ), \
+             mock.patch("kyth_shared.vm_acceptance.emit") as emit, \
+             mock.patch("kyth_shared.vm_acceptance.power"), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)
+             ) as fail:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertIn("selinux", fail.call_args.args[0])
+        self.assertFalse(
+            any(call.args[0] == "INSTALL_COMPLETE" for call in emit.call_args_list)
+        )
+
+    def test_install_via_installer_daemon_propagates_stream_errors(self):
+        _requests, fake_request = self._daemon_flow_mocks(_complete_report())
+        with mock.patch("kyth_shared.vm_acceptance.wait_for_desktop", return_value=True), \
+             mock.patch("kyth_shared.vm_acceptance.run_smoke_check"), \
+             mock.patch("kyth_shared.vm_acceptance.TARGET_BY_ID", _FakeTarget()), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._installer_source_ref",
+                 return_value="ghcr.io/mrtrickdotorg/kyth@sha256:abc",
+             ), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._installer_target_ref",
+                 return_value="ghcr.io/mrtrickdotorg/kyth:testing",
+             ), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._prepare_installer_daemon",
+                 return_value=("token-123", object()),
+             ), \
+             mock.patch("kyth_shared.vm_acceptance._daemon_request", side_effect=fake_request), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance._daemon_stream_terminal_state",
+                 side_effect=RuntimeError("installer job failed: boom"),
+             ), \
+             mock.patch("kyth_shared.vm_acceptance.emit") as emit, \
+             mock.patch("kyth_shared.vm_acceptance.power"):
+            with self.assertRaises(RuntimeError):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertFalse(
+            any(call.args[0] == "INSTALL_COMPLETE" for call in emit.call_args_list)
+        )
+
+
+class VariantAcceptanceTests(unittest.TestCase):
+    def test_variant_fw_cfg_readers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sb_file = pathlib.Path(tmp) / "secure-boot"
+            win_file = pathlib.Path(tmp) / "windows"
+            sb_file.write_bytes(b"1\x00")
+            win_file.write_bytes(b"0")
+            with mock.patch("kyth_shared.vm_acceptance.SECURE_BOOT_FILE", sb_file), \
+                 mock.patch("kyth_shared.vm_acceptance.WINDOWS_FILE", win_file):
+                self.assertTrue(vm_acceptance.secure_boot_mode())
+                self.assertFalse(vm_acceptance.windows_mode())
+            win_file.write_bytes(b"1")
+            with mock.patch("kyth_shared.vm_acceptance.WINDOWS_FILE", win_file):
+                self.assertTrue(vm_acceptance.windows_mode())
+            with mock.patch(
+                "kyth_shared.vm_acceptance.SECURE_BOOT_FILE",
+                pathlib.Path(tmp) / "absent",
+            ):
+                self.assertFalse(vm_acceptance.secure_boot_mode())
+
+    def test_variant_contract_is_present_in_both_guests_and_host(self):
+        python_text = pathlib.Path(vm_acceptance.__file__).read_text(encoding="utf-8")
+        rust_text = (
+            ROOT / "src/kyth-shared-rs/src/system/vm_acceptance.rs"
+        ).read_text(encoding="utf-8")
+        for text in (python_text, rust_text):
+            for marker in (
+                "secure-boot", "windows", "INSTALLED_SECUREBOOT_OK",
+                "WINDOWS_NTFS_BEFORE", "WINDOWS_NTFS_AFTER", "WINDOWS_NTFS_OK",
+                "resize_ntfs", "ntfs_resize_candidate", "mokutil", "--sb-state",
+            ):
+                self.assertIn(marker, text)
+        host_text = HOST.read_text(encoding="utf-8")
+        for marker in (
+            "--secure-boot", "--windows",
+            "opt/com.kyth/secure-boot,string=1",
+            "opt/com.kyth/windows,string=1",
+            "virt-fw-vars", "--add-mok", "kyth-secureboot.cer",
+            "OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.ms.fd",
+            "q35,smm=on", "cfi.pflash01,property=secure",
+            "--secure-boot-required", "--windows-required",
+            "vm-acceptance-prep-windows.sh", "128G",
+            "--windows requires --installer-daemon",
+            "INSTALLED_SECUREBOOT_OK", "WINDOWS_NTFS_OK",
+        ):
+            self.assertIn(marker, host_text)
+
+    def test_windows_start_request_matches_the_native_contract(self):
+        request = vm_acceptance._daemon_windows_start_request(
+            "/dev/vda", "kyth-acceptance", "kyth-acceptance",
+            "kyth-acceptance", "/dev/vda2", 63,
+        )
+        wipe = vm_acceptance._daemon_start_request(
+            "/dev/vda", "kyth-acceptance", "kyth-acceptance", "kyth-acceptance"
+        )
+        self.assertEqual(set(request), set(wipe))
+        self.assertEqual(request["install_mode"], "resize_ntfs")
+        self.assertEqual(request["resize_partition"], "/dev/vda2")
+        self.assertEqual(request["resize_gib"], 63)
+        self.assertIs(request["confirm_erase"], True)
+        self.assertEqual(request["encryption"], "none")
+
+    def test_windows_resize_sizing_keeps_the_windows_floor(self):
+        gib = 1024 * 1024 * 1024
+        self.assertIsNone(vm_acceptance._windows_resize_gib(64 * gib))
+        self.assertIsNone(vm_acceptance._windows_resize_gib(96 * gib - 1))
+        self.assertEqual(vm_acceptance._windows_resize_gib(96 * gib), 32)
+        self.assertEqual(vm_acceptance._windows_resize_gib(127 * gib), 63)
+
+    def test_windows_target_requires_the_daemons_own_candidate_flag(self):
+        partitions = [
+            {"name": "/dev/vda1", "size_bytes": 512 * 1024 * 1024,
+             "fstype": "vfat", "ntfs_resize_candidate": False},
+            {"name": "/dev/vda2", "size_bytes": 127 * 1024 * 1024 * 1024,
+             "fstype": "ntfs", "ntfs_resize_candidate": True},
+        ]
+        self.assertEqual(
+            vm_acceptance._windows_resize_target_from_partitions(partitions),
+            ("/dev/vda2", 63),
+        )
+        small = [
+            {"name": "/dev/vda2", "size_bytes": 63 * 1024 * 1024 * 1024,
+             "fstype": "ntfs", "ntfs_resize_candidate": False},
+        ]
+        self.assertIsNone(
+            vm_acceptance._windows_resize_target_from_partitions(small)
+        )
+        self.assertIsNone(
+            vm_acceptance._windows_resize_target_from_partitions({})
+        )
+
+    def test_ntfs_entries_parse_lsblk_output(self):
+        output = (
+            "/dev/vda\n"
+            "/dev/vda1 vfat 8CA4-F0D2\n"
+            "/dev/vda2 ntfs 5A8C4E2F12345678\n"
+            "/dev/vda3 btrfs 9f1c-uuid\n"
+            "/dev/vdb1 ntfs3 FEDCBA0987654321\n"
+            "/dev/vdb2 ntfs\n"
+        )
+        self.assertEqual(
+            vm_acceptance._ntfs_entries_from_lsblk(output),
+            [
+                ("/dev/vda2", "5A8C4E2F12345678"),
+                ("/dev/vdb1", "FEDCBA0987654321"),
+                ("/dev/vdb2", ""),
+            ],
+        )
+        self.assertEqual(vm_acceptance._ntfs_entries_from_lsblk(""), [])
+
+    def test_secure_boot_state_parsing(self):
+        self.assertIs(
+            vm_acceptance._secure_boot_state_from_output("SecureBoot enabled\n"),
+            True,
+        )
+        self.assertIs(
+            vm_acceptance._secure_boot_state_from_output("SecureBoot disabled\n"),
+            False,
+        )
+        self.assertIsNone(vm_acceptance._secure_boot_state_from_output(""))
+        self.assertIsNone(
+            vm_acceptance._secure_boot_state_from_output(
+                "mokutil: EFI variables are not supported\n"
+            )
+        )
+
+    def _windows_flow_mocks(self, report: dict):
+        requests: list[tuple] = []
+
+        def fake_request(method, path, token, body=None):
+            requests.append((method, path, token, body))
+            if path == "/api/disks":
+                return 200, json.dumps([
+                    {"name": "/dev/sda", "current": True},
+                    {"name": "/dev/vda", "current": False},
+                ])
+            if path == "/api/partitions?disk=%2Fdev%2Fvda":
+                return 200, json.dumps([
+                    {"name": "/dev/vda1", "size_bytes": 512 * 1024 * 1024,
+                     "fstype": "vfat", "ntfs_resize_candidate": False},
+                    {"name": "/dev/vda2",
+                     "size_bytes": 127 * 1024 * 1024 * 1024,
+                     "fstype": "ntfs", "ntfs_resize_candidate": True},
+                ])
+            if path == "/api/start":
+                return 200, '{"started": true, "job_id": 1, "first_event_id": 1}'
+            if path == "/api/report":
+                return 200, json.dumps(report)
+            raise AssertionError(f"unexpected daemon path {path}")
+
+        return requests, fake_request
+
+    def _windows_flow_patches(self, fake_request, ntfs_uuids):
+        return (
+            mock.patch("kyth_shared.vm_acceptance.wait_for_desktop", return_value=True),
+            mock.patch("kyth_shared.vm_acceptance.run_smoke_check"),
+            mock.patch("kyth_shared.vm_acceptance.TARGET_BY_ID", _FakeTarget()),
+            mock.patch(
+                "kyth_shared.vm_acceptance._installer_source_ref",
+                return_value="ghcr.io/mrtrickdotorg/kyth@sha256:abc",
+            ),
+            mock.patch(
+                "kyth_shared.vm_acceptance._installer_target_ref",
+                return_value="ghcr.io/mrtrickdotorg/kyth:testing",
+            ),
+            mock.patch(
+                "kyth_shared.vm_acceptance._prepare_installer_daemon",
+                return_value=("token-123", object()),
+            ),
+            mock.patch("kyth_shared.vm_acceptance.windows_mode", return_value=True),
+            mock.patch("kyth_shared.vm_acceptance._daemon_request", side_effect=fake_request),
+            mock.patch(
+                "kyth_shared.vm_acceptance._daemon_stream_terminal_state",
+                return_value='{"id": 9, "type": "done"}',
+            ),
+            mock.patch(
+                "kyth_shared.vm_acceptance._ntfs_uuids",
+                side_effect=ntfs_uuids,
+            ),
+        )
+
+    def test_install_via_installer_daemon_windows_flow(self):
+        requests, fake_request = self._windows_flow_mocks(_complete_report())
+        patches = self._windows_flow_patches(
+            fake_request, lambda device=None: [("/dev/vda2", "5A8C4E2F12345678")]
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], patches[8], patches[9], \
+             mock.patch("kyth_shared.vm_acceptance.emit") as emit, \
+             mock.patch("kyth_shared.vm_acceptance.power") as power:
+            vm_acceptance.install_via_installer_daemon()
+        self.assertEqual(
+            [(method, path) for method, path, _token, _body in requests],
+            [
+                ("GET", "/api/disks"),
+                ("GET", "/api/partitions?disk=%2Fdev%2Fvda"),
+                ("POST", "/api/start"),
+                ("GET", "/api/report"),
+            ],
+        )
+        start_body = requests[2][3]
+        self.assertEqual(start_body["install_mode"], "resize_ntfs")
+        self.assertEqual(start_body["resize_partition"], "/dev/vda2")
+        self.assertEqual(start_body["resize_gib"], 63)
+        emitted = [(call.args[0], call.args[1]) for call in emit.call_args_list]
+        self.assertIn(
+            ("WINDOWS_NTFS_BEFORE", "device=/dev/vda2 uuid=5A8C4E2F12345678"),
+            emitted,
+        )
+        self.assertIn(
+            ("WINDOWS_NTFS_AFTER", "device=/dev/vda2 uuid=5A8C4E2F12345678"),
+            emitted,
+        )
+        self.assertIn(
+            ("INSTALL_COMPLETE", "ghcr.io/mrtrickdotorg/kyth:testing"), emitted
+        )
+        power.assert_called_once_with("reboot")
+
+    def test_windows_flow_fails_when_ntfs_identity_changes(self):
+        _requests, fake_request = self._windows_flow_mocks(_complete_report())
+        sightings = iter([
+            [("/dev/vda2", "5A8C4E2F12345678")],
+            [("/dev/vda2", "AAAA4E2F12345678")],
+        ])
+        patches = self._windows_flow_patches(
+            fake_request, lambda device=None: next(sightings)
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], patches[8], patches[9], \
+             mock.patch("kyth_shared.vm_acceptance.emit") as emit, \
+             mock.patch("kyth_shared.vm_acceptance.power"), \
+             mock.patch(
+                 "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)
+             ) as fail:
+            with self.assertRaises(SystemExit):
+                vm_acceptance.install_via_installer_daemon()
+        self.assertIn("identity changed", fail.call_args.args[0])
+        self.assertFalse(
+            any(call.args[0] == "INSTALL_COMPLETE" for call in emit.call_args_list)
+        )
+
+    def test_secure_boot_check_emits_only_when_enabled(self):
+        enabled = _completed(0, stdout="SecureBoot enabled\n")
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=enabled
+        ), mock.patch("kyth_shared.vm_acceptance.emit") as emit:
+            vm_acceptance._secure_boot_check()
+        emit.assert_called_once_with("INSTALLED_SECUREBOOT_OK", "enabled")
+
+        disabled = _completed(0, stdout="SecureBoot disabled\n")
+        with mock.patch(
+            "kyth_shared.vm_acceptance.run_text", return_value=disabled
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)
+        ) as fail:
+            with self.assertRaises(SystemExit):
+                vm_acceptance._secure_boot_check()
+        self.assertIn("Secure Boot disabled", fail.call_args.args[0])
+
+    def test_windows_ntfs_check_requires_a_surviving_volume(self):
+        with mock.patch(
+            "kyth_shared.vm_acceptance._ntfs_uuids",
+            return_value=[("/dev/vda2", "5A8C4E2F12345678")],
+        ), mock.patch("kyth_shared.vm_acceptance.emit") as emit:
+            vm_acceptance._windows_ntfs_check()
+        emit.assert_called_once_with(
+            "WINDOWS_NTFS_OK", "device=/dev/vda2 uuid=5A8C4E2F12345678"
+        )
+        with mock.patch(
+            "kyth_shared.vm_acceptance._ntfs_uuids", return_value=[]
+        ), mock.patch(
+            "kyth_shared.vm_acceptance.fail", side_effect=SystemExit(1)
+        ) as fail:
+            with self.assertRaises(SystemExit):
+                vm_acceptance._windows_ntfs_check()
+        self.assertIn("survived", fail.call_args.args[0])
+
+
+class VariantPrepScriptTests(unittest.TestCase):
+    def test_prep_script_shape(self):
+        text = PREP.read_text(encoding="utf-8")
+        for marker in (
+            # GPT identities the installer's preflight keys on.
+            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+            "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+            # Both backends and their packages are named.
+            "guestfish", "libguestfs-tools", "qemu-nbd", "mkntfs",
+            "ntfs-3g", "mkfs.vfat", "dosfstools", "sfdisk",
+            # The marker tree and the report contract.
+            "Windows/System32", "NTFS_UUID=", "ntfs_resize_candidate",
+            # The candidacy size floor is enforced, not assumed.
+            "96 * 1024 * 1024 * 1024",
+        ):
+            self.assertIn(marker, text)
+
+    @unittest.skipUnless(
+        __import__("shutil").which("qemu-img"), "qemu-img is not installed"
+    )
+    def test_prep_refuses_a_disk_below_the_candidacy_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = pathlib.Path(tmp) / "small.qcow2"
+            subprocess.run(
+                ["qemu-img", "create", "-q", "-f", "qcow2", str(disk), "64G"],
+                check=True,
+            )
+            result = subprocess.run(
+                [str(PREP), "--disk", str(disk)],
+                capture_output=True, text=True, timeout=120,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("96 GiB", result.stderr)
 
 
 class RunSmokeCheckTests(unittest.TestCase):

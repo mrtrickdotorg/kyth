@@ -47,7 +47,7 @@ fn option(args: &mut Vec<String>, name: &str) -> Option<PathBuf> {
 
 fn usage() {
     eprintln!(
-        "usage: kyth-qualify acceptance --log PATH --output PATH [--markdown PATH] [--update-required]\n\
+        "usage: kyth-qualify acceptance --log PATH --output PATH [--markdown PATH] [--update-required] [--secure-boot-required] [--windows-required]\n\
          kyth-qualify gate --candidate PATH --baseline PATH --budgets PATH [--output PATH] [--markdown PATH]"
     );
 }
@@ -60,9 +60,17 @@ fn run(args: &mut Vec<String>) -> Result<QualificationReport, String> {
             let output = option(args, "--output").ok_or("acceptance requires --output")?;
             let markdown = option(args, "--markdown");
             let update_required = args.iter().any(|value| value == "--update-required");
+            let secure_boot_required = args.iter().any(|value| value == "--secure-boot-required");
+            let windows_required = args.iter().any(|value| value == "--windows-required");
             let content = fs::read_to_string(&log)
                 .map_err(|error| format!("could not read {}: {error}", log.display()))?;
-            let report = acceptance_report(&content, update_required, generated_at());
+            let report = acceptance_report(
+                &content,
+                update_required,
+                secure_boot_required,
+                windows_required,
+                generated_at(),
+            );
             write_report(&report, &output, markdown.as_deref())?;
             Ok(report)
         }

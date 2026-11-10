@@ -18,8 +18,13 @@ Options:
 
 The wrapper records source-ledger and runtime-report results, image metadata
 when available, then runs the disposable install/update/rollback harness.
-Destructive hardware and dual-boot operations remain manual disposable-device
-steps documented in docs/rust-migration-acceptance-gates.md.
+After the base run it drives the same ISO through the installer daemon for
+two more install shapes — Secure Boot with the KythOS MOK pre-enrolled, and
+an alongside install next to a prepared Windows (NTFS) side — each in its
+own evidence subdirectory (vm-secure-boot/, vm-windows/). Variant failures
+fail this wrapper, exactly like a base-run failure. Destructive hardware and
+dual-boot operations remain manual disposable-device steps documented in
+docs/rust-migration-acceptance-gates.md.
 EOF
 }
 
@@ -95,6 +100,23 @@ for command in git python3 qemu-img qemu-system-x86_64; do
     }
 done
 
+# The variant runs at the end of this script need tooling the base run
+# does not. Fail here, before the long base run, naming the same
+# packages vm-acceptance.sh and vm-acceptance-prep-windows.sh report.
+command -v virt-fw-vars >/dev/null || {
+    echo "Missing required command: virt-fw-vars (package: python3-virt-firmware)" >&2
+    exit 69
+}
+if ! command -v guestfish >/dev/null; then
+    for spec in qemu-nbd:qemu-utils sfdisk:fdisk mkntfs:ntfs-3g mkfs.vfat:dosfstools; do
+        command -v "${spec%%:*}" >/dev/null || {
+            echo "Missing required command: ${spec%%:*} (package: ${spec##*:};" >&2
+            echo "or install guestfish instead, package: libguestfs-tools)" >&2
+            exit 69
+        }
+    done
+fi
+
 if [[ -z "${ARTIFACTS}" ]]; then
     ARTIFACTS="$(mktemp -d /tmp/kyth-rust-migration-acceptance.XXXXXXXX)"
 else
@@ -169,12 +191,51 @@ fi
     exit 1
 }
 
+# Variant runs: the same ISO installed through the real installer daemon,
+# once with Secure Boot enforced and once alongside a prepared Windows
+# (NTFS) side. Each variant owns a separate artifacts subdirectory —
+# vm-acceptance.sh treats its whole artifacts directory as scratch
+# (disk image, serial log, firmware copies). No --update-ref: update and
+# rollback mechanics are install-shape independent and already proven on
+# this exact image by the base run above, so the variants stay focused
+# on the install shapes the base run cannot reach. A nonzero variant
+# exit aborts this wrapper (set -e), failing the calling job just like
+# a base-run failure.
+run_variant() {
+    local name="$1"
+    shift
+    local variant_args=(
+        --iso "${ISO}"
+        --artifacts "${ARTIFACTS}/${name}"
+        --timeout-minutes "${TIMEOUT_MINUTES}"
+        --installer-daemon
+        "$@"
+    )
+    if ((ALLOW_TCG)); then
+        variant_args+=(--allow-tcg)
+    fi
+    "${REPO_ROOT}/build_files/scripts/vm-acceptance.sh" "${variant_args[@]}"
+    [[ -s "${ARTIFACTS}/${name}/serial.log" ]] || {
+        echo "Variant ${name} did not produce serial.log" >&2
+        exit 1
+    }
+    [[ -s "${ARTIFACTS}/${name}/qualification.json" ]] || {
+        echo "Variant ${name} did not produce qualification.json" >&2
+        exit 1
+    }
+}
+
+run_variant vm-secure-boot --secure-boot
+run_variant vm-windows --windows
+
 cat >"${ARTIFACTS}/evidence-status.txt" <<'EOF'
 source_owner_ledger=pass
 runtime_reachability_report=pass
 exact_image_identity=review_image_metadata
 live_install_and_first_boot=pass
 update_and_rollback=pass
+secure_boot_variant=pass
+windows_alongside_variant=pass
 destructive_hardware_paths=manual_disposable_device_required
 dual_boot_paths=manual_disposable_device_required
 observation_window=not_started
