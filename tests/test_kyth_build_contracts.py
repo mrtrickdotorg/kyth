@@ -663,6 +663,37 @@ class BuildAssemblyContracts(unittest.TestCase):
                         self.fail(f"{script.relative_to(ROOT)} re-installs purged cups-browsed")
 
 
+    def test_llama_cpp_and_rocm_stay_out_of_the_image(self):
+        # Fedora's llama-cpp links the ROCm/HIP backend into the main
+        # binary, so installing it hard-requires rocblas/hipblas and
+        # drags in the whole ROCm tree — measured 2.32 GiB, 30% of the
+        # image — for the Guardian's optional, CPU-only local LLM. The
+        # Guardian treats a missing llama-cli as an explicit degraded
+        # state and fetches the runtime on first use. Nothing in the
+        # image build may re-add these packages (comments stripped, so
+        # the explanatory note in the tooling script doesn't trip this).
+        banned = {"llama-cpp", "rocm", "rocblas", "rocsolver", "hipblas"}
+        candidates = list(BUILD_FILES.rglob("*.sh")) + list(
+            (ROOT / "build_base").rglob("*.sh")
+        )
+        candidates += [
+            ROOT / "Dockerfile",
+            ROOT / "build_base" / "Dockerfile",
+            ROOT / "installer" / "Containerfile",
+        ]
+        for script in candidates:
+            text = script.read_text(encoding="utf-8")
+            code = "\n".join(
+                line.split("#", 1)[0] for line in text.splitlines()
+            )
+            tokens = set(code.replace("\\", " ").split())
+            with self.subTest(script=script.relative_to(ROOT)):
+                self.assertFalse(
+                    banned & tokens,
+                    f"{script.relative_to(ROOT)} installs a banned AI-payload "
+                    f"package: {sorted(banned & tokens)}",
+                )
+
     def test_payload_build_sh_failure_fails_the_image_layer(self):
         # A trailing `; if ...; fi` once masked build.sh's exit code: the
         # layer committed a half-built payload (cosign gate failed, so

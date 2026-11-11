@@ -33,6 +33,13 @@ dnf5 install -y --skip-unavailable \
 	openssl \
 	fwupd
 
-# Small CPU-only runtime for the optional, user-downloaded Guardian model.
-# Keep image construction portable if the package is temporarily unavailable.
-dnf5 install -y --skip-unavailable llama-cpp
+# The Guardian's local-LLM runtime is deliberately NOT installed here.
+# Fedora's llama-cpp package links the ROCm/HIP backend into the main
+# binary, so it hard-requires rocblas/hipblas/libamdhip64 and drags in
+# the whole ROCm tree (rocsolver alone is ~1 GiB; the closure measured
+# 2.32 GiB — 30% of the image) for a feature that is optional and
+# CPU-only by design. The Guardian already treats a missing llama-cli
+# as an explicit degraded state and its model is user-downloaded, so
+# the runtime is fetched on first use instead of taxing every install.
+# Do not re-add llama-cpp (or any rocm* package) to the image; the
+# build contracts pin this.
