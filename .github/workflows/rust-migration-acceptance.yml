@@ -113,12 +113,37 @@ jobs:
       - name: Grant runner access to /dev/kvm
         run: |
           set -euo pipefail
+          # ubuntu-latest moved to the Ubuntu 26.04 runner image, which
+          # no longer loads the kvm module (or creates /dev/kvm) out of
+          # the box: the udev static-node rule below conjures nothing
+          # while the driver is unregistered, and every nightly
+          # acceptance run died at this step from 2026-11-09 on. Load
+          # the host module first; the vendor-wrong modprobe fails
+          # harmlessly and a built-in kvm needs no module at all.
+          if [[ ! -e /dev/kvm ]]; then
+            # No silent-pass fallback on purpose: a failed modprobe
+            # is non-fatal only because the usability check below is
+            # the real gate and fails loudly with diagnostics.
+            for module in kvm_intel kvm_amd; do
+              if sudo modprobe "${module}" 2>/dev/null; then
+                break
+              fi
+            done
+          fi
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # The trigger only replays events for devices udev already
+          # knows; chmod is the deterministic permissions floor.
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 0666 /dev/kvm
+          fi
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
             echo "::error::/dev/kvm is not usable on this runner" >&2
+            echo "device node: $(ls -l /dev/kvm 2>&1)" >&2
+            echo "kvm modules: $(lsmod | grep '^kvm' || echo none)" >&2
+            echo "cpu virt flag: $(grep -m1 -o -E 'vmx|svm' /proc/cpuinfo || echo none)" >&2
             exit 1
           fi
 
@@ -230,12 +255,37 @@ jobs:
       - name: Grant runner access to /dev/kvm
         run: |
           set -euo pipefail
+          # ubuntu-latest moved to the Ubuntu 26.04 runner image, which
+          # no longer loads the kvm module (or creates /dev/kvm) out of
+          # the box: the udev static-node rule below conjures nothing
+          # while the driver is unregistered, and every nightly
+          # acceptance run died at this step from 2026-11-09 on. Load
+          # the host module first; the vendor-wrong modprobe fails
+          # harmlessly and a built-in kvm needs no module at all.
+          if [[ ! -e /dev/kvm ]]; then
+            # No silent-pass fallback on purpose: a failed modprobe
+            # is non-fatal only because the usability check below is
+            # the real gate and fails loudly with diagnostics.
+            for module in kvm_intel kvm_amd; do
+              if sudo modprobe "${module}" 2>/dev/null; then
+                break
+              fi
+            done
+          fi
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # The trigger only replays events for devices udev already
+          # knows; chmod is the deterministic permissions floor.
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 0666 /dev/kvm
+          fi
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
             echo "::error::/dev/kvm is not usable on this runner" >&2
+            echo "device node: $(ls -l /dev/kvm 2>&1)" >&2
+            echo "kvm modules: $(lsmod | grep '^kvm' || echo none)" >&2
+            echo "cpu virt flag: $(grep -m1 -o -E 'vmx|svm' /proc/cpuinfo || echo none)" >&2
             exit 1
           fi
 

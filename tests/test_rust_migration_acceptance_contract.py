@@ -44,6 +44,34 @@ class RustMigrationAcceptanceContractTest(unittest.TestCase):
         self.assertIn("rust-migration-acceptance iso image_ref", self.justfile)
         self.assertIn("run-rust-migration-acceptance.sh", self.justfile)
 
+    def test_kvm_grant_loads_module_before_usability_check(self):
+        """Regression (2026-11-12): the Ubuntu 26.04 runner image no
+        longer loads the kvm module out of the box, so the old
+        udev-rule-only grant step conjured no /dev/kvm and every
+        nightly acceptance run died at the usability check from
+        2026-11-09 on. Every copy of the grant step (both jobs here,
+        plus the ISO workflow's acceptance job) must load the host
+        module and set permissions before it checks usability."""
+        iso_workflow = (ROOT / ".github/workflows/build-live-iso.yml").read_text(
+            encoding="utf-8"
+        )
+        for name, workflow in (
+            ("rust-migration-acceptance", self.artifact_workflow),
+            ("build-live-iso", iso_workflow),
+        ):
+            blocks = workflow.split("- name: Grant runner access to /dev/kvm")[1:]
+            self.assertTrue(blocks, f"{name}: no KVM grant step found")
+            for block in blocks:
+                step = block.split("- name:", 1)[0]
+                self.assertIn("for module in kvm_intel kvm_amd", step, name)
+                self.assertIn('modprobe "${module}"', step, name)
+                self.assertIn("chmod 0666 /dev/kvm", step, name)
+                self.assertLess(
+                    step.index("modprobe"),
+                    step.index("! -r /dev/kvm"),
+                    name,
+                )
+
     def test_artifact_workflow_reuses_exact_iso_without_rebuilding(self):
         for token in (
             "artifact_run_id",
