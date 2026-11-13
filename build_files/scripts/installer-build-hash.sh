@@ -15,6 +15,7 @@ cd "${repo_root}"
 # rather than maintaining a partial list of helpers that silently goes stale.
 git ls-files -z \
 	installer/Containerfile \
+	installer/Containerfile.offline \
 	installer/build.sh \
 	installer/iso.yaml \
 	src/kyth-installer-web \

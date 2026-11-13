@@ -29,17 +29,21 @@ channel unless a specific advisory says otherwise.
 
 ## Immutable vs. Channel Artifacts
 
-Every publish produces **two** artifact sets per channel:
+Every publish produces **two** artifact sets per channel **per ISO variant** (live and offline):
 
 | Kind | GitHub release tag | R2 ISO name | Mutability |
 | --- | --- | --- | --- |
-| Immutable | `iso-{testing,latest}-{release_id}` (e.g. `iso-testing-20260918-abcdef01-42-1`) | `kyth-live-{tag}-{release_id}.iso` | Never overwritten in place; on R2, retention keeps only the newest 5 build sets per channel |
+| Immutable | `iso-{testing,latest}-{release_id}` (e.g. `iso-testing-20260918-abcdef01-42-1`) | `kyth-live-{tag}-{release_id}.iso` | Never overwritten in place; on R2, retention keeps only the newest 5 build sets per variant and channel |
 | Channel pointer | `iso-testing` / `iso-latest` | `kyth-live-testing.iso` / `kyth-live-latest.iso` | Overwritten in place on every publish |
+| Offline immutable | `iso-offline-{testing,latest}-{release_id}` | `kyth-offline-{tag}-{release_id}.iso` | Never overwritten in place; same retention as live |
+| Offline channel pointer | `iso-offline-testing` / `iso-offline-latest` | `kyth-offline-testing.iso` / `kyth-offline-latest.iso` | Overwritten in place on every publish |
+
+The offline ISO boots a minimal installer session (no desktop preview) and carries the same signed image embedded, so it installs with no network. The live ISO is the smaller download and previews the full desktop, but downloads the image during setup.
 
 The channel pointer is what users download. The immutable set is the
 audit trail and the rollback source — with one boundary: after every
 publish, R2 retention (`build_files/scripts/r2_retention.py`) keeps
-only the **newest 5 immutable build sets per channel** and deletes
+only the **newest 5 immutable build sets per variant and channel** and deletes
 older ones, so a rollback target more than five builds back may no
 longer exist on R2. (The immutable GitHub releases are not purged.)
 Container images follow the same split: the build job publishes only

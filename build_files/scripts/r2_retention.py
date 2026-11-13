@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """R2 retention for the kyth-releases bucket.
 
-Every live-ISO publish uploads one immutable build set per build
-(``kyth-live-<channel>-<date>-<sha8>-<run>-<attempt>.iso`` plus its
--CHECKSUM/.sig/.bundle/.intoto.jsonl/.json companions) and overwrites the
-channel pointer objects (``kyth-live-<channel>.iso`` + companions).
+Every ISO publish uploads one immutable build set per build
+(``kyth-<variant>-<channel>-<date>-<sha8>-<run>-<attempt>.iso`` plus its
+-CHECKSUM/.sig/.bundle/.intoto.jsonl/.json companions, where variant is
+``live`` or ``offline``) and overwrites the channel pointer objects
+(``kyth-<variant>-<channel>.iso`` + companions).
 Nothing ever removed the old build sets, so the bucket grew by one full
 ISO per build (~3 TB / ~$46 per month by 2026-10).
 
@@ -32,8 +33,14 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 CHANNELS = ("testing", "latest")
+VARIANTS = ("live", "offline")
+# Retention groups are variant+channel pairs: the offline ISO is a
+# separate lineage from the live ISO and must not spend the live
+# lineage's keep budget (or vice versa).
+GROUPS = tuple(f"{variant}:{channel}" for variant in VARIANTS for channel in CHANNELS)
 BUILD_KEY_RE = re.compile(
-    r"^kyth-live-(?P<channel>testing|latest)-(?P<date>\d{8})-[0-9a-f]{8}-"
+    r"^kyth-(?P<variant>live|offline)-(?P<channel>testing|latest)-"
+    r"(?P<date>\d{8})-[0-9a-f]{8}-"
     r"(?P<run>\d+)-(?P<attempt>\d+)\.iso"
     r"(?P<suffix>-CHECKSUM|\.sig|\.bundle|\.intoto\.jsonl|\.json)?$"
 )
@@ -41,7 +48,7 @@ DELETE_BATCH = 1000  # S3 DeleteObjects limit
 
 
 def parse_build_key(key: str) -> tuple[str, tuple[int, int, int]] | None:
-    """Return (channel, (date, run, attempt)) for an immutable build key.
+    """Return (variant:channel group, (date, run, attempt)) for a build key.
 
     The stem of a build set is the key with its companion suffix removed;
     grouping by stem keeps a build's files together. Returns None for
@@ -55,7 +62,7 @@ def parse_build_key(key: str) -> tuple[str, tuple[int, int, int]] | None:
         int(match.group("run")),
         int(match.group("attempt")),
     )
-    return match.group("channel"), order
+    return f"{match.group('variant')}:{match.group('channel')}", order
 
 
 def build_stem(key: str) -> str:
@@ -66,26 +73,27 @@ def build_stem(key: str) -> str:
 
 
 def plan_deletions(keys: Iterable[str], keep: int = 5) -> list[str]:
-    """Keys to delete so each channel retains its newest ``keep`` builds."""
+    """Keys to delete so each variant+channel group retains its newest
+    ``keep`` builds."""
     if keep < 1:
         raise ValueError("keep must be at least 1")
     stems: dict[str, dict[tuple[int, int, int], str]] = {
-        channel: {} for channel in CHANNELS
+        group: {} for group in GROUPS
     }
     members: dict[str, list[str]] = {}
     for key in keys:
         parsed = parse_build_key(key)
         if parsed is None:
             continue
-        channel, order = parsed
+        group, order = parsed
         stem = build_stem(key)
-        stems[channel][order] = stem
+        stems[group][order] = stem
         members.setdefault(stem, []).append(key)
     doomed: list[str] = []
-    for channel in CHANNELS:
-        ordered = sorted(stems[channel], reverse=True)
+    for group in GROUPS:
+        ordered = sorted(stems[group], reverse=True)
         for order in ordered[keep:]:
-            doomed.extend(members[stems[channel][order]])
+            doomed.extend(members[stems[group][order]])
     return sorted(doomed)
 
 

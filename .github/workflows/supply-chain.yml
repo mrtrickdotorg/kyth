@@ -680,6 +680,22 @@ jobs:
               "run_acceptance": ${{ inputs.source_tag == 'latest' && '"true"' || '"false"' }}
             }
 
+      - name: Dispatch Offline ISO after image verification
+        if: inputs.dispatch_iso == 'true' || inputs.dispatch_iso == true
+        uses: ./.github/actions/dispatch-workflow
+        with:
+          workflow: build-live-iso.yml
+          ref: ${{ github.ref_name }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fields-json: |
+            {
+              "source_tag": ${{ toJSON(inputs.source_tag) }},
+              "source_digest": ${{ toJSON(inputs.source_digest) }},
+              "source_sha": ${{ toJSON(inputs.source_sha) }},
+              "run_acceptance": "false",
+              "variant": "offline"
+            }
+
       - name: Trigger CVE scan
         uses: ./.github/actions/dispatch-workflow
         with:

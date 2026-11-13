@@ -37,6 +37,17 @@ class PlanDeletionsTests(unittest.TestCase):
         )
         self.assertEqual(doomed, expected)
 
+    def test_offline_builds_have_their_own_retention_group(self):
+        keys: list[str] = []
+        for run in range(1, 8):  # 7 live testing builds: oldest 2 doomed
+            keys += build_keys("testing", f"202610{run:02d}", "a94b429e", run)
+        for run in range(1, 4):  # 3 offline testing builds: all kept
+            stem = f"kyth-offline-testing-202611{run:02d}-a94b429e-{run}-1.iso"
+            keys += [stem + suffix for suffix in SUFFIXES]
+        doomed = r2_retention.plan_deletions(keys, keep=5)
+        self.assertEqual(len(doomed), 2 * len(SUFFIXES))
+        self.assertTrue(all("offline" not in key for key in doomed))
+
     def test_channel_pointers_and_foreign_keys_are_never_planned(self):
         keys: list[str] = []
         for run in range(1, 9):

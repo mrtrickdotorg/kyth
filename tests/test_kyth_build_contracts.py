@@ -711,6 +711,31 @@ class BuildAssemblyContracts(unittest.TestCase):
         self.assertNotIn("bash /src/installer/build.sh;", containerfile)
         self.assertNotIn("bash /src/installer/build.sh &&", containerfile)
 
+    def test_offline_containerfile_embeds_the_pinned_payload(self):
+        """The offline variant's contract: a digest-pinned fedora-bootc
+        base, the signed image embedded as an OCI layout at exactly the
+        path build.sh's offline gate asserts, KYTH_OFFLINE_ISO=1 set for
+        the build.sh RUN, and build.sh still the RUN's final command so
+        its exit code fails the layer."""
+        containerfile = (ROOT / "installer" / "Containerfile.offline").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("quay.io/fedora/fedora-bootc:45@sha256:", containerfile)
+        self.assertIn(
+            'skopeo copy "docker://${INSTALL_SOURCE_IMAGE}" "oci:/payload:${SOURCE_TAG}"',
+            containerfile,
+        )
+        self.assertIn(
+            "COPY --from=payload-fetcher /payload /usr/lib/kyth/payload",
+            containerfile,
+        )
+        self.assertIn("KYTH_OFFLINE_ISO=1", containerfile)
+        self.assertIn("plasmalogin", containerfile)
+        self.assertTrue(
+            containerfile.rstrip().endswith("bash /src/installer/build.sh"),
+            "offline payload RUN must end with build.sh",
+        )
+
     def test_cosign_gate_retries_transients_but_stays_hard(self):
         # Shared-runner network flakes (TUF root refresh, registry reads)
         # must not nuke a 25-minute payload build on one blip — but the
@@ -814,6 +839,71 @@ class BuildAssemblyContracts(unittest.TestCase):
         self.assertIn("KYTH_SOURCE_DIGEST=%s", build)
         self.assertIn("Gate ISO size (8.5 GiB max)", iso_workflow)
         self.assertIn('"${cosign_bin}" verify', build)
+
+    def test_offline_iso_gate_points_daemon_at_embedded_payload(self):
+        """The offline ISO is a separate artifact. build.sh re-points the
+        daemon at the embedded OCI layout only when KYTH_OFFLINE_ISO=1,
+        and only after proving the embedded manifest digest equals the
+        pinned, cosign-verified source digest. The registry validation
+        above the gate is untouched: the pinned registry ref is still
+        what gets verified; only the install transport changes."""
+        build = (ROOT / "installer" / "build.sh").read_text(encoding="utf-8")
+        gate = build.split(
+            "Offline variant: install from the embedded OCI payload", 1
+        )[1].split("# Install live-only packages", 1)[0]
+        self.assertIn("KYTH_OFFLINE_ISO:-0", gate)
+        self.assertIn('payload_root="/usr/lib/kyth/payload"', gate)
+        self.assertIn("oci-layout", gate)
+        self.assertIn("index.json", gate)
+        self.assertIn("payload_digest", gate)
+        self.assertIn('!= "${source_digest}"', gate)
+        self.assertIn("exit 1", gate)
+        self.assertIn("KYTH_SOURCE_IMAGE=oci:${payload_root}:${SOURCE_TAG}", gate)
+        self.assertIn(
+            "live ISO installer source must be a registry image reference.", build
+        )
+
+    def test_offline_payload_digest_jq_matches_daemon_contract(self):
+        """Run build.sh's actual jq program against production-shaped OCI
+        index files: the daemon resolves an embedded image by the
+        org.opencontainers.image.ref.name annotation, falling back to a
+        single unannotated manifest; anything else must yield no digest
+        so the build fails closed on the digest comparison."""
+        import json as jsonlib
+
+        build = (ROOT / "installer" / "build.sh").read_text(encoding="utf-8")
+        match = re.search(
+            r"jq -r --arg tag \"\$\{SOURCE_TAG\}\" '\n(.*?)' \"\$\{payload_root\}/index\.json\"",
+            build,
+            re.S,
+        )
+        self.assertIsNotNone(match, "offline gate jq program not found in build.sh")
+        program = match.group(1)
+        digest_a = "sha256:" + "a" * 64
+        digest_b = "sha256:" + "b" * 64
+
+        def resolve(manifests):
+            with tempfile.TemporaryDirectory() as directory:
+                index = Path(directory) / "index.json"
+                index.write_text(
+                    jsonlib.dumps({"schemaVersion": 2, "manifests": manifests}),
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    ["jq", "-r", "--arg", "tag", "testing", program, str(index)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return result.stdout.strip()
+
+        annotated = [
+            {"digest": digest_a, "annotations": {"org.opencontainers.image.ref.name": "testing"}},
+            {"digest": digest_b, "annotations": {"org.opencontainers.image.ref.name": "latest"}},
+        ]
+        self.assertEqual(resolve(annotated), digest_a)
+        self.assertEqual(resolve([{"digest": digest_b}]), digest_b)
+        self.assertEqual(resolve([{"digest": digest_a}, {"digest": digest_b}]), "")
 
     def test_builder_cargo_targets_use_cache_mounts(self):
         """Rust rebuilds must be incremental: every cargo target dir in the

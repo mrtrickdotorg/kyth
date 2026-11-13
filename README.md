@@ -83,7 +83,7 @@ Rust is not the point of using KythOS; dependable desktop behavior is. It is one
 | **Stable** | You want the current daily-driver release. | [Download stable ISO](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-latest.iso) |
 | **Testing** | You want to help try new work before it reaches stable. | [Download testing ISO](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-live-testing.iso) |
 
-You need an x86-64 PC, a USB drive, at least 8 GB of RAM for the live environment, and an internet connection for the install itself: the installer downloads the system image (about 8.5 GiB) during setup — the live USB does not carry an offline copy, so KythOS cannot be installed without a connection. **Back up anything important before changing partitions or selecting an install disk.**
+You need an x86-64 PC, a USB drive, and at least 8 GB of RAM for the live environment. The standard ISO needs an internet connection for the install itself: the installer downloads the system image (about 5.5 GiB) during setup — the live USB does not carry an offline copy. If the machine has no connection, use the **offline ISO** instead ([stable offline](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-offline-latest.iso) · [testing offline](https://pub-9a3cc72972ea44c4ae7504ee7cda1fa6.r2.dev/kyth-offline-testing.iso)): it is a larger download that carries the same signed system image on the USB itself, boots straight into the installer, and installs with no network at all. **Back up anything important before changing partitions or selecting an install disk.**
 
 1. Download the ISO for the channel you chose.
 2. Verify the download against its published checksum (substitute the

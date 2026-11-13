@@ -37,6 +37,36 @@ class ReleaseIdentityTests(unittest.TestCase):
                 "nightly", "abcdef0123456789", "1", "1"
             )
 
+    def test_offline_variant_names_share_the_release_id(self):
+        identity = release_identity.build_identity(
+            "testing",
+            "abcdef0123456789",
+            "42",
+            "3",
+            build_date="20260726",
+            variant="offline",
+        )
+
+        self.assertEqual(identity.release_id, "20260726-abcdef01-42-3")
+        self.assertEqual(
+            identity.iso_basename,
+            "kyth-offline-testing-20260726-abcdef01-42-3.iso",
+        )
+        self.assertEqual(identity.channel_basename, "kyth-offline-testing.iso")
+        self.assertEqual(
+            identity.immutable_tag, "iso-offline-testing-20260726-abcdef01-42-3"
+        )
+        self.assertEqual(
+            identity.artifact_name,
+            "kyth-offline-iso-testing-20260726-abcdef01-42-3",
+        )
+
+    def test_unknown_release_variant_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unsupported release variant"):
+            release_identity.build_identity(
+                "testing", "abcdef0123456789", "1", "1", variant="usb"
+            )
+
 
 class WorkflowArtifactContracts(unittest.TestCase):
     def test_previous_sbom_baseline_comes_from_an_older_published_release(self):
@@ -100,6 +130,37 @@ class WorkflowArtifactContracts(unittest.TestCase):
         # Skipped is tolerated (emergency dispatch); failure never is.
         self.assertIn("needs.acceptance.result == 'skipped'", workflow)
         self.assertNotIn("needs.acceptance.result != 'failure'", workflow)
+
+    def test_iso_workflow_builds_the_offline_variant_end_to_end(self):
+        """The variant input must reach every place that behaves
+        differently for the offline ISO: the shared release identity
+        (offline artifact names), the payload Containerfile selection,
+        and the concurrency group — a live and an offline dispatch for
+        the same tag run in parallel pipelines and must never cancel
+        each other. Supply chain dispatches both variants of the same
+        verified image."""
+        workflow = (
+            ROOT / ".github/workflows/build-live-iso.yml"
+        ).read_text(encoding="utf-8")
+        supply = (
+            ROOT / ".github/workflows/supply-chain.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('echo "variant=${VARIANT}" >&3', workflow)
+        self.assertIn('--variant "${VARIANT}"', workflow)
+        self.assertIn('CONTAINERFILE="installer/Containerfile.offline"', workflow)
+        self.assertIn(
+            "build-live-iso-${{ inputs.variant || 'live' }}-", workflow
+        )
+        self.assertIn('"variant": "offline"', supply)
+        # The channel GitHub release is per variant too: deriving it
+        # from the source tag alone would upload offline assets into
+        # the live channel release (iso-testing / iso-latest).
+        self.assertIn('echo "value=iso-offline-${SOURCE_TAG}"', workflow)
+        self.assertIn('echo "value=iso-${SOURCE_TAG}"', workflow)
+        self.assertIn(
+            "CHANNEL_TAG: ${{ steps.channel_tag.outputs.value }}", workflow
+        )
 
     def test_release_identity_is_generated_by_shared_script(self):
         workflow = (

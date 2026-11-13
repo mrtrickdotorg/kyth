@@ -175,6 +175,44 @@ printf '{"schema_version":1,"digest":"%s","release_digest":"%s","target_image":"
 	"${signature_state}" "${signature_digest}" \
 	>/usr/share/kyth/image-source.json
 
+# ── Offline variant: install from the embedded OCI payload ──────────────────
+# Only installer/Containerfile.offline sets KYTH_OFFLINE_ISO=1: it copies
+# the pinned image into /usr/lib/kyth/payload as an OCI layout before this
+# script runs. The image identity does not change — the digest, release
+# metadata, and cosign signature bundle above still describe the signed
+# registry image — only the daemon's transport does. The daemon reads
+# oci:/usr/lib/kyth/payload:<tag> and re-verifies the layout against those
+# same pins before bootc runs (installer_readonly::embedded_digest), so
+# fail the build unless the embedded manifest digest is exactly the
+# pinned, cosign-verified source digest. The network-install ISO never
+# sets the flag and never embeds the image (see the note at the source
+# validation above); its payload stays byte-identical.
+if [[ "${KYTH_OFFLINE_ISO:-0}" == "1" ]]; then
+	payload_root="/usr/lib/kyth/payload"
+	if [[ ! -d "${payload_root}" || -L "${payload_root}" ]]; then
+		echo "ERROR: offline payload layout missing at ${payload_root}" >&2
+		exit 1
+	fi
+	if [[ ! -f "${payload_root}/oci-layout" || ! -f "${payload_root}/index.json" ]]; then
+		echo "ERROR: offline payload at ${payload_root} is not an OCI layout" >&2
+		exit 1
+	fi
+	payload_digest="$(jq -r --arg tag "${SOURCE_TAG}" '
+		(.manifests | map(select(.annotations["org.opencontainers.image.ref.name"] == $tag)) | first)
+		// (.manifests | if length == 1 then first else empty end)
+		| .digest // empty' "${payload_root}/index.json")"
+	if [[ "${payload_digest}" != "${source_digest}" ]]; then
+		echo "ERROR: embedded payload digest '${payload_digest}' does not match the pinned source digest '${source_digest}'" >&2
+		exit 1
+	fi
+	sed -i "s|^KYTH_SOURCE_IMAGE=.*|KYTH_SOURCE_IMAGE=oci:${payload_root}:${SOURCE_TAG}|" /etc/kyth-installer.env
+	if ! grep -qx "KYTH_SOURCE_IMAGE=oci:${payload_root}:${SOURCE_TAG}" /etc/kyth-installer.env; then
+		echo "ERROR: failed to point the installer at the embedded payload" >&2
+		exit 1
+	fi
+	echo "Offline ISO: the installer daemon will install ${source_digest} from the embedded payload at ${payload_root}"
+fi
+
 # Install live-only packages in one transaction so dependency solving and
 # repository metadata work happen once. Browsers from the installed image are
 # intentionally deferred to Flatpak first-boot setup.

@@ -52,7 +52,7 @@ class TitanoboaIsoWrapperTests(unittest.TestCase):
         self.assertIn("build_files/titanoboa/build_iso.sh:/src/titanoboa-build_iso.sh:ro", yml)
         self.assertIn("build_files/scripts/titanoboa-iso-wrapper.sh:/src/build_iso.sh:ro", yml)
         self.assertIn("installer/iso.yaml:/kyth/iso.yaml:ro", yml)
-        self.assertIn("kyth-live-${SOURCE_TAG}.iso", yml)
+        self.assertIn("kyth-${VARIANT}-${SOURCE_TAG}.iso", yml)
         wrapper = WRAPPER.read_text(encoding="utf-8")
         self.assertIn("TITANOBOA_ISO:-/src/titanoboa-build_iso.sh", wrapper)
         self.assertIn("KYTH_ISO:-/kyth/iso.yaml", wrapper)

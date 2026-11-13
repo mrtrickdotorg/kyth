@@ -10,6 +10,14 @@ from pathlib import Path
 
 SUPPORTED_CHANNELS = frozenset({"latest", "testing"})
 
+# ISO variants: "live" is the network-install ISO (the live rootfs is the
+# full image; installs fetch the signed image from the registry), "offline"
+# is the minimal-live ISO that embeds the same signed image as an OCI
+# layout and installs with no network. Variant changes only artifact
+# naming — channel and release id stay shared so a release's two ISOs are
+# trivially correlatable.
+SUPPORTED_VARIANTS = frozenset({"live", "offline"})
+
 # Single source of truth for the public ISO download base URL. Release
 # scripts, release metadata, and README download links must all resolve to
 # this value — do not hardcode the r2.dev host anywhere else (Python code
@@ -40,13 +48,25 @@ def build_identity(
     run_attempt: str,
     *,
     build_date: str | None = None,
+    variant: str = "live",
 ) -> ReleaseIdentity:
     if source_tag not in SUPPORTED_CHANNELS:
         raise ValueError(f"unsupported release channel: {source_tag}")
+    if variant not in SUPPORTED_VARIANTS:
+        raise ValueError(f"unsupported release variant: {variant}")
     if len(source_sha) < 8:
         raise ValueError("source SHA must contain at least eight characters")
     date = build_date or dt.datetime.now(dt.UTC).strftime("%Y%m%d")
     release_id = f"{date}-{source_sha[:8]}-{run_number}-{run_attempt}"
+    if variant == "offline":
+        return ReleaseIdentity(
+            source_sha=source_sha,
+            release_id=release_id,
+            iso_basename=f"kyth-offline-{source_tag}-{release_id}.iso",
+            channel_basename=f"kyth-offline-{source_tag}.iso",
+            immutable_tag=f"iso-offline-{source_tag}-{release_id}",
+            artifact_name=f"kyth-offline-iso-{source_tag}-{release_id}",
+        )
     return ReleaseIdentity(
         source_sha=source_sha,
         release_id=release_id,
@@ -64,6 +84,7 @@ def main() -> int:
     parser.add_argument("--run-number", required=True)
     parser.add_argument("--run-attempt", required=True)
     parser.add_argument("--build-date")
+    parser.add_argument("--variant", default="live")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     sha = args.source_sha or subprocess.check_output(
@@ -75,6 +96,7 @@ def main() -> int:
         args.run_number,
         args.run_attempt,
         build_date=args.build_date,
+        variant=args.variant,
     )
     output = "\n".join(
         f"{field}={getattr(identity, field)}"

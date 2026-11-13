@@ -18,6 +18,11 @@ on:
         # Fedora variant only — the live ISO must boot the signed Fedora kernel
         # for Secure Boot. The -cachy image has no Fedora kernel and would fail.
         default: testing
+      variant:
+        description: ISO variant (live = network install, offline = embedded payload)
+        required: false
+        type: string
+        default: live
       source_digest:
         description: Optional pinned source image digest
         required: false
@@ -61,6 +66,14 @@ on:
         options:
           - latest
           - testing
+      variant:
+        description: ISO variant to build
+        required: false
+        default: live
+        type: choice
+        options:
+          - live
+          - offline
       source_digest:
         description: Immutable source image digest from the build workflow
         required: false
@@ -88,7 +101,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-live-iso-${{ inputs.source_tag || github.ref_name || 'testing' }}
+  group: build-live-iso-${{ inputs.variant || 'live' }}-${{ inputs.source_tag || github.ref_name || 'testing' }}
   cancel-in-progress: true
 
 env:
@@ -113,6 +126,7 @@ jobs:
       source_image: ${{ steps.source_image.outputs.name }}
       source_digest: ${{ steps.source_image.outputs.digest }}
       effective_tag: ${{ steps.effective.outputs.tag }}
+      variant: ${{ steps.effective.outputs.variant }}
 
     steps:
       # workflow_call and workflow_dispatch both declare a defaulted
@@ -125,15 +139,22 @@ jobs:
           INPUT_TAG: ${{ inputs.source_tag }}
           INPUT_SHA: ${{ inputs.source_sha }}
           INPUT_DIGEST: ${{ inputs.source_digest }}
+          INPUT_VARIANT: ${{ inputs.variant }}
         run: |
           exec 3>>"${GITHUB_OUTPUT}"
           TAG="${INPUT_TAG:-testing}"
           SHA="${INPUT_SHA}"
           DIGEST="${INPUT_DIGEST}"
+          VARIANT="${INPUT_VARIANT:-live}"
+          [[ "${VARIANT}" == "live" || "${VARIANT}" == "offline" ]] || {
+            echo "::error::unsupported ISO variant '${VARIANT}'" >&2
+            exit 1
+          }
           echo "tag=${TAG}" >&3
+          echo "variant=${VARIANT}" >&3
           echo "sha=${SHA}" >&3
           echo "digest=${DIGEST}" >&3
-          echo "Effective source tag=${TAG} sha=${SHA:0:8} digest=${DIGEST:0:12}" >&2
+          echo "Effective source tag=${TAG} sha=${SHA:0:8} digest=${DIGEST:0:12} variant=${VARIANT}" >&2
 
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -178,9 +199,11 @@ jobs:
         id: release
         env:
           SOURCE_TAG: ${{ steps.effective.outputs.tag }}
+          VARIANT: ${{ steps.effective.outputs.variant }}
         run: |
           python3 build_files/scripts/release_identity.py \
             --source-tag "${SOURCE_TAG}" \
+            --variant "${VARIANT}" \
             --run-number "${GITHUB_RUN_NUMBER}" \
             --run-attempt "${GITHUB_RUN_ATTEMPT}" \
             --github-output "${GITHUB_OUTPUT}"
@@ -265,9 +288,14 @@ jobs:
       - name: Build live payload container
         env:
           SOURCE_TAG: ${{ steps.effective.outputs.tag }}
+          VARIANT: ${{ steps.effective.outputs.variant }}
           SOURCE_IMAGE_PINNED: ${{ steps.source_image.outputs.pinned }}
           INSTALLER_BUILD_HASH: ${{ steps.installer_hash.outputs.hash }}
         run: |
+          CONTAINERFILE="installer/Containerfile"
+          if [[ "${VARIANT}" == "offline" ]]; then
+            CONTAINERFILE="installer/Containerfile.offline"
+          fi
           # No registry cache — podman/buildah cache syntax is incompatible
           # with buildx type=registry (and bare tagged refs are rejected by
           # newer podman as "must contain neither tag nor digest"). Keep the
@@ -280,7 +308,7 @@ jobs:
             --build-arg "SOURCE_TAG=${SOURCE_TAG}" \
             --build-arg "INSTALLER_BUILD_HASH=${INSTALLER_BUILD_HASH}" \
             --tag localhost/payload:latest \
-            -f installer/Containerfile \
+            -f "${CONTAINERFILE}" \
             .
 
       - name: Report disk usage after payload build
@@ -305,6 +333,7 @@ jobs:
         env:
           RUNNER_TEMP: ${{ runner.temp }}
           SOURCE_TAG: ${{ steps.effective.outputs.tag }}
+          VARIANT: ${{ steps.effective.outputs.variant }}
         run: |
           set -euo pipefail
           OUT="${RUNNER_TEMP}/titanoboa-out"
@@ -318,22 +347,23 @@ jobs:
             -v "${OUT}:/output" \
             registry.fedoraproject.org/fedora:45@sha256:cc55518dc3593184519ae4184a814a26d6405b42713762d57353659fd7105445 /src/build_iso.sh
           sudo chown "$(id -u):$(id -g)" "${OUT}/"*.iso
-          mv "${OUT}/"*.iso "${RUNNER_TEMP}/kyth-live-${SOURCE_TAG}.iso"
-          test -s "${RUNNER_TEMP}/kyth-live-${SOURCE_TAG}.iso"
+          mv "${OUT}/"*.iso "${RUNNER_TEMP}/kyth-${VARIANT}-${SOURCE_TAG}.iso"
+          test -s "${RUNNER_TEMP}/kyth-${VARIANT}-${SOURCE_TAG}.iso"
 
       - name: Report disk usage after ISO build
         run: |
           df -h / /mnt /var/lib/containers
           sudo du -sh /mnt/podman-storage.img
-          du -h "${RUNNER_TEMP}/kyth-live-${SOURCE_TAG}.iso"
+          du -h "${RUNNER_TEMP}/kyth-${VARIANT}-${SOURCE_TAG}.iso"
         env:
           RUNNER_TEMP: ${{ runner.temp }}
           SOURCE_TAG: ${{ steps.effective.outputs.tag }}
+          VARIANT: ${{ steps.effective.outputs.variant }}
 
       - name: Move and verify ISO
         run: |
           ISO="output/live-iso/${STEPS_RELEASE_OUTPUTS_ISO_BASENAME}"
-          mv "${RUNNER_TEMP}/kyth-live-${SOURCE_TAG}.iso" "${ISO}"
+          mv "${RUNNER_TEMP}/kyth-${VARIANT}-${SOURCE_TAG}.iso" "${ISO}"
           sudo chown "$(id -u):$(id -g)" "${ISO}"
           test -s "${ISO}"
           test -r "${ISO}"
@@ -342,6 +372,7 @@ jobs:
         env:
           RUNNER_TEMP: ${{ runner.temp }}
           SOURCE_TAG: ${{ steps.effective.outputs.tag }}
+          VARIANT: ${{ steps.effective.outputs.variant }}
           STEPS_RELEASE_OUTPUTS_ISO_BASENAME: ${{ steps.release.outputs.iso_basename }}
 
       - name: Gate ISO size (8.5 GiB max)
@@ -656,12 +687,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           SOURCE_TAG: ${{ inputs.source_tag || needs.build.outputs.effective_tag }}
+          VARIANT: ${{ needs.build.outputs.variant }}
           IMMUTABLE_TAG: ${{ needs.build.outputs.immutable_tag }}
         run: |
           exec 3>>"${GITHUB_OUTPUT}"
           PREV_DIGEST=""
+          TAG_PREFIX="iso-${SOURCE_TAG}-"
+          if [[ "${VARIANT}" == "offline" ]]; then
+            TAG_PREFIX="iso-offline-${SOURCE_TAG}-"
+          fi
           PREV_TAG="$(gh release list --limit 30 --json tagName \
-            -q ".[] | .tagName | select(startswith(\"iso-${SOURCE_TAG}-\"))" \
+            -q ".[] | .tagName | select(startswith(\"${TAG_PREFIX}\"))" \
             | grep -v "^${IMMUTABLE_TAG}$" | head -1 || true)"
           if [[ -n "${PREV_TAG}" ]]; then
             RELEASE_BODY="$(gh release view "${PREV_TAG}" --json body -q '.body' 2>/dev/null || true)"
@@ -861,12 +897,28 @@ jobs:
           cp "${ATTESTATION_BUNDLE_PATH}" "${ISO}.intoto.jsonl"
           cp "${ATTESTATION_BUNDLE_PATH}" "output/live-iso/${CHANNEL_BASENAME}.intoto.jsonl"
 
+      - name: Resolve channel release tag
+        id: channel_tag
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag || needs.build.outputs.effective_tag }}
+          VARIANT: ${{ needs.build.outputs.variant }}
+        run: |
+          # The channel GitHub release is per variant: iso-<tag> for the
+          # live ISO, iso-offline-<tag> for the offline ISO. Deriving it
+          # from the source tag alone would upload the offline assets
+          # into the live channel release.
+          if [[ "${VARIANT}" == "offline" ]]; then
+            echo "value=iso-offline-${SOURCE_TAG}" >>"${GITHUB_OUTPUT}"
+          else
+            echo "value=iso-${SOURCE_TAG}" >>"${GITHUB_OUTPUT}"
+          fi
+
       - name: Publish GitHub releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           SOURCE_TAG: ${{ inputs.source_tag || needs.build.outputs.effective_tag }}
-          CHANNEL_TAG: ${{ (inputs.source_tag || needs.build.outputs.effective_tag) == 'testing' && 'iso-testing' || 'iso-latest' }}
+          CHANNEL_TAG: ${{ steps.channel_tag.outputs.value }}
           IMMUTABLE_TAG: ${{ needs.build.outputs.immutable_tag }}
           RELEASE_ID: ${{ needs.build.outputs.release_id }}
           SOURCE_SHA: ${{ needs.build.outputs.source_sha }}

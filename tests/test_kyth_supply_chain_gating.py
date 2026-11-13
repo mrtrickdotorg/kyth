@@ -24,7 +24,7 @@ class SupplyChainAcceptanceDispatchTests(unittest.TestCase):
         workflow = SUPPLY_CHAIN.read_text(encoding="utf-8")
         dispatch = workflow.split(
             "- name: Dispatch Live ISO after image verification", 1
-        )[1]
+        )[1].split("- name: Dispatch Offline ISO", 1)[0]
         self.assertNotIn('"run_acceptance": "false"', dispatch)
         self.assertIn(
             "\"run_acceptance\": "

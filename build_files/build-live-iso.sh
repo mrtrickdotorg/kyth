@@ -5,6 +5,18 @@
 set -euo pipefail
 
 SOURCE_TAG="${SOURCE_TAG:-latest}"
+# ISO variant: live (full desktop, network install) or offline (minimal
+# installer session on fedora-bootc + the pinned image embedded as an OCI
+# layout; see installer/Containerfile.offline).
+ISO_VARIANT="${KYTH_ISO_VARIANT:-live}"
+case "${ISO_VARIANT}" in
+	live) CONTAINERFILE="installer/Containerfile" ;;
+	offline) CONTAINERFILE="installer/Containerfile.offline" ;;
+	*)
+		echo "ERROR: KYTH_ISO_VARIANT must be 'live' or 'offline', got '${ISO_VARIANT}'" >&2
+		exit 1
+		;;
+esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUTPUT_DIR="${KYTH_ISO_OUTPUT:-${REPO_ROOT}/output/live-iso}"
@@ -39,7 +51,8 @@ fi
 
 # An ISO cannot install from the host's local container store. For local payload
 # builds, require a separately signed, network-accessible image as the install
-# source; never copy that multi-gigabyte image into the ISO.
+# source; the live ISO never embeds it, and the offline variant embeds a copy
+# of that same pinned registry image — never the local build.
 if [[ "${IS_LOCAL_IMAGE}" == true ]]; then
 	if [[ "${INSTALL_SOURCE_IMAGE}" == "${BASE_IMAGE}" ]]; then
 		echo "ERROR: set INSTALL_SOURCE_IMAGE to a signed registry digest when building an ISO from a local payload image." >&2
@@ -86,7 +99,7 @@ pull_flag=(--pull=newer)
 	--build-arg "INSTALLER_BUILD_HASH=${INSTALLER_BUILD_HASH}" \
 	--build-arg "SOURCE_TAG=${SOURCE_TAG}" \
 	--tag "${LIVE_TAG}" \
-	-f installer/Containerfile \
+	-f "${CONTAINERFILE}" \
 	"${REPO_ROOT}"
 
 wait
@@ -114,16 +127,16 @@ echo "==> Assembling ISO with Titanoboa"
 	--mount type=image,source="${LIVE_TAG}",dst=/rootfs \
 	-v "${WORK}:/output" \
 	registry.fedoraproject.org/fedora:45@sha256:cc55518dc3593184519ae4184a814a26d6405b42713762d57353659fd7105445 /src/build_iso.sh
-mv "${WORK}/KYTHOS-45-LIVE.iso" "${OUTPUT_DIR}/kyth-live-${SOURCE_TAG}.iso"
-sudo chown "$(id -u):$(id -g)" "${OUTPUT_DIR}/kyth-live-${SOURCE_TAG}.iso"
-test -r "${OUTPUT_DIR}/kyth-live-${SOURCE_TAG}.iso"
-test -w "${OUTPUT_DIR}/kyth-live-${SOURCE_TAG}.iso"
+mv "${WORK}/KYTHOS-45-LIVE.iso" "${OUTPUT_DIR}/kyth-${ISO_VARIANT}-${SOURCE_TAG}.iso"
+sudo chown "$(id -u):$(id -g)" "${OUTPUT_DIR}/kyth-${ISO_VARIANT}-${SOURCE_TAG}.iso"
+test -r "${OUTPUT_DIR}/kyth-${ISO_VARIANT}-${SOURCE_TAG}.iso"
+test -w "${OUTPUT_DIR}/kyth-${ISO_VARIANT}-${SOURCE_TAG}.iso"
 # 8.5 GiB hard ceiling, matching the CI gate in build-live-iso.yml.
-iso_size="$(stat -c%s "${OUTPUT_DIR}/kyth-live-${SOURCE_TAG}.iso")"
+iso_size="$(stat -c%s "${OUTPUT_DIR}/kyth-${ISO_VARIANT}-${SOURCE_TAG}.iso")"
 iso_limit=$((8 * 1024 * 1024 * 1024 + 512 * 1024 * 1024))
 echo "==> ISO size: $((iso_size / 1024 / 1024)) MiB (limit $((iso_limit / 1024 / 1024)) MiB)"
 if ((iso_size > iso_limit)); then
 	echo "ERROR: ISO exceeds the 8.5 GiB ceiling by $(((iso_size - iso_limit) / 1024 / 1024)) MiB" >&2
 	exit 1
 fi
-echo "==> KythOS live ISO ready: ${OUTPUT_DIR}/kyth-live-${SOURCE_TAG}.iso"
+echo "==> KythOS live ISO ready: ${OUTPUT_DIR}/kyth-${ISO_VARIANT}-${SOURCE_TAG}.iso"
