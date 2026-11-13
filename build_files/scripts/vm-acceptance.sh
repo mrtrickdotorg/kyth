@@ -41,6 +41,11 @@ offers NTFS partitions of at least 96 GiB as shrink candidates (a 64 GiB
 Windows floor plus the 32 GiB KythOS minimum), which a 64G disk can
 never satisfy.
 
+With --display MODE, the QEMU display backend is chosen explicitly.
+The default is automatic: spice-app when a graphical session and
+remote-viewer are present (workstation use), none on headless runners —
+spice-app is fatal there because QEMU cannot launch a SPICE client.
+
 Booting a full desktop OS under software emulation (no /dev/kvm) is too slow
 to finish inside any practical timeout, so hardware acceleration is required
 by default; pass --allow-tcg to run under TCG anyway (expect it to time out
@@ -52,6 +57,7 @@ ISO=
 UPDATE_REF=
 ARTIFACTS=
 TIMEOUT_MINUTES=75
+DISPLAY_MODE=
 ALLOW_TCG=0
 NETWORK_CHECK=0
 INSTALLER_DAEMON=0
@@ -73,6 +79,10 @@ while (($#)); do
 		;;
 	--timeout-minutes)
 		TIMEOUT_MINUTES="${2:?}"
+		shift 2
+		;;
+	--display)
+		DISPLAY_MODE="${2:?}"
 		shift 2
 		;;
 	--allow-tcg)
@@ -113,6 +123,26 @@ done
 }
 [[ "${TIMEOUT_MINUTES}" =~ ^[1-9][0-9]*$ ]] || {
 	echo "Invalid timeout" >&2
+	exit 64
+}
+# spice-app makes QEMU spawn a SPICE client (remote-viewer): right on a
+# workstation, fatal on a headless runner ("Failed to launch spice+unix
+# URI: Operation not supported") — QEMU exits before the guest boots and
+# every readiness sentinel reports missing. Nothing in this harness
+# connects to the SPICE socket (screenshots use the QEMU monitor;
+# readiness uses the serial log), so auto-select: spice-app only when a
+# viewer session actually exists, -display none otherwise. The SPICE
+# server socket below stays either way for the guest agent channel.
+if [[ -z "${DISPLAY_MODE}" ]]; then
+	if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] \
+		&& command -v remote-viewer >/dev/null; then
+		DISPLAY_MODE="spice-app"
+	else
+		DISPLAY_MODE="none"
+	fi
+fi
+[[ "${DISPLAY_MODE}" =~ ^[a-z0-9-]+$ ]] || {
+	echo "Invalid --display mode: ${DISPLAY_MODE}" >&2
 	exit 64
 }
 if ((WINDOWS)) && ((INSTALLER_DAEMON == 0)); then
@@ -238,7 +268,7 @@ QEMU_ARGS=(
 	-nodefaults
 	-no-user-config
 	-device virtio-vga
-	-display "spice-app"
+	-display "${DISPLAY_MODE}"
 	-spice "unix=on,addr=${ARTIFACTS}/spice.sock,disable-ticketing=on,disable-copy-paste=off,disable-agent-file-xfer=off"
 	-device virtio-rng-pci
 	-device ich9-ahci,id=ahci

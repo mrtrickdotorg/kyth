@@ -35,6 +35,21 @@ class VmAcceptanceTests(unittest.TestCase):
         subprocess.run(["bash", "-n", str(HOST)], check=True)
         subprocess.run(["bash", "-n", str(PREP)], check=True)
 
+    def test_host_display_auto_selects_headless(self):
+        """Regression (2026-11-13): -display spice-app makes QEMU spawn a
+        SPICE client, which does not exist on headless CI runners — QEMU
+        exited before the guest booted and the first real CI acceptance
+        run reported every sentinel missing. The host must auto-select
+        -display none headless (screenshots use the QEMU monitor and
+        readiness the serial log; nothing connects to the SPICE socket),
+        keeping spice-app only for workstation sessions."""
+        text = HOST.read_text(encoding="utf-8")
+        self.assertIn('-display "${DISPLAY_MODE}"', text)
+        self.assertNotIn('-display "spice-app"', text)
+        self.assertIn('DISPLAY_MODE="spice-app"', text)
+        self.assertIn('DISPLAY_MODE="none"', text)
+        self.assertIn("remote-viewer", text)
+
     def test_guest_is_firmware_gated_and_covers_lifecycle(self):
         text = pathlib.Path(vm_acceptance.__file__).read_text(encoding="utf-8")
         self.assertIn("/sys/firmware/qemu_fw_cfg/by_name/opt/com.kyth", text)
