@@ -293,8 +293,20 @@ jobs:
           INSTALLER_BUILD_HASH: ${{ steps.installer_hash.outputs.hash }}
         run: |
           CONTAINERFILE="installer/Containerfile"
+          EXTRA_BUILD_ARGS=()
           if [[ "${VARIANT}" == "offline" ]]; then
             CONTAINERFILE="installer/Containerfile.offline"
+            # quay garbage-collects fedora-bootc manifests when :45
+            # moves (the digest pinned in Containerfile.offline on
+            # 2026-11-12 was a 404 the next day), so resolve the digest
+            # :45 serves NOW and pin the build to exactly that — the
+            # same treatment BASE_IMAGE gets via fetch-image-metadata.
+            BOOTC_DIGEST="$(skopeo inspect --no-creds "docker://quay.io/fedora/fedora-bootc:45" | jq -r '.Digest')"
+            [[ "${BOOTC_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "::error::could not resolve the fedora-bootc:45 digest (got '${BOOTC_DIGEST}')"
+              exit 1
+            }
+            EXTRA_BUILD_ARGS+=(--build-arg "BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45@${BOOTC_DIGEST}")
           fi
           # No registry cache — podman/buildah cache syntax is incompatible
           # with buildx type=registry (and bare tagged refs are rejected by
@@ -307,6 +319,7 @@ jobs:
             --build-arg "BASE_IMAGE=${SOURCE_IMAGE_PINNED}" \
             --build-arg "SOURCE_TAG=${SOURCE_TAG}" \
             --build-arg "INSTALLER_BUILD_HASH=${INSTALLER_BUILD_HASH}" \
+            "${EXTRA_BUILD_ARGS[@]}" \
             --tag localhost/payload:latest \
             -f "${CONTAINERFILE}" \
             .

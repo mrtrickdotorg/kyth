@@ -161,6 +161,31 @@ class WorkflowArtifactContracts(unittest.TestCase):
         self.assertIn(
             "CHANNEL_TAG: ${{ steps.channel_tag.outputs.value }}", workflow
         )
+        # The fedora-bootc base digest is resolved at build time, never
+        # trusted from the Containerfile's snapshot default: quay
+        # garbage-collects fedora-bootc manifests when :45 moves (the
+        # 2026-11-12 pin 404'd a day later and the first offline build
+        # died pulling its base).
+        self.assertIn(
+            'skopeo inspect --no-creds "docker://quay.io/fedora/fedora-bootc:45"',
+            workflow,
+        )
+        self.assertIn(
+            'BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45@${BOOTC_DIGEST}',
+            workflow,
+        )
+
+    def test_upload_r2_action_pins_the_region_r2_accepts(self):
+        """Regression (2026-11-13): the live publish died with
+        InvalidRegionName ('us-west-2') when the runner image began
+        supplying an AWS region default. The upload action must pin
+        region 'auto' for both its upload and retention steps so the
+        AWS CLI/boto layer never inherits a region R2 rejects."""
+        action = (
+            ROOT / ".github" / "actions" / "upload-r2" / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertGreaterEqual(action.count("AWS_DEFAULT_REGION: auto"), 2)
+        self.assertGreaterEqual(action.count("AWS_REGION: auto"), 2)
 
     def test_release_identity_is_generated_by_shared_script(self):
         workflow = (

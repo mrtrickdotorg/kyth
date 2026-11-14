@@ -39,6 +39,12 @@ runs:
       env:
         AWS_ACCESS_KEY_ID: ${{ inputs.r2-access-key-id }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.r2-secret-access-key }}
+        # R2 only accepts its own region names ('auto', wnam, ...). The
+        # 2026-11-13 publish died with InvalidRegionName because the
+        # runner image began supplying a us-west-2 default; pin 'auto'
+        # so the CLI never inherits a region R2 rejects.
+        AWS_DEFAULT_REGION: auto
+        AWS_REGION: auto
         R2_ENDPOINT_URL: ${{ inputs.r2-endpoint-url }}
         R2_ACCOUNT_ID: ${{ inputs.r2-account-id }}
         ISO_BASENAME: ${{ inputs.iso-basename }}
@@ -102,6 +108,8 @@ runs:
       env:
         AWS_ACCESS_KEY_ID: ${{ inputs.r2-access-key-id }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.r2-secret-access-key }}
+        AWS_DEFAULT_REGION: auto
+        AWS_REGION: auto
         BUCKET: ${{ inputs.bucket }}
         RETENTION_KEEP: ${{ inputs.retention-keep }}
       run: |

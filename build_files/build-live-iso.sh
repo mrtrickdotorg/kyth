@@ -89,8 +89,25 @@ _titanoboa_ok="/tmp/kyth-titanoboa-ok.$$"
 echo "==> Building KythOS live payload from ${BASE_IMAGE}"
 pull_flag=(--pull=newer)
 [[ "${IS_LOCAL_IMAGE}" == true ]] && pull_flag=()
+variant_build_args=()
+if [[ "${ISO_VARIANT}" == "offline" ]]; then
+	# quay garbage-collects fedora-bootc manifests when :45 moves, so
+	# resolve the digest :45 serves now instead of trusting the
+	# snapshot pinned in Containerfile.offline (mirrors the CI step).
+	command -v skopeo >/dev/null || {
+		echo "ERROR: offline ISO builds require skopeo to resolve the fedora-bootc base digest" >&2
+		exit 1
+	}
+	bootc_digest="$(skopeo inspect --no-creds "docker://quay.io/fedora/fedora-bootc:45" | jq -r '.Digest')"
+	[[ "${bootc_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+		echo "ERROR: could not resolve the fedora-bootc:45 digest (got '${bootc_digest}')" >&2
+		exit 1
+	}
+	variant_build_args+=(--build-arg "BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45@${bootc_digest}")
+fi
 "${ROOTFUL_PODMAN}" build \
 	"${pull_flag[@]}" \
+	"${variant_build_args[@]}" \
 	--cap-add SYS_ADMIN \
 	--security-opt label=disable \
 	--network host \

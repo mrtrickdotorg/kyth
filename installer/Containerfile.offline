@@ -15,7 +15,11 @@
 #     -t kyth-offline:build -f installer/Containerfile.offline .
 
 ARG BASE_IMAGE=ghcr.io/mrtrickdotorg/kyth:latest
-ARG BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45@sha256:0ae801a078c884ff2553fb755c8a0cb7892523ab6c72d38cd786c592df587917
+# Snapshot default for manual builds only: quay garbage-collects
+# fedora-bootc manifests when :45 moves (the 2026-11-12 pin was a 404 a
+# day later), so the ISO workflow and build-live-iso.sh always resolve
+# the digest :45 serves at build time and override this argument.
+ARG BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45@sha256:17227a17c0bb9222918881e27f254e219eb3808ceb4399e26322bbd2e77932bc
 
 # ── Rust installer UI builder ────────────────────────────────────────────────
 # Identical to installer/Containerfile: keep Node/Rust/WebKit development

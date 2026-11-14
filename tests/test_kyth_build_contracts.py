@@ -713,10 +713,13 @@ class BuildAssemblyContracts(unittest.TestCase):
 
     def test_offline_containerfile_embeds_the_pinned_payload(self):
         """The offline variant's contract: a digest-pinned fedora-bootc
-        base, the signed image embedded as an OCI layout at exactly the
-        path build.sh's offline gate asserts, KYTH_OFFLINE_ISO=1 set for
-        the build.sh RUN, and build.sh still the RUN's final command so
-        its exit code fails the layer."""
+        base (the Containerfile carries a snapshot default; builders
+        resolve the digest :45 serves at build time and override it,
+        because quay garbage-collects the manifests — see the workflow
+        contract), the signed image embedded as an OCI layout at exactly
+        the path build.sh's offline gate asserts, KYTH_OFFLINE_ISO=1 set
+        for the build.sh RUN, and build.sh still the RUN's final command
+        so its exit code fails the layer."""
         containerfile = (ROOT / "installer" / "Containerfile.offline").read_text(
             encoding="utf-8"
         )
