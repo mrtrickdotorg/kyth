@@ -72,6 +72,12 @@ RUN mkdir -p /assets/usr/share/plymouth/themes /assets/usr/share/kyth && \
     cp -a /usr/share/kyth/branding /assets/usr/share/kyth/branding && \
     mkdir -p /assets/usr/share/icons && \
     (find /usr/share/icons -name 'kyth*' -exec cp -a --parents {} /assets \; || true)
+# build.sh runs the Plymouth branding guard, which requires (and execs)
+# the canonical configuration owner /usr/libexec/kyth-plymouth-configure.
+# The full image carries it; the bootc base does not, so take it from the
+# signed image too — the first offline build died on exactly this.
+RUN mkdir -p /assets/usr/libexec && \
+    cp -a /usr/libexec/kyth-plymouth-configure /assets/usr/libexec/kyth-plymouth-configure
 
 FROM ${BOOTC_BASE_IMAGE}
 ARG BASE_IMAGE

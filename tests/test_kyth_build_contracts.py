@@ -734,6 +734,15 @@ class BuildAssemblyContracts(unittest.TestCase):
         )
         self.assertIn("KYTH_OFFLINE_ISO=1", containerfile)
         self.assertIn("plasmalogin", containerfile)
+        # build.sh's Plymouth branding guard execs the canonical
+        # configuration owner from the rootfs; the bootc base lacks it,
+        # so the assets stage must lift it from the signed image (the
+        # first offline build died at the guard without it).
+        self.assertIn(
+            "cp -a /usr/libexec/kyth-plymouth-configure "
+            "/assets/usr/libexec/kyth-plymouth-configure",
+            containerfile,
+        )
         self.assertTrue(
             containerfile.rstrip().endswith("bash /src/installer/build.sh"),
             "offline payload RUN must end with build.sh",
