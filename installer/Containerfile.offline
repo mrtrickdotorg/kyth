@@ -96,10 +96,12 @@ COPY --from=kyth-assets /assets/ /
 # build.sh) into a KWin/Plasma session whose only job is the installer
 # autostart, plus the tools build.sh assumes the full KythOS image
 # already carries (skopeo/jq/curl for its signature gate, sudo for the
-# liveuser grant). build.sh installs its own live packages on top.
+# liveuser grant, plymouth for plymouth-set-default-theme in the
+# branding guard and build.sh itself — the bootc base ships neither).
+# build.sh installs its own live packages on top.
 RUN dnf5 install -y \
         plasmalogin plasma-workspace kwin plasma-nm kscreen \
-        skopeo jq curl sudo && \
+        skopeo jq curl sudo plymouth && \
     dnf5 clean all && \
     systemctl enable plasmalogin.service && \
     systemctl set-default graphical.target

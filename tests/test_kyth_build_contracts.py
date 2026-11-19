@@ -743,6 +743,11 @@ class BuildAssemblyContracts(unittest.TestCase):
             "/assets/usr/libexec/kyth-plymouth-configure",
             containerfile,
         )
+        # The branding guard and build.sh both call
+        # plymouth-set-default-theme; the bootc base does not ship
+        # plymouth at all, so the final stage must install it (the
+        # second offline build died on exactly this, exit 127).
+        self.assertIn("sudo plymouth", containerfile)
         self.assertTrue(
             containerfile.rstrip().endswith("bash /src/installer/build.sh"),
             "offline payload RUN must end with build.sh",
