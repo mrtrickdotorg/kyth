@@ -1,0 +1,35 @@
+name: RPM Fusion pin freshness
+
+# The image build verifies the RPM Fusion bootstrap RPMs against SHA256 pins.
+# RPM Fusion republishes those RPMs inside a Fedora release, which staleness a
+# pin with no change on our side; the next build then fails at the checksum
+# gate (as it did when 45-2 replaced 45-1 on 2026-11-03). This check runs
+# daily so the bump lands on its own schedule. A failure here means "bump the
+# pins", not "the published image is broken" — it never touches the image.
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: Compare pins with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The checker exits 1 on drift confirmed by two hosts and 2 when it could
+      # not confirm anything; both are non-zero so the run is red either way,
+      # and the report in the job summary says which case it hit.
+      - name: Compare pins with the published RPMs
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 build_files/scripts/check-rpmfusion-pins.py 2>&1 | tee -a "${GITHUB_STEP_SUMMARY}"
