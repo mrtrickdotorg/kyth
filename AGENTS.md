@@ -103,7 +103,8 @@ Fedora Kinoite base
   cutover. Retired VPN/SAML client, network-share helper, and privileged socket
   daemon fixtures were also removed — do not reintroduce them as Python
   authorities.
-- `build_files/kyth-installer/` is the local-only installer driving
+- `build_files/kyth-installer/` (a tracked symlink to `src/kyth-installer/`,
+  gated by the same mirror step): the local-only installer driving
   `bootc install to-disk`: `plan_*.py` computes, `partition_ops*.py`/`disk/`
   executes, `recovery.py`/`assurance.py` verifies. High-risk area: add tests
   in `tests/test_kyth_installer_*` alongside changes.
