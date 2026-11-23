@@ -25,6 +25,28 @@ class QualityContractsTests(unittest.TestCase):
         self.assertIn(".github/workflows", command)
         self.assertIn(".github/actions", command)
 
+    def test_ruff_covers_src_without_grandfathering_the_tree(self):
+        # Ruff does not descend into build_files/kyth_shared or
+        # build_files/kyth-installer (symlinks to src/), so linting only
+        # build_files/ left the shipped runtime unchecked.
+        quality = (ROOT / "build_files/scripts/run-quality.sh").read_text()
+        commands = [
+            line for line in quality.splitlines()
+            if "-m ruff check --config" in line and "--select" not in line
+        ]
+        self.assertTrue(commands)
+        self.assertIn("src", commands[0].split())
+
+        import tomllib
+        config = tomllib.loads((ROOT / "ruff.toml").read_text())
+        ignores = config["lint"]["per-file-ignores"]
+        blanket = [pattern for pattern in ignores if "src" in pattern and "*" in pattern]
+        self.assertEqual(blanket, [], "grandfather files, not the whole src/ tree")
+        self.assertTrue(
+            any("src/" in pattern for pattern in ignores),
+            "the known src/ BLE001 files must stay grandfathered explicitly",
+        )
+
     def test_validation_publishes_coverage_even_on_failure(self):
         workflow = (ROOT / ".github/workflows/validation.yml").read_text()
         self.assertIn("./build_files/scripts/run-quality.sh", workflow)

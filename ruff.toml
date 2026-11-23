@@ -15,3 +15,9 @@ select = ["E9", "F63", "F7", "F82", "BLE001"]
 "build_files/**/*.py" = ["BLE001"]
 "tests/**/*.py" = ["BLE001"]
 ".github/scripts/**/*.py" = ["BLE001"]
+# src/ is the tree the image installs (and what the build_files/ symlinks
+# point at). Grandfather these four files, not the tree: new src/ modules must
+# be clean, so the gate actually starts covering the shipped runtime.
+"src/kyth-installer/kyth_installer/app.py" = ["BLE001"]
+"src/kyth_shared/kyth_shared/memory_tune.py" = ["BLE001"]
+"src/kyth_shared/kyth_shared/system/boot_runtime.py" = ["BLE001"]

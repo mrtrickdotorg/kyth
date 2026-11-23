@@ -35,10 +35,13 @@ echo "==> Python correctness"
 # those and keep walking up to this repo's root ruff.toml, but that discovery
 # step observably flaked between runs on identical input (clean vs. the full
 # default pyflakes rule set). Pinning removes the ambiguity outright.
-"${quality_python}" -m ruff check --config "${repo_root}/ruff.toml" build_files tests .github/scripts
+# src/ is listed explicitly because it is the tree the image installs and Ruff
+# does not descend into the build_files/kyth_shared and build_files/kyth-installer
+# symlinks that point at it, so those modules were never linted at all.
+"${quality_python}" -m ruff check --config "${repo_root}/ruff.toml" build_files tests .github/scripts src
 
 echo "==> Blind-except audit (BLE001, grandfathered — new top-level files must be clean)"
-if ! "${quality_python}" -m ruff check --config "${repo_root}/ruff.toml" --select BLE001 --statistics build_files tests .github/scripts 2>&1 | tee /tmp/kyth-ble001-stats.txt; then
+if ! "${quality_python}" -m ruff check --config "${repo_root}/ruff.toml" --select BLE001 --statistics build_files tests .github/scripts src 2>&1 | tee /tmp/kyth-ble001-stats.txt; then
   echo "(BLE001 violations exist in grandfathered files — see /tmp/kyth-ble001-stats.txt)" >&2
 fi
 # Enforce BLE001 only outside grandfathered globs: any new top-level *.py must be clean
