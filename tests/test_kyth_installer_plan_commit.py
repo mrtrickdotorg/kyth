@@ -13,6 +13,14 @@ from kyth_installer import plan_commit  # noqa: E402
 
 
 class PlanCommitTests(unittest.TestCase):
+    def setUp(self):
+        # Never let a shrink marker land in the host's /run/kyth-installer:
+        # it is root-only on a real install, so probing it from a normal test
+        # run raises PermissionError and the fail-closed marker probe refuses
+        # to continue before the code under test is even reached.
+        self.marker_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.marker_dir.cleanup)
+
     def dependencies(self, **changes):
         values = {
             "is_gpt": lambda _disk: True,
@@ -34,6 +42,7 @@ class PlanCommitTests(unittest.TestCase):
 
     def ntfs_dependencies(self, **changes):
         values = {
+            "marker_root": Path(self.marker_dir.name),
             "normal_device_path": lambda value: value or "",
             "validate_target": mock.Mock(
                 return_value=("/dev/sda", "/dev/sda2", 20)
