@@ -132,7 +132,6 @@ KythOS uses multiple validation layers:
 - Static validation for workflows, containers, shell, Python syntax, JSON, TOML,
   systemd units, and Just recipes.
 - Python unit tests for pure parser/helper behavior.
-- Fuzzing for selected System Hub parsers.
 - Image build checks and `bootc container lint`.
 - Live ISO build and QEMU boot paths for release confidence.
 - Runtime smoke checks on installed systems.

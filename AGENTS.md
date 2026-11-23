@@ -93,8 +93,8 @@ Fedora Kinoite base
   a new fragment, not edits to existing ones.
 - `build_files/kyth_shared/` (a tracked symlink to `src/kyth_shared/`, gated
   by the mirror step in `validate.sh`): one small module per
-  tunable/preset/feature (e.g. `swappiness.py`, `zram.py`,
-  `vrr.py`, `gaming_scan_atomic.py`, `cloud_idempotent.py`). New host-tuning
+  tunable/preset/feature (e.g. `swappiness.py`, `zswap_preset.py`, `vrr.py`,
+  `gaming_master.py`, `cloud_idempotent.py`). New host-tuning
   logic follows that pattern; state-mutating modules must be idempotent and
   transactional (fully apply or fully roll back). Probe collector, Guardian
   core, and update watcher are native Rust in `src/kyth-shared-rs/`.
@@ -130,19 +130,21 @@ sudo bootc upgrade
 ```text
 Dockerfile              # final OS image (layers 2+3)
 Justfile                # build orchestration (imports build_files/just/*.just)
-build_base/             # layer 1: CachyOS kernel + base Fedora Kinoite 45
+build_base/             # layer 1: Fedora Kinoite 45 base, kernel flavor, plymouth
 build_files/            # layer 2+: packages, tweaks, branding, runtime code
 installer/              # live payload customization
 tests/                  # flat unittest suite for installer, Hub, shared helpers
 docs/                   # architecture, security, hardware, validation docs
 .githooks/              # pre-commit / pre-push / prepare-commit-msg
-.github/workflows/      # CI: daily rebuilds 10:05 UTC, validation, signing, CVE scans
+.github/workflows/      # CI: weekly rebuilds Sun 10:05 UTC, validation, signing, CVE scans
 ```
 
 ## Key details
 
-- Base: `quay.io/fedora/fedora-kinoite:45` (Fedora 45 KDE, digest-pinned in `build_base/Dockerfile`); CachyOS kernel
-  (BORE, sched-ext, BBRv3, NTSYNC); Mesa-git via `xxmitsu/mesa-git` COPR.
+- Base: `quay.io/fedora/fedora-kinoite:45` (Fedora 45 KDE, digest-pinned in
+  `build_base/Dockerfile`). The kernel flavor is Fedora
+  (`KYTH_KERNEL_FLAVOR=fedora`); CachyOS (x86-64-v3) is an opt-in image variant,
+  and Mesa-git is an opt-in overlay (`ENABLE_MESA_GIT`), not a shipped default.
 - SELinux enforcing (bootc/ostree relabels on every deployment).
 - Live ISOs on Cloudflare R2: `kyth-live-latest.iso` / `kyth-live-testing.iso`.
 - GitHub: https://github.com/mrtrickdotorg/kyth

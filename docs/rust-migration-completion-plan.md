@@ -388,7 +388,8 @@ Python modules retained as source-only parity fixtures:
 An earlier pass over this plan treated `kyth-vm-acceptance-guest` as a
 ready-made cutover because `src/kyth-shared-rs/Cargo.toml` already defines a
 `[[bin]] name = "kyth-vm-acceptance-guest"` target
-(`src/vm_acceptance_guest_bin.rs`). Direct inspection shows that's wrong: the
+(`src/kyth-shared-rs/src/vm_acceptance_guest_bin.rs`). Direct inspection shows
+that's wrong: the
 Rust binary is a **separate, narrower tool**, not a drop-in replacement. Its
 own doc comment says so directly:
 
