@@ -55,6 +55,22 @@ runs:
           run: this is payload text, not a step
 """
 
+FLOW = """\
+name: Flow
+runs:
+  using: composite
+  steps:
+    - {name: Flow body, shell: bash, run: "echo flow"}
+    - name: Anchored body
+      shell: bash
+      run: &body |
+        set -euo pipefail
+        echo "${HOME}"
+    - name: Aliased body
+      shell: bash
+      run: *body
+"""
+
 BROKEN = """\
 name: Broken
 runs:
@@ -106,8 +122,22 @@ class ParseActionTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             run_blocks.find_step(path, "Absent step")
 
+    def test_flow_mappings_and_anchors_are_read_like_any_other_shape(self):
+        steps = run_blocks.parse_action(write_action(self.root, FLOW))
+        self.assertEqual([step.name for step in steps], ["Flow body", "Anchored body", "Aliased body"])
+        self.assertEqual(steps[0].run, "echo flow\n")
+        self.assertEqual(steps[2].run, steps[1].run)
+
     def test_an_action_without_steps_is_an_error_not_a_skip(self):
         path = write_action(self.root, "name: Empty\nruns:\n  using: composite\n  steps: []\n")
+        with self.assertRaises(ValueError):
+            run_blocks.parse_action(path)
+
+    def test_invalid_yaml_is_an_error_not_a_skip(self):
+        path = write_action(
+            self.root,
+            'name: Broken\nruns:\n  using: composite\n  steps: [{name: x, shell: bash, run: "echo hi"}\n',
+        )
         with self.assertRaises(ValueError):
             run_blocks.parse_action(path)
 

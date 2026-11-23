@@ -9,11 +9,11 @@ at that file's run block. This walks every composite action, extracts each
 bash run body, and checks it the way a shell script is checked: `bash -n`
 first, then `shellcheck` at the same severity validate.sh uses for `*.sh`.
 
-Composite actions are read without a YAML library: validate.sh must not depend
-on PyYAML being installed. The parser understands the block forms actions use
-(`run: |`, `run: |-`, `run: >`, `run: >-`) and single-line scalars; an
-unrecognised form is an error, never a silent skip, because silently skipping
-is the failure mode this check exists to remove.
+Actions are read with PyYAML (`requirements-validation.txt`) instead of a
+hand-rolled reader: block scalars, quoting, anchors and flow mappings are
+exactly the shapes a bespoke parser gets wrong, and getting one wrong here
+would hide a step rather than fail it. A step that cannot be understood is an
+error, never a silent skip.
 """
 
 from __future__ import annotations
@@ -27,15 +27,22 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError as exc:  # pragma: no cover - the message itself is the point
+    raise ImportError(
+        "PyYAML is required to lint composite actions; install "
+        "requirements-validation.txt (python3 -m pip install -r requirements-validation.txt)"
+    ) from exc
+
 ROOT = Path(__file__).resolve().parents[2]
 ACTIONS = ROOT / ".github/actions"
 SEVERITY = "warning"
-BLOCK_SCALAR = re.compile(r"^[|>][+-]?$")
 
 
 @dataclass(frozen=True)
 class Step:
-    """One step of a composite action, with its shell body already dedented."""
+    """One step of a composite action, with its shell body ready to lint."""
 
     action: str
     name: str
@@ -43,123 +50,48 @@ class Step:
     run: str
 
 
-def _indent(line: str) -> int:
-    return len(line) - len(line.lstrip())
-
-
-def _scalar(value: str) -> str:
-    """A YAML scalar with its quotes removed only when the whole value is quoted.
-
-    Stripping quote characters from both ends unconditionally truncates a plain
-    scalar like `rm -f "${HOME}/config.json"`, whose trailing quote is content.
-    """
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-        return value[1:-1]
-    return value
-
-
-def _block_body(lines: list[str], start: int, indent: int, folded: bool = False) -> tuple[str, int]:
-    """The block scalar beginning at `start`, dedented; returns it and the last index."""
-    body: list[str] = []
-    index = start
-    while index < len(lines):
-        line = lines[index]
-        if line.strip() and _indent(line) <= indent:
-            break
-        body.append(line)
-        index += 1
-    while body and not body[-1].strip():
-        body.pop()
-    levels = [_indent(line) for line in body if line.strip()]
-    dedent = min(levels) if levels else indent + 1
-    text = [line[dedent:] if line.strip() else "" for line in body]
-    if not folded:
-        return "\n".join(text), index - 1
-    # `>` joins consecutive non-blank lines with a space and keeps a blank line
-    # as a line break; without this the linted body would not be what runs.
-    folded_lines: list[str] = []
-    pending: list[str] = []
-    for line in text:
-        if line.strip():
-            pending.append(line.strip())
-            continue
-        folded_lines.append(" ".join(pending))
-        pending = []
-    folded_lines.append(" ".join(pending))
-    return "\n".join(folded_lines), index - 1
-
-
 def parse_action(path: Path) -> list[Step]:
     """Every `run:` step in a composite action, whatever its shell."""
-    lines = path.read_text(encoding="utf-8").splitlines()
     try:
-        runs_at = next(i for i, line in enumerate(lines) if line.rstrip() == "runs:")
-        steps_at = next(
-            i for i in range(runs_at, len(lines))
-            if lines[i].strip() == "steps:" and _indent(lines[i]) > _indent(lines[runs_at])
-        )
-    except StopIteration:
-        raise ValueError(f"{path}: no runs.steps section") from None
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{path}: not valid YAML: {exc}") from exc
 
-    step_indent = _indent(lines[steps_at]) + 2
-    starts = [
-        i for i in range(steps_at + 1, len(lines))
-        if lines[i].lstrip().startswith("- ") and _indent(lines[i]) == step_indent
-    ]
-    if not starts:
+    runs = document.get("runs") if isinstance(document, dict) else None
+    steps = runs.get("steps") if isinstance(runs, dict) else None
+    if not isinstance(steps, list) or not steps:
         raise ValueError(f"{path}: runs.steps lists no steps")
 
-    key_indent = step_indent + 2
     parsed: list[Step] = []
-    for position, start in enumerate(starts):
-        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
-        name = ""
-        shell = ""
-        body: str | None = None
-        index = start
-        while index < end:
-            line = lines[index]
-            if index == start:
-                # `- name: Foo` puts the first key on the dash line; re-indent
-                # it so the key scan below sees it like every other key.
-                line = " " * key_indent + line.strip()[2:]
-            if _indent(line) == key_indent and line.strip():
-                key, _, value = line.strip().partition(":")
-                value = value.strip()
-                if BLOCK_SCALAR.match(value):
-                    # Skip any block scalar, not just run's: a `with: body: |`
-                    # payload can contain lines shaped like step keys.
-                    block, last = _block_body(
-                        lines, index + 1, key_indent, folded=value.startswith(">"))
-                    if key == "run":
-                        body = block
-                    index = last
-                elif key == "name":
-                    name = _scalar(value)
-                elif key == "shell":
-                    shell = _scalar(value)
-                elif key == "run":
-                    if not value:
-                        raise ValueError(f"{path}: step {name or start} has an empty run key")
-                    body = _scalar(value) + "\n"
-            index += 1
-        if body is None:
+    for position, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise ValueError(f"{path}: step {position} is not a mapping")
+        if "run" not in step:
             continue
-        # Every body is linted as a script, so normalise the terminator that a
-        # block scalar and an inline scalar would otherwise disagree on.
+        body = step["run"]
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError(f"{path}: step {position} has an empty run key")
+        # Every body is linted as a script, so normalise the terminator that
+        # block and flow scalars would otherwise disagree on.
         normalised = body if body.endswith("\n") else body + "\n"
-        parsed.append(Step(action=path.parent.name, name=name or f"step {position + 1}",
-                           shell=shell or "bash", run=normalised))
+        parsed.append(
+            Step(
+                action=path.parent.name,
+                name=str(step.get("name") or f"step {position}"),
+                shell=str(step.get("shell") or "bash"),
+                run=normalised,
+            )
+        )
     return parsed
 
 
 def find_step(path: Path, name: str) -> Step:
     """The named step of one action; raises when the action has no such step."""
-    for step in parse_action(path):
+    steps = parse_action(path)
+    for step in steps:
         if step.name == name:
             return step
-    available = [step.name for step in parse_action(path)]
-    raise KeyError(f"{path}: no step named {name!r} (have {available})")
+    raise KeyError(f"{path}: no step named {name!r} (have {[step.name for step in steps]})")
 
 
 def lint(step: Step, tool_dir: Path) -> list[str]:
@@ -174,7 +106,9 @@ def lint(step: Step, tool_dir: Path) -> list[str]:
         findings.append(f"{step.action} step {step.name!r}: bash -n failed\n{parse.stderr.strip()}")
     linted = subprocess.run(
         ["shellcheck", f"--severity={SEVERITY}", "--shell=bash", str(script)],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if linted.returncode != 0:
         findings.append(f"{step.action} step {step.name!r}: shellcheck\n{linted.stdout.strip()}")

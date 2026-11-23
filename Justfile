@@ -107,7 +107,7 @@ setup-quality:
     if [[ ! -x .venv-quality/bin/python ]]; then
         python3 -m venv --clear .venv-quality
     fi
-    .venv-quality/bin/python -m pip install --disable-pip-version-check -r requirements-quality.txt
+    .venv-quality/bin/python -m pip install --disable-pip-version-check -r requirements-quality.txt -r requirements-validation.txt
     .venv-quality/bin/coverage --version
     .venv-quality/bin/ruff --version
 

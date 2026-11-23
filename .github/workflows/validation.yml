@@ -57,6 +57,21 @@ jobs:
         run: ./build_files/scripts/install-validation-tools.sh
         shell: bash --noprofile --norc -euo pipefail {0}
 
+      - name: Cache pip (validation)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: pip-validation-${{ runner.os }}-${{ hashFiles('requirements-validation.txt') }}
+          restore-keys: |
+            pip-validation-${{ runner.os }}-
+
+      # validate.sh lints the composite actions' run blocks, which needs YAML
+      # parsing: PyYAML is pinned in requirements-validation.txt instead of
+      # relying on the runner image happening to ship it.
+      - name: Install pinned Python validation dependencies
+        run: python3 -m pip install --disable-pip-version-check -r requirements-validation.txt
+        shell: bash --noprofile --norc -euo pipefail {0}
+
       - name: Cache apt (validation)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -149,7 +164,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
-          key: pip-quality-${{ runner.os }}-${{ hashFiles('requirements-quality.txt') }}
+          key: pip-quality-${{ runner.os }}-${{ hashFiles('requirements-quality.txt', 'requirements-validation.txt') }}
           restore-keys: |
             pip-quality-${{ runner.os }}-
 
@@ -165,8 +180,10 @@ jobs:
         run: ./build_files/scripts/install-validation-tools.sh
         shell: bash --noprofile --norc -euo pipefail {0}
 
+      # The suite imports the composite-action linter, so the validation deps
+      # are installed here too; both files are pinned.
       - name: Install pinned quality tools
-        run: python3 -m pip install --disable-pip-version-check -r requirements-quality.txt
+        run: python3 -m pip install --disable-pip-version-check -r requirements-quality.txt -r requirements-validation.txt
         shell: bash --noprofile --norc -euo pipefail {0}
 
       # The quality gate runs Python tests that compile/inspect the shared
