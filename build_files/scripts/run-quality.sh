@@ -24,8 +24,7 @@ if [[ -x .venv-quality/bin/python ]]; then
 fi
 
 if ! "${quality_python}" -m coverage --version >/dev/null 2>&1 ||
-	! "${quality_python}" -m ruff --version >/dev/null 2>&1 ||
-	! "${quality_python}" -c "import yaml" >/dev/null 2>&1; then
+	! "${quality_python}" -m ruff --version >/dev/null 2>&1; then
 	echo "Quality tools are unavailable. Run: just setup-quality" >&2
 	exit 1
 fi
