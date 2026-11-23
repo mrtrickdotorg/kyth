@@ -62,6 +62,12 @@ done
 echo "==> Python syntax"
 python3 build_files/scripts/validate-python-syntax.py
 
+# The image's config stage installs src/kyth_shared and src/kyth-installer,
+# but the tests, ruff and the coverage floors read build_files/. Drift between
+# the copies makes validation green for bytes the image never ships.
+echo "==> Runtime source mirrors"
+python3 build_files/scripts/check-kyth-mirror-drift.py
+
 # Fast, dependency-free gate for the destination-testing policy: it asserts the
 # opt-in preflight workflow feeds the same repository identity the policy
 # authorizes, so the gate cannot silently reject every dispatch. Runs here as
