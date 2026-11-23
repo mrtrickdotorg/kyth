@@ -155,8 +155,6 @@ docs/                   # architecture, security, hardware, validation docs
   boundary, make cancellation explicit, and ensure spawned tasks are joined or
   detached with a bounded shutdown policy before the shell exits. Do not add
   Python/Qt worker lifecycles to the supported Hub.
-- **Unbounded logging:** cap `QTextEdit` logs
-  (e.g. `document().setMaximumBlockCount(5000)`) when streaming long output.
 - **Probe cache:** reuse expensive probes (`bootc status`, `flatpak list`,
   `lsblk`) via `probe_cached` with a short TTL (5–30s) instead of fanning out
   identical subprocess calls on rapid UI refresh.
