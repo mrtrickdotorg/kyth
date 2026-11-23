@@ -91,8 +91,9 @@ Fedora Kinoite base
 - `Dockerfile` runs ordered `RUN --mount=type=bind` steps, one
   `build_files/scripts/*.sh` fragment per concern. New build-time concerns get
   a new fragment, not edits to existing ones.
-- `build_files/kyth_shared/` (mirrored at `src/kyth_shared/`): one small
-  module per tunable/preset/feature (e.g. `swappiness.py`, `zram.py`,
+- `build_files/kyth_shared/` (a tracked symlink to `src/kyth_shared/`, gated
+  by the mirror step in `validate.sh`): one small module per
+  tunable/preset/feature (e.g. `swappiness.py`, `zram.py`,
   `vrr.py`, `gaming_scan_atomic.py`, `cloud_idempotent.py`). New host-tuning
   logic follows that pattern; state-mutating modules must be idempotent and
   transactional (fully apply or fully roll back). Probe collector, Guardian
