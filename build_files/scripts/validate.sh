@@ -25,6 +25,12 @@ echo "==> GitHub Actions workflows"
 actionlint -color -shellcheck=""
 zizmor --persona auditor --min-severity medium --no-online-audits .github/workflows
 
+# actionlint/zizmor above only read .github/workflows, so composite actions in
+# .github/actions never had their run blocks parsed or linted (an unrunnable
+# r2_retention.py path shipped that way). Extract and lint every bash step.
+echo "==> GitHub Actions composite actions"
+python3 build_files/scripts/validate-action-run-blocks.py
+
 echo "==> Container build files"
 hadolint --failure-threshold error \
 	Dockerfile \

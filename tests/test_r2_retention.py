@@ -12,6 +12,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "build_files/scripts/r2_retention.py"
 ACTION = ROOT / ".github/actions/upload-r2/action.yml"
+BLOCKS_SCRIPT = ROOT / "build_files/scripts/validate-action-run-blocks.py"
+BLOCKS_SPEC = importlib.util.spec_from_file_location("validate_action_run_blocks", BLOCKS_SCRIPT)
+assert BLOCKS_SPEC and BLOCKS_SPEC.loader
+run_blocks = importlib.util.module_from_spec(BLOCKS_SPEC)
+sys.modules[BLOCKS_SPEC.name] = run_blocks
+BLOCKS_SPEC.loader.exec_module(run_blocks)
 SPEC = importlib.util.spec_from_file_location("r2_retention", SCRIPT)
 assert SPEC and SPEC.loader
 r2_retention = importlib.util.module_from_spec(SPEC)
@@ -212,20 +218,8 @@ class ApplyRetentionTests(unittest.TestCase):
 
 
 def step_run_script(step_name: str) -> str:
-    """The dedented shell body of one step in the upload-r2 action."""
-    lines = ACTION.read_text(encoding="utf-8").splitlines()
-    start = next(i for i, line in enumerate(lines) if line.strip() == f"- name: {step_name}") + 1
-    body = lines[next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |") + 1:]
-    while body and not body[-1].strip():
-        body.pop()
-    first = next(line for line in body if line.strip())
-    indent = len(first) - len(first.lstrip())
-    kept: list[str] = []
-    for line in body:
-        if line.strip() and len(line) - len(line.lstrip()) < indent:
-            break
-        kept.append(line[indent:])
-    return "\n".join(kept) + "\n"
+    """A step body, extracted the same way validate.sh checks these files."""
+    return run_blocks.find_step(ACTION, step_name).run
 
 
 def run_locate_step(workspace: Path) -> tuple[subprocess.CompletedProcess[str], str]:
