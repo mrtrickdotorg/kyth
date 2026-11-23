@@ -6,9 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class QualityContractsTests(unittest.TestCase):
     def test_quality_dependencies_are_exactly_pinned(self):
-        requirements = (ROOT / "requirements-quality.txt").read_text().splitlines()
-        self.assertTrue(requirements)
-        self.assertTrue(all(line.count("==") == 1 for line in requirements))
+        # requirements-validation.txt pins PyYAML for validate.sh's composite
+        # action lint, so both gate requirement files need exact pins.
+        for name in ("requirements-quality.txt", "requirements-validation.txt"):
+            with self.subTest(requirements=name):
+                requirements = (ROOT / name).read_text().splitlines()
+                self.assertTrue(requirements)
+                self.assertTrue(all(line.count("==") == 1 for line in requirements), requirements)
         justfile = (ROOT / "Justfile").read_text()
         self.assertIn("setup-quality:", justfile)
         self.assertIn(".venv-quality/bin/python", justfile)
