@@ -1,5 +1,7 @@
 # Plan: Kyth Guardian — Own Menu Item & Self-Healing Differentiator
 
+> **Status: historical record.** Written before the Python/Qt Hub was retired; the `src/kyth-welcome/kyth_welcome/...` paths below no longer exist in the tree.
+
 ## Goal
 Promote Kyth Guardian from a small card inside Repair (`src/kyth-welcome/kyth_welcome/page_repair.py:265`) to its own top-level System Hub menu item and build it into an extremely useful, always-on self-healing surface — the Kyth differentiator. It should be the first place a user looks when "something feels off," and the place Kyth fixes itself quietly in the background.
 

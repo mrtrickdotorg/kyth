@@ -1,5 +1,7 @@
 # Plan: Finish the toggle-list → setting-row migration across System Hub leaves
 
+> **Status: historical record.** Written before the Python/Qt Hub was retired; the `src/kyth-welcome/kyth_welcome/...` paths below no longer exist in the tree.
+
 ## Goal
 Cursor's Pulse rewrite (`ef026cd1`…`3ea9597b`) already replaced the flat page list
 with a 5-destination rail (`PULSE_RAIL`) and sectioned hub chrome
