@@ -202,6 +202,37 @@ class QualityContractsTests(unittest.TestCase):
                 self.assertNotIn("test_kyth_welcome_hub_smoke", text)
                 self.assertNotIn("gui-smoke", text)
 
+    def test_living_docs_mark_retired_hub_paths_as_historical(self):
+        # A doc that names src/kyth-welcome reads as current layout unless the
+        # line says otherwise, and only a manual sweep has caught that so far.
+        # .agents/plans/ is out of scope by design: those are dated records of
+        # the Hub as it was, not descriptions of the current tree.
+        markers = (
+            "retired", "removed", "deleted", "historical", "former",
+            "no longer", "gone", "deprecated",
+        )
+        retired_path = re.compile(r"kyth_welcome|kyth-welcome/")
+        plans = (ROOT / ".agents/plans").resolve()
+        docs = [ROOT / "AGENTS.md", ROOT / "README.md"] + sorted(
+            (ROOT / "docs").glob("*.md")
+        )
+        self.assertGreater(len(docs), 20)
+        self.assertFalse([path for path in docs if plans in path.resolve().parents])
+        offenders = []
+        for path in docs:
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if not retired_path.search(line):
+                    continue
+                if any(marker in line.lower() for marker in markers):
+                    continue
+                # A checked item records a completed removal, not a live path.
+                if line.lstrip().startswith("- [x]"):
+                    continue
+                offenders.append(f"{path.name}:{number}: {line.strip()}")
+        self.assertEqual([], offenders, "living docs name the retired Hub without a historical marker")
+
     def test_retired_python_hub_package_has_no_source_files(self):
         self.assertFalse(
             any(path.is_file() for path in (ROOT / "src/kyth-welcome").rglob("*"))
