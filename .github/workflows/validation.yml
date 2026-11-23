@@ -201,6 +201,41 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # GitHub only fires `schedule` and `workflow_dispatch` from the default
+  # branch, so rpmfusion-pin-freshness.yml stays dormant until testing is
+  # promoted to main. Until then this job runs the same two-host comparison on
+  # every push to testing, so a mid-cycle republish of the bootstrap RPMs is
+  # reported by the next commit instead of by a red image build.
+  pin-freshness:
+    name: RPM Fusion pin freshness (advisory)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/testing'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Advisory by design: this step always exits 0, so a network blip or a
+      # half-rolled-out mirror cannot gate a push to testing (and cannot turn
+      # into a red check on the commit). Drift surfaces as an annotation plus
+      # the full report in the job summary; the daily cron is the run that goes
+      # red, and it only exists once this file reaches main.
+      - name: Compare pins with the published RPMs
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          python3 build_files/scripts/check-rpmfusion-pins.py 2>&1 | tee -a "${GITHUB_STEP_SUMMARY}" || rc=$?
+          case "${rc}" in
+            0) echo "::notice::Both pins match upstream." ;;
+            1) echo "::error title=RPM Fusion pins are stale::Upstream republished the bootstrap RPMs; the job summary has the replacement hashes." ;;
+            *) echo "::warning title=RPM Fusion pin check inconclusive::Could not confirm the pins from two hosts; the job summary says why. Re-run before bumping." ;;
+          esac
+          exit 0
+
   hub-shell:
     name: Hub web shell (React + Tauri) build check
     runs-on: ubuntu-latest

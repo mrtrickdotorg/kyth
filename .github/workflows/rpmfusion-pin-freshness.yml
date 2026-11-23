@@ -6,6 +6,10 @@ name: RPM Fusion pin freshness
 # gate (as it did when 45-2 replaced 45-1 on 2026-11-03). This check runs
 # daily so the bump lands on its own schedule. A failure here means "bump the
 # pins", not "the published image is broken" — it never touches the image.
+#
+# GitHub only fires schedules from the default branch, so this workflow stays
+# dormant until testing is promoted. Until then, validation.yml runs the same
+# comparison as the advisory `pin-freshness` job on every push to testing.
 on:
   schedule:
     - cron: "41 7 * * *"

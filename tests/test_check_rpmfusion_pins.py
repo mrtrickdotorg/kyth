@@ -181,6 +181,16 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("pull-requests: write", workflow)
         self.assertNotIn("issues: write", workflow)
 
+    def test_testing_pushes_run_an_advisory_probe_while_the_cron_is_dormant(self):
+        """Schedules only fire from the default branch, so testing needs its own."""
+        workflow = (ROOT / ".github/workflows/validation.yml").read_text(encoding="utf-8")
+        self.assertIn("pin-freshness:", workflow)
+        self.assertIn("if: github.event_name == 'push' && github.ref == 'refs/heads/testing'", workflow)
+        job = workflow.split("pin-freshness:", 1)[1].split("\n  hub-shell:", 1)[0]
+        self.assertIn("python3 build_files/scripts/check-rpmfusion-pins.py", job)
+        self.assertIn("exit 0", job)
+        self.assertNotIn("continue-on-error: false", job)
+
 
 if __name__ == "__main__":
     unittest.main()
