@@ -225,8 +225,8 @@ def step_run_script(step_name: str) -> str:
 def run_locate_step(workspace: Path) -> tuple[subprocess.CompletedProcess[str], str]:
     """Run the action's locate step against a pretend checkout root."""
     with tempfile.TemporaryDirectory() as tmp:
-        env_file = Path(tmp) / "github_env"
-        env_file.write_text("", encoding="utf-8")
+        output_file = Path(tmp) / "github_output"
+        output_file.write_text("", encoding="utf-8")
         proc = subprocess.run(
             ["bash", "-c", step_run_script("Locate the R2 retention script")],
             capture_output=True,
@@ -235,10 +235,10 @@ def run_locate_step(workspace: Path) -> tuple[subprocess.CompletedProcess[str], 
             env={
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "GITHUB_WORKSPACE": str(workspace),
-                "GITHUB_ENV": str(env_file),
+                "GITHUB_OUTPUT": str(output_file),
             },
         )
-        return proc, env_file.read_text(encoding="utf-8")
+        return proc, output_file.read_text(encoding="utf-8")
 
 
 class LocateRetentionScriptTests(unittest.TestCase):
@@ -249,7 +249,7 @@ class LocateRetentionScriptTests(unittest.TestCase):
         resolved = [
             line.split("=", 1)[1]
             for line in exported.splitlines()
-            if line.startswith("R2_RETENTION_SCRIPT=")
+            if line.startswith("script=")
         ]
         self.assertEqual(len(resolved), 1, exported)
         self.assertEqual(Path(resolved[0]).resolve(), SCRIPT.resolve())
@@ -288,6 +288,23 @@ class UploadActionContractTests(unittest.TestCase):
         self.assertIn('"${R2_RETENTION_SCRIPT}"', purge)
         self.assertIn("::error title=R2 retention failed::", purge)
         self.assertIn("continue-on-error: true", purge)
+
+    def test_derived_values_reach_retention_as_step_outputs_not_github_env(self):
+        """zizmor's github-env audit flags env-file writes of derived values.
+
+        Both values are computed (a workspace path, an endpoint built from an
+        input), and GITHUB_ENV is re-parsed into every later step's environment.
+        """
+        action = ACTION.read_text(encoding="utf-8")
+        self.assertNotIn('>> "${GITHUB_ENV}"', action)
+        self.assertEqual(action.count('>> "${GITHUB_OUTPUT}"'), 2)
+        purge = action.split("- name: Purge old ISO builds", 1)[1]
+        self.assertIn(
+            "R2_ENDPOINT: ${{ steps.upload.outputs.r2-endpoint }}", purge
+        )
+        self.assertIn(
+            "R2_RETENTION_SCRIPT: ${{ steps.locate-retention.outputs.script }}", purge
+        )
 
 
 if __name__ == "__main__":

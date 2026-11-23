@@ -21,11 +21,14 @@ fi
 tool_bin="$(./build_files/scripts/install-validation-tools.sh | tail -n 1)"
 export PATH="${tool_bin}:${PATH}"
 
-echo "==> GitHub Actions workflows"
+echo "==> GitHub Actions workflows and composite actions"
 actionlint -color -shellcheck=""
-zizmor --persona auditor --min-severity medium --no-online-audits .github/workflows
+# Composite actions carry the same run/env surface as workflows, so they get
+# the same audit; this is what flagged the GITHUB_ENV writes in upload-r2.
+zizmor --persona auditor --min-severity medium --no-online-audits \
+	.github/workflows .github/actions
 
-# actionlint/zizmor above only read .github/workflows, so composite actions in
+# actionlint above only reads .github/workflows, so composite actions in
 # .github/actions never had their run blocks parsed or linted (an unrunnable
 # r2_retention.py path shipped that way). Extract and lint every bash step.
 echo "==> GitHub Actions composite actions"

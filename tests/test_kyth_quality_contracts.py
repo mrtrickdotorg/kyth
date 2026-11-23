@@ -17,6 +17,14 @@ class QualityContractsTests(unittest.TestCase):
         self.assertIn("setup-quality:", justfile)
         self.assertIn(".venv-quality/bin/python", justfile)
 
+    def test_zizmor_audits_composite_actions_too(self):
+        # A composite action's run/env surface is the same as a workflow's;
+        # auditing only .github/workflows left .github/actions unseen.
+        validation = (ROOT / "build_files/scripts/validate.sh").read_text()
+        command = validation.split("zizmor ", 1)[1].split("\n\n", 1)[0]
+        self.assertIn(".github/workflows", command)
+        self.assertIn(".github/actions", command)
+
     def test_validation_publishes_coverage_even_on_failure(self):
         workflow = (ROOT / ".github/workflows/validation.yml").read_text()
         self.assertIn("./build_files/scripts/run-quality.sh", workflow)

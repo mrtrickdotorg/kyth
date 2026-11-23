@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Lint the `run:` bodies of the repository's composite actions.
 
-`actionlint` and `zizmor` in validate.sh only scan `.github/workflows`, so the
-shell inside `.github/actions/*/action.yml` was never parsed or linted. A
+`actionlint` in validate.sh only scans `.github/workflows` (zizmor audits the
+composite actions, but not the shell inside their `run:` bodies), so the shell
+in `.github/actions/*/action.yml` was never parsed or linted. A
 mispathed script reference in `.github/actions/upload-r2/action.yml` survived
 review and every ISO publish for weeks because nothing in the pipeline looked
 at that file's run block. This walks every composite action, extracts each

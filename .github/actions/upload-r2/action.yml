@@ -40,6 +40,7 @@ runs:
     # script is a repository invariant with no network involved, so it is
     # checked in a step that is allowed to fail the publish loudly.
     - name: Locate the R2 retention script
+      id: locate-retention
       shell: bash
       run: |
         set -euo pipefail
@@ -53,9 +54,13 @@ runs:
           echo "::error title=R2 retention script missing::Expected ${script}; refusing to publish with retention silently disabled."
           exit 1
         fi
-        echo "R2_RETENTION_SCRIPT=${script}" >> "${GITHUB_ENV}"
+        # A step output, not GITHUB_ENV: an env-file write is re-parsed by
+        # every later step in the job, which is why zizmor's github-env audit
+        # rejects it wherever the value is not a literal.
+        echo "script=${script}" >> "${GITHUB_OUTPUT}"
 
     - name: Run R2 upload script
+      id: upload
       shell: bash
       env:
         AWS_ACCESS_KEY_ID: ${{ inputs.r2-access-key-id }}
@@ -92,8 +97,10 @@ runs:
           exit 1
         fi
 
-        # Shared with the retention step below.
-        echo "R2_ENDPOINT=${R2_ENDPOINT}" >> "${GITHUB_ENV}"
+        # Handed to the retention step below as an output rather than through
+        # GITHUB_ENV: the endpoint is derived from an input, and an env-file
+        # write becomes part of every later step's environment.
+        echo "r2-endpoint=${R2_ENDPOINT}" >> "${GITHUB_OUTPUT}"
 
         ISO="${SOURCE_DIR}/${ISO_BASENAME}"
         CHANNEL="${SOURCE_DIR}/${CHANNEL_BASENAME}"
@@ -136,6 +143,8 @@ runs:
         AWS_REGION: auto
         BUCKET: ${{ inputs.bucket }}
         RETENTION_KEEP: ${{ inputs.retention-keep }}
+        R2_ENDPOINT: ${{ steps.upload.outputs.r2-endpoint }}
+        R2_RETENTION_SCRIPT: ${{ steps.locate-retention.outputs.script }}
       run: |
         set -euo pipefail
 
@@ -145,7 +154,7 @@ runs:
         fi
 
         if [[ -z "${R2_RETENTION_SCRIPT:-}" ]]; then
-          echo "::error title=R2 retention script unresolved::The locate step did not export R2_RETENTION_SCRIPT; nothing was purged."
+          echo "::error title=R2 retention script unresolved::The locate step did not hand over R2_RETENTION_SCRIPT; nothing was purged."
           exit 1
         fi
 
