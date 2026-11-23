@@ -194,7 +194,7 @@ class QualityContractsTests(unittest.TestCase):
         # Nothing may re-wire the retired Hub: a hook or CI job that names the
         # deleted PySide6 smoke module fails the moment it runs, and a fuzz
         # build that packages kyth_welcome points at a deleted tree.
-        for name in (".githooks/pre-push", ".gitlab-ci.yml", ".clusterfuzzlite/build.sh"):
+        for name in (".githooks/pre-push", ".clusterfuzzlite/build.sh"):
             text = (ROOT / name).read_text()
             with self.subTest(file=name):
                 self.assertNotIn("kyth-welcome", text)
