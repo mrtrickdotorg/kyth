@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "build_files/scripts/r2_retention.py"
+ACTION = ROOT / ".github/actions/upload-r2/action.yml"
 SPEC = importlib.util.spec_from_file_location("r2_retention", SCRIPT)
 assert SPEC and SPEC.loader
 r2_retention = importlib.util.module_from_spec(SPEC)
@@ -207,14 +211,89 @@ class ApplyRetentionTests(unittest.TestCase):
             )
 
 
+def step_run_script(step_name: str) -> str:
+    """The dedented shell body of one step in the upload-r2 action."""
+    lines = ACTION.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == f"- name: {step_name}") + 1
+    body = lines[next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |") + 1:]
+    while body and not body[-1].strip():
+        body.pop()
+    first = next(line for line in body if line.strip())
+    indent = len(first) - len(first.lstrip())
+    kept: list[str] = []
+    for line in body:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        kept.append(line[indent:])
+    return "\n".join(kept) + "\n"
+
+
+def run_locate_step(workspace: Path) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run the action's locate step against a pretend checkout root."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env_file = Path(tmp) / "github_env"
+        env_file.write_text("", encoding="utf-8")
+        proc = subprocess.run(
+            ["bash", "-c", step_run_script("Locate the R2 retention script")],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "GITHUB_WORKSPACE": str(workspace),
+                "GITHUB_ENV": str(env_file),
+            },
+        )
+        return proc, env_file.read_text(encoding="utf-8")
+
+
+class LocateRetentionScriptTests(unittest.TestCase):
+    def test_resolves_the_script_that_ships_in_this_checkout(self):
+        """The ../../ form resolved to .github/build_files, so retention never ran."""
+        proc, exported = run_locate_step(ROOT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        resolved = [
+            line.split("=", 1)[1]
+            for line in exported.splitlines()
+            if line.startswith("R2_RETENTION_SCRIPT=")
+        ]
+        self.assertEqual(len(resolved), 1, exported)
+        self.assertEqual(Path(resolved[0]).resolve(), SCRIPT.resolve())
+        self.assertTrue(SCRIPT.is_file())
+
+    def test_a_missing_script_fails_the_step_with_an_annotation(self):
+        with tempfile.TemporaryDirectory() as empty:
+            proc, exported = run_locate_step(Path(empty))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(exported, "")
+        self.assertIn(
+            "::error title=R2 retention script missing::",
+            proc.stdout + proc.stderr,
+        )
+
+
 class UploadActionContractTests(unittest.TestCase):
     def test_action_runs_retention_after_upload_without_failing_releases(self):
-        action = (ROOT / ".github/actions/upload-r2/action.yml").read_text(encoding="utf-8")
+        action = ACTION.read_text(encoding="utf-8")
         self.assertIn("r2_retention.py", action)
         self.assertIn("continue-on-error: true", action)
         self.assertIn('default: "5"', action)
-        # retention step must come after the upload step it cleans up behind
-        self.assertLess(action.index("aws s3 cp"), action.index("r2_retention.py"))
+        # the purge step must come after the upload step it cleans up behind
+        self.assertLess(action.index("aws s3 cp"), action.index("- name: Purge old ISO builds"))
+
+    def test_locating_the_script_is_not_advisory(self):
+        """continue-on-error hid the mispath for weeks; that check stays loud."""
+        action = ACTION.read_text(encoding="utf-8")
+        locate = action.split("- name: Locate the R2 retention script", 1)[1]
+        locate = locate.split("- name: Run R2 upload script", 1)[0]
+        self.assertNotIn("continue-on-error", locate)
+        self.assertNotIn("${{ github.action_path }}", action)
+
+    def test_purge_uses_the_located_path_and_reports_its_own_failures(self):
+        purge = ACTION.read_text(encoding="utf-8").split("- name: Purge old ISO builds", 1)[1]
+        self.assertIn('"${R2_RETENTION_SCRIPT}"', purge)
+        self.assertIn("::error title=R2 retention failed::", purge)
+        self.assertIn("continue-on-error: true", purge)
 
 
 if __name__ == "__main__":

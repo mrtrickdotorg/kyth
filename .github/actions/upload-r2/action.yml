@@ -34,6 +34,27 @@ inputs:
 runs:
   using: composite
   steps:
+    # A path bug here stayed hidden for weeks: the retention step below is
+    # continue-on-error (a purge outage must not block a release), so a
+    # mispathed script only printed a traceback nobody read. Locating the
+    # script is a repository invariant with no network involved, so it is
+    # checked in a step that is allowed to fail the publish loudly.
+    - name: Locate the R2 retention script
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # github.action_path is .github/actions/upload-r2, so a fixed count of
+        # .. segments only worked until the action moved (two of them resolved
+        # to .github/build_files/...). The checkout root does not move: this is
+        # a repository-local action, used only from the repo that ships it.
+        script="${GITHUB_WORKSPACE}/build_files/scripts/r2_retention.py"
+        if [[ ! -f "${script}" ]]; then
+          echo "::error title=R2 retention script missing::Expected ${script}; refusing to publish with retention silently disabled."
+          exit 1
+        fi
+        echo "R2_RETENTION_SCRIPT=${script}" >> "${GITHUB_ENV}"
+
     - name: Run R2 upload script
       shell: bash
       env:
@@ -102,6 +123,9 @@ runs:
     # before this existed). It must never fail a release: the plan only
     # ever names strict immutable-build keys, and the step is
     # continue-on-error so a retention outage cannot block publishing.
+    # Because that flag also hides real breakage, the step reports its own
+    # failure as an ::error annotation and the script's existence was already
+    # enforced by the non-advisory step above.
     - name: Purge old ISO builds from R2 (keep newest ${{ inputs.retention-keep }} per channel)
       shell: bash
       continue-on-error: true
@@ -120,7 +144,20 @@ runs:
           exit 0
         fi
 
-        python3 "${{ github.action_path }}/../../build_files/scripts/r2_retention.py" \
+        if [[ -z "${R2_RETENTION_SCRIPT:-}" ]]; then
+          echo "::error title=R2 retention script unresolved::The locate step did not export R2_RETENTION_SCRIPT; nothing was purged."
+          exit 1
+        fi
+
+        # Re-emit failures as annotations: continue-on-error keeps the step red
+        # in the job view without failing the run, which is easy to miss in a
+        # long publish log.
+        rc=0
+        python3 "${R2_RETENTION_SCRIPT}" \
           --bucket "${BUCKET}" \
           --endpoint-url "${R2_ENDPOINT}" \
-          --keep "${RETENTION_KEEP}"
+          --keep "${RETENTION_KEEP}" || rc=$?
+        if [[ "${rc}" -ne 0 ]]; then
+          echo "::error title=R2 retention failed::${R2_RETENTION_SCRIPT} exited ${rc}; old ISO build sets were not purged and the bucket keeps growing."
+          exit "${rc}"
+        fi
