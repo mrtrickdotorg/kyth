@@ -748,6 +748,11 @@ class BuildAssemblyContracts(unittest.TestCase):
         # plymouth at all, so the final stage must install it (the
         # second offline build died on exactly this, exit 127).
         self.assertIn("sudo plymouth", containerfile)
+        # The kyth theme is a script theme: plymouth-set-default-theme
+        # refuses without /usr/lib64/plymouth/script.so, which lives in
+        # plymouth-plugin-script (offline builds at 4e0cab29 and
+        # 08b7677b both died on exactly this).
+        self.assertIn("plymouth-plugin-script", containerfile)
         self.assertTrue(
             containerfile.rstrip().endswith("bash /src/installer/build.sh"),
             "offline payload RUN must end with build.sh",
