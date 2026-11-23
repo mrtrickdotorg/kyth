@@ -1,13 +1,21 @@
 #!/bin/bash -eu
 
-for fuzzer in "$SRC"/kyth/fuzz/*_fuzzer.py; do
+# fuzz/ currently carries only its pinned atheris requirement: the Hub fuzzer
+# and the retired Hub page package it bundled are gone. Glob with nullglob so
+# an empty fuzz/ reports that instead of handing pyinstaller a nonexistent
+# literal path.
+shopt -s nullglob
+fuzzers=("$SRC"/kyth/fuzz/*_fuzzer.py)
+if ((${#fuzzers[@]} == 0)); then
+	echo "clusterfuzzlite: fuzz/ has no *_fuzzer.py — nothing to build" >&2
+	exit 1
+fi
+
+for fuzzer in "${fuzzers[@]}"; do
 	fuzzer_basename="$(basename -s .py "$fuzzer")"
 	fuzzer_package="${fuzzer_basename}.pkg"
 	pyinstaller \
 		--distpath "$OUT" \
-		--paths "$SRC/kyth/build_files/kyth-welcome" \
-		--hidden-import kyth_welcome.core \
-		--hidden-import kyth_welcome.page_vpn \
 		--onefile \
 		--name "$fuzzer_package" \
 		"$fuzzer"

@@ -27,9 +27,9 @@ suite is CI-gated (`validation.yml` → `build.yml`).
 
 - Local `git push` runs fast repository validation plus the **full Python
   coverage-floor gate** by default (`validate.sh --fast` + `run-quality.sh`).
-  This prevents coverage-floor failures from reaching GitHub. Hub smoke and
-  the additional uninstrumented full validation remain opt-in because they
-  are expensive on a live desktop.
+  This prevents coverage-floor failures from reaching GitHub. The additional
+  uninstrumented full validation remains opt-in because it is expensive on a
+  live desktop.
 - Force the additional heavy checks locally when needed:
   `KYTH_ALLOW_HEAVY_PRE_PUSH=1 git push` or
   `KYTH_FORCE_FULL_VALIDATION=1 ./build_files/scripts/validate.sh --full`.

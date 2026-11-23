@@ -191,6 +191,16 @@ class QualityContractsTests(unittest.TestCase):
         metadata = (ROOT / "pyproject.toml").read_text()
         self.assertNotIn('"src/kyth-welcome"', metadata)
         self.assertNotIn('"build_files/kyth-welcome"', metadata)
+        # Nothing may re-wire the retired Hub: a hook or CI job that names the
+        # deleted PySide6 smoke module fails the moment it runs, and a fuzz
+        # build that packages kyth_welcome points at a deleted tree.
+        for name in (".githooks/pre-push", ".gitlab-ci.yml", ".clusterfuzzlite/build.sh"):
+            text = (ROOT / name).read_text()
+            with self.subTest(file=name):
+                self.assertNotIn("kyth-welcome", text)
+                self.assertNotIn("kyth_welcome", text)
+                self.assertNotIn("test_kyth_welcome_hub_smoke", text)
+                self.assertNotIn("gui-smoke", text)
 
     def test_retired_python_hub_package_has_no_source_files(self):
         self.assertFalse(
