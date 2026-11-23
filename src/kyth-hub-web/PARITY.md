@@ -26,7 +26,8 @@ search, while parameterized recipes remain outside the generic recipe field.
 | Move In | Move Files, Cloud Storage, Network Shares, VPN | `MoveIn.tsx` → 4 sections, all with actions | Move Files: `ntfs-drives` cache + live `ntfs_devices` rescan. Cloud: `network-summary` + `cloud_oauth_status` + `rclone_oauth_command`. Shares: `smb_browse`/temporary mount command plus persisted add/remove through the typed privileged socket and native Rust root helper; credentials stay off the user config. VPN: `network-summary` + live `network_identity` refresh plus native Rust openconnect/SAML controls in the Hub. All three network sections escalate to `network_identity` on Refresh |
 | Updates | Updates | `Updates.tsx` → dedicated update page | `update_status`/`pending_updates_summary` on mount, `collect_availability` on demand; one page-level action surface owns check, stage, restart, app updates, and rollback |
 
-`27` page keys total (`Welcome` + `6` landings + `21` sections + `1` Dashboard alias) are derived from the shared route manifest. Updates is a dedicated left-rail destination and is listed last in the web menu.
+`27` page keys total (`6` landings + `21` sections) are derived from the shared
+route manifest, with `Welcome` and `Dashboard` aliasing the Home page. Updates is a dedicated left-rail destination and is listed last in the web menu.
 
 ## Conventions the sections follow
 

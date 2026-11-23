@@ -100,7 +100,7 @@ commit explains any manual hardware or live ISO validation.
 
 ## CI Checks
 
-Every push to `main`/`testing` runs the **Validation** workflow (5 jobs):
+Every push to `main`/`testing` runs the **Validation** workflow (6 jobs):
 
 - **validation** — actionlint, zizmor (auditor, medium+), hadolint, and the
   full `validate.sh` suite (shellcheck at `--severity=warning`, Python
@@ -109,9 +109,12 @@ Every push to `main`/`testing` runs the **Validation** workflow (5 jobs):
 - **quality (coverage and lint)** — `run-quality.sh`: ruff, blind-except
   audit, coverage-instrumented suite plus the critical-coverage floor;
   full on push. Uploads the coverage report.
-- **hub-shell / installer-shell** — frontend + Tauri shell builds
+- **hub-shell / installer-shell** — frontend + Tauri shell builds, plus
+  advisory clippy (its warnings do not fail the job)
 - **rust** — clippy (advisory while the warning burn-down is in progress)
   plus `cargo test --locked`
+- **pin-freshness** — RPM Fusion pin drift on `testing` pushes only; advisory,
+  it always exits 0 and reports through the job summary
 
 Tool versions (actionlint, hadolint, just, shellcheck, zizmor, syft, grype)
 are pinned — validators in `validation.yml` via
@@ -132,7 +135,7 @@ With hooks installed (`just install-git-hooks`), every push runs:
    mandatory local gate, including in fast mode.
 
 Set `KYTH_ALLOW_HEAVY_PRE_PUSH=1` to also run the full validation suite
-and the Hub headless smoke test. `KYTH_SKIP_PRE_PUSH_VALIDATION=1`
+(`validate.sh --full`). `KYTH_SKIP_PRE_PUSH_VALIDATION=1`
 bypasses the gate (emergencies only — CI still gates promotion).
 
 ## Reporting Bugs
